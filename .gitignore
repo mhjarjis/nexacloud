@@ -1,0 +1,19 @@
+# build output
+/dist/
+agent/target/
+agent/dev-backups/
+web/node_modules/
+web/.nuxt/
+web/.output/
+web/.data/
+
+# local secrets / env
+.env
+.env.*
+*.pem
+*.key
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

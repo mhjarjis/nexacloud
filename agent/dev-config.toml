@@ -1,0 +1,7 @@
+# Local development config (plain HTTP, no TLS). Password: dev
+# Relative paths are resolved against this file's directory.
+listen = "127.0.0.1:8443"
+web_dir = "../web/.output/public"
+backup_dir = "./dev-backups"
+admin_password_hash = "$argon2id$v=19$m=19456,t=2,p=1$yX2hTNdLAU4pD0KuYhFmEw$gCKoblKUIuGbUqh8V32Onjd9ducsywueDc26vVb3iLc"
+tls = false

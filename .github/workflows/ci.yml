@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build agent + web
+    runs-on: ubuntu-22.04 # older glibc so the binary runs on Ubuntu 22.04 and 24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web UI
+        working-directory: web
+        run: |
+          npm ci
+          npx nuxi generate
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: agent
+
+      - name: Test agent
+        working-directory: agent
+        run: cargo test --locked
+
+      - name: Build agent
+        working-directory: agent
+        run: cargo build --release --locked
+
+      - name: Package
+        run: bash scripts/package.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexacloud-dist
+          path: dist/
+          retention-days: 7
+
+  install-test:
+    name: Install on a fresh Ubuntu 24.04
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nexacloud-dist
+          path: dist
+
+      - name: Run installer
+        run: |
+          sudo NEXACLOUD_TARBALL="$PWD/dist/nexacloud-x86_64-linux.tar.gz" bash scripts/install.sh | tee install.log
+
+      - name: Smoke test API
+        run: |
+          set -euo pipefail
+          PASS="$(sed -n 's/^  Password:  //p' install.log | head -1)"
+          test -n "$PASS" || { echo "no password printed"; exit 1; }
+          U=https://127.0.0.1:8443
+          curl -fsk "$U/api/health"
+          curl -fsk "$U/" | grep -qi '<html'
+          # unauthenticated access must be refused
+          test "$(curl -sk -o /dev/null -w '%{http_code}' "$U/api/system")" = "401"
+          # wrong password
+          test "$(curl -sk -o /dev/null -w '%{http_code}' -H "Origin: $U" -H 'Content-Type: application/json' -d '{"password":"nope"}' "$U/api/auth/login")" = "401"
+          # missing Origin on a POST must be refused
+          test "$(curl -sk -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' -d "{\"password\":\"$PASS\"}" "$U/api/auth/login")" = "403"
+          curl -fsk -c jar -H "Origin: $U" -H 'Content-Type: application/json' -d "{\"password\":\"$PASS\"}" "$U/api/auth/login"
+          for p in auth/me overview system services php sites databases backups jobs security; do
+            echo "== /api/$p"; curl -fsk -b jar "$U/api/$p" | head -c 600; echo
+          done
+
+      - name: Re-run installer (upgrade keeps config)
+        run: |
+          sudo NEXACLOUD_TARBALL="$PWD/dist/nexacloud-x86_64-linux.tar.gz" bash scripts/install.sh | tee upgrade.log
+          grep -q 'Password:  unchanged' upgrade.log
+          curl -fsk https://127.0.0.1:8443/api/health
+
+      - name: Uninstall
+        run: |
+          sudo bash scripts/install.sh --uninstall
+          ! systemctl is-active --quiet nexacloud
+          test ! -e /opt/nexacloud

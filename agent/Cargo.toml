@@ -1,0 +1,36 @@
+[package]
+name = "nexacloud"
+version = "0.1.0"
+edition = "2021"
+description = "NexaCloud agent: JSON API + web UI server for managing a Laravel/PHP VPS"
+publish = false
+
+[[bin]]
+name = "nexacloud"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+argon2 = "0.6.0"
+axum = "0.8.9"
+axum-server = { version = "0.9.2", default-features = false, features = ["tls-rustls-no-provider"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.6.7", features = ["derive"] }
+rand = "0.10.3"
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sysinfo = { version = "0.40.3", default-features = false, features = ["system", "disk"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "process", "signal", "fs", "time", "sync", "io-util"] }
+tokio-util = { version = "0.7.20", features = ["io"] }
+toml = "1.2.1"
+tower-http = { version = "0.7.1", features = ["fs", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.29.2", features = ["v4"] }
+x509-parser = "0.18.1"
+
+[profile.release]
+strip = true
+lto = "thin"
