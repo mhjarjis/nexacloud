@@ -721,3 +721,18 @@ pub async fn release_activate(
     })();
     wrap(res, info)
 }
+
+/// The whole `.env` for "Edit as text" (sudo, audited — it holds secrets).
+pub async fn env_raw(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
+    let info = AuditInfo::action("project.env_raw", id.clone());
+    let res = (|| {
+        let p = get_project(&state.db, &id)?.ok_or_else(|| ApiError::not_found("project not found"))?;
+        let path = std::path::Path::new(&p.shared_dir()).join(".env");
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        Ok(Json(json!({"content": content, "exists": path.exists()})).into_response())
+    })();
+    wrap(res, info)
+}

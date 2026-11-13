@@ -311,6 +311,50 @@ fn errors(p: &Project) -> Value {
     json!({"file": file, "items": items, "last_hour": last_hour})
 }
 
+// ------------------------------------------------------------------ schedule results
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SchedRun {
+    pub command: String,
+    pub at: String,
+    pub ok: bool,
+}
+
+/// Last run of each command from `schedule:run` output, e.g.
+/// `  2026-11-13 14:00:00 Running ['artisan' inspire] .... 4ms DONE`.
+pub fn parse_schedule_log(text: &str) -> Vec<SchedRun> {
+    let mut out: Vec<SchedRun> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        let Some(i) = t.find("Running [") else { continue };
+        let at = t[..i].trim().to_string();
+        let rest = &t[i + "Running [".len()..];
+        let Some(j) = rest.find(']') else { continue };
+        let mut cmd = rest[..j].to_string();
+        if let Some(k) = cmd.find("artisan'") {
+            cmd = cmd[k + "artisan'".len()..].trim().to_string();
+        }
+        let tail = rest[j..].trim_end();
+        let ok = !tail.ends_with("FAIL");
+        if !(tail.ends_with("DONE") || tail.ends_with("FAIL")) {
+            continue;
+        }
+        out.retain(|r| r.command != cmd);
+        out.push(SchedRun { command: cmd, at, ok });
+    }
+    out
+}
+
+fn schedule_runs(p: &Project) -> Vec<SchedRun> {
+    let f = Path::new(&p.shared_dir()).join("storage/logs/nexacloud-schedule.log");
+    // Keep the file small (it gets a line every minute).
+    if std::fs::metadata(&f).is_ok_and(|m| m.len() > 2_000_000) {
+        let tail = crate::jobs::read_log_tail(&f, 256_000);
+        let _ = std::fs::write(&f, tail);
+    }
+    parse_schedule_log(&crate::jobs::read_log_tail(&f, 512_000))
+}
+
 // ------------------------------------------------------------------ laravel facts
 
 async fn du_bytes(path: &str) -> Option<u64> {
@@ -372,6 +416,13 @@ async fn collect(p: &Project) -> Value {
     };
     let logs_dir = format!("{}/storage/logs", p.shared_dir());
     let (dir_bytes, logs_bytes) = tokio::join!(du_bytes(&p.dir), du_bytes(&logs_dir));
+    if let Some(u) = ["uploads", "public/uploads", "public_html/uploads"]
+        .iter()
+        .map(|d| format!("{app}/{d}"))
+        .find(|d| Path::new(d).is_dir())
+    {
+        facts["uploads_bytes"] = json!(du_bytes(&u).await);
+    }
     facts["dir_bytes"] = json!(dir_bytes);
     facts["logs_bytes"] = json!(logs_bytes);
     facts["collected_at"] = json!(chrono::Utc::now().timestamp());
@@ -426,6 +477,16 @@ pub async fn refresh_all(state: &AppState) {
 pub async fn facts(p: &Project, fresh: bool) -> Value {
     match cached(&p.id) {
         Some((at, v)) if !fresh && at.elapsed() < TTL * 3 => v,
+        Some(_) | None if !fresh => {
+            // Don't make the page wait for PHP: collect in the background.
+            let p2 = p.clone();
+            tokio::spawn(async move {
+                refresh(&p2).await;
+            });
+            cached(&p.id)
+                .map(|c| c.1)
+                .unwrap_or_else(|| json!({"collecting": true}))
+        }
         _ => refresh(p).await,
     }
 }
@@ -491,6 +552,12 @@ pub async fn overview(state: &AppState, p: &Project, fresh: bool) -> Value {
         .and_then(|m| m.modified())
         .ok()
         .map(|t| chrono::DateTime::<chrono::Utc>::from(t).timestamp());
+    let cron_running = Cmd::new("systemctl")
+        .args(["is-active", "--quiet", "cron"])
+        .timeout(Duration::from_secs(5))
+        .run()
+        .await
+        .ok;
     let scheduler = Path::new(&format!(
         "/etc/cron.d/{}",
         crate::deploys::routes::cron_name(&p.id)
@@ -500,7 +567,22 @@ pub async fn overview(state: &AppState, p: &Project, fresh: bool) -> Value {
         .join("storage/framework/down")
         .exists()
         || Path::new(&shared).join("storage/framework/down").exists();
+    let app = p.app_dir();
+    let composer_pkgs = std::fs::read_to_string(Path::new(&app).join("composer.lock"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .map(|v| v["packages"].as_array().map(|a| a.len()).unwrap_or(0));
+    let shared: Vec<String> = std::fs::read_dir(format!("{}/shared", p.dir))
+        .map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+    let uploads_dir = ["uploads", "public/uploads", "public_html/uploads"]
+        .iter()
+        .find(|d| Path::new(&app).join(d).is_dir())
+        .map(|d| d.to_string());
     json!({
+        "composer": {"lock": composer_pkgs.is_some(), "packages": composer_pkgs, "on_deploy": p.script.contains("composer install")},
+        "shared": shared,
+        "uploads_dir": uploads_dir,
         "site": {
             "id": p.site_id,
             "url": format!("{}://{}", if site.is_some_and(|s| s.ssl) { "https" } else { "http" }, p.site_id),
@@ -512,7 +594,7 @@ pub async fn overview(state: &AppState, p: &Project, fresh: bool) -> Value {
         },
         "facts": facts,
         "workers": workers,
-        "scheduler": {"enabled": scheduler, "last_run": sched_last},
+        "scheduler": {"enabled": scheduler, "last_run": sched_last, "runs": schedule_runs(p), "cron_running": cron_running},
         "maintenance": maintenance,
         "errors": errors(p),
         "monitor": super::stats(&state.db, &p.site_id, 24),
@@ -545,6 +627,16 @@ mod tests {
         assert_eq!(s[0].program, "nexacloud-crm-test-mail");
         assert_eq!(s[0].uptime.as_deref(), Some("6 days, 4:01:02"));
         assert_eq!(s[1].state, "FATAL");
+    }
+
+    #[test]
+    fn parses_schedule_output() {
+        let t = "  2026-11-13 14:00:00 Running ['artisan' inspire] ........ 4.12ms DONE\n  ⇂ '/usr/bin/php8.3' 'artisan' inspire > '/dev/null' 2>&1\n   INFO  No scheduled commands are ready to run.\n  2026-11-13 14:15:00 Running ['artisan' sync:mailchimp] ..... 1s FAIL\n  2026-11-13 15:00:00 Running ['artisan' inspire] ..... 3ms DONE\n";
+        let r = parse_schedule_log(t);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0], SchedRun { command: "sync:mailchimp".into(), at: "2026-11-13 14:15:00".into(), ok: false });
+        assert_eq!(r[1].command, "inspire");
+        assert_eq!(r[1].at, "2026-11-13 15:00:00");
     }
 
     #[test]

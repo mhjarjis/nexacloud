@@ -79,6 +79,7 @@ pub fn router(state: AppState) -> Router {
         .route("/projects/{id}/artisan", post(dp::artisan))
         .route("/firewall/confirm", post(crate::plans::firewall_confirm))
         .route("/projects/{id}/env/reveal", post(dp::env_reveal))
+        .route("/projects/{id}/env/raw", post(dp::env_raw))
         .route("/projects/{id}/workers/restart", post(dp::workers_restart))
         .route("/notify/settings", put(crate::monitor::routes::settings_put))
         .route("/notify/test", post(crate::monitor::routes::test))

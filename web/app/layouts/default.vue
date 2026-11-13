@@ -5,7 +5,7 @@ import type { IconName } from '~/utils/icons'
 const NAV: { to: string; label: string; icon: IconName }[] = [
   { to: '/', label: 'Dashboard', icon: 'dashboard' },
   { to: '/sites', label: 'Sites', icon: 'sites' },
-  { to: '/projects', label: 'Deployments', icon: 'git' },
+  { to: '/projects', label: 'Projects', icon: 'git' },
   { to: '/php', label: 'PHP', icon: 'php' },
   { to: '/services', label: 'Services', icon: 'services' },
   { to: '/databases', label: 'Databases', icon: 'databases' },
@@ -18,13 +18,20 @@ const NAV: { to: string; label: string; icon: IconName }[] = [
 
 const api = useApi()
 const authed = useAuthState()
-const health = useResource<Health>('/api/health', { interval: 30_000 })
+const health = useResource<Health>('/api/health', { interval: 5_000 })
 const system = useResource<SystemInfo>('/api/system')
 
 const agentUp = computed(() => !health.error.value && !!health.data.value?.ok)
 const agentLabel = computed(() =>
-  health.data.value ? `nexacloud-agent ${health.data.value.version}` : 'nexacloud-agent',
+  health.data.value ? `nexacloud-agent ${health.data.value.version} · Rust` : 'nexacloud-agent · Rust',
 )
+const lastBeat = ref<number | null>(null)
+const now = ref(Date.now())
+watch(() => health.data.value, (v) => { if (v?.ok) lastBeat.value = Date.now() }, { immediate: true })
+let beatTimer: ReturnType<typeof setInterval> | null = null
+onMounted(() => { beatTimer = setInterval(() => { now.value = Date.now() }, 1000) })
+onBeforeUnmount(() => { if (beatTimer) clearInterval(beatTimer) })
+const beatLabel = computed(() => lastBeat.value === null ? '' : `Heartbeat ${Math.max(0, Math.round((now.value - lastBeat.value) / 1000))}s ago`)
 const signingOut = ref(false)
 
 async function signOut() {
@@ -90,6 +97,7 @@ async function signOut() {
             style="align-self: flex-start"
           />
           <span class="small muted">{{ agentLabel }}</span>
+          <span v-if="beatLabel" class="small muted">{{ beatLabel }}</span>
         </div>
         <button type="button" class="btn btn-s" :disabled="signingOut" @click="signOut">
           <AppIcon name="logout" :size="16" />

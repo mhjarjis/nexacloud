@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { Site } from '~/types/api'
 
-useHead({ title: 'Deployments · NexaCloud' })
+useHead({ title: 'Projects · NexaCloud' })
 
 interface DeployRow { id: string; project_id: string; status: string; trigger: string; commit: string | null; message: string | null; author: string | null; started_at: string; finished_at: string | null; error: string | null }
 interface ProjectRow { id: string; kind: string; dir: string; repo: string; branch: string; auto_deploy: boolean; last_commit: string | null; last_deploy_at: string | null; last: DeployRow | null }
@@ -32,7 +32,7 @@ function deployLabel(s?: string) { return ({ ok: 'Live', running: 'Deploying', q
 </script>
 
 <template>
-  <PageHeader title="Deployments" crumb="Connect sites to Git and deploy on push">
+  <PageHeader title="Projects" crumb="Connect sites to Git and deploy on push">
     <button type="button" class="btn" @click="connecting = !connecting"><AppIcon name="git" :size="16" :stroke="2" /> Connect an existing site</button>
     <NuxtLink to="/apps/new" class="btn btn-p"><AppIcon name="plus" :size="16" :stroke="2" /> New app</NuxtLink>
   </PageHeader>

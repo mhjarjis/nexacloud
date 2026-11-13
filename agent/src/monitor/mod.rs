@@ -112,6 +112,10 @@ async fn probe_all(state: &AppState) {
         .collect();
     for (site, (code, ms)) in crate::util::join_all(futs).await.into_iter().flatten() {
         record(&state.db, &site, ts, code, ms);
+        if code == 503 && in_maintenance(state, &site) {
+            // On purpose: not an outage.
+            continue;
+        }
         let fails = {
             let mut f = FAILS.lock().unwrap_or_else(|e| e.into_inner());
             let n = f.entry(site.clone()).or_default();
@@ -152,6 +156,17 @@ async fn probe_all(state: &AppState) {
             );
         }
     }
+}
+
+/// Maintenance mode is on (nginx option, or `artisan down`).
+fn in_maintenance(state: &AppState, site: &str) -> bool {
+    if crate::plans::sites::load_model(&state.changes_env, site).is_ok_and(|m| m.options.maintenance) {
+        return true;
+    }
+    crate::deploys::get_project(&state.db, site)
+        .ok()
+        .flatten()
+        .is_some_and(|p| std::path::Path::new(&p.app_dir()).join("storage/framework/down").exists())
 }
 
 fn prune(db: &Db) {
@@ -231,6 +246,8 @@ pub struct Stats {
     pub failures_1h: usize,
     pub checks_1h: usize,
     pub buckets: Vec<Bucket>,
+    /// Last 2 h in 5-minute buckets.
+    pub recent: Vec<Bucket>,
     pub interval_secs: u64,
 }
 
@@ -242,12 +259,11 @@ fn percentile(sorted: &[i64], p: f64) -> Option<i64> {
     sorted.get(idx).copied()
 }
 
-pub fn compute_stats(site: &str, now: i64, hours: i64, samples: &[(i64, i64, i64)]) -> Stats {
-    let start_hour = (now / 3600 - hours + 1) * 3600;
+fn bucketize(samples: &[(i64, i64, i64)], first: i64, step: i64, n: i64) -> Vec<Bucket> {
     let mut buckets = Vec::new();
-    for h in 0..hours {
-        let from = start_hour + h * 3600;
-        let to = from + 3600;
+    for h in 0..n {
+        let from = first + h * step;
+        let to = from + step;
         let mut ms: Vec<i64> = samples
             .iter()
             .filter(|s| s.0 >= from && s.0 < to && !is_failure(s.1))
@@ -265,6 +281,13 @@ pub fn compute_stats(site: &str, now: i64, hours: i64, samples: &[(i64, i64, i64
             failures,
         });
     }
+    buckets
+}
+
+pub fn compute_stats(site: &str, now: i64, hours: i64, samples: &[(i64, i64, i64)]) -> Stats {
+    let buckets = bucketize(samples, (now / 3600 - hours + 1) * 3600, 3600, hours);
+    // Last two hours in 5-minute steps (a new server has no hourly history yet).
+    let recent = bucketize(samples, (now / 300 - 23) * 300, 300, 24);
     let good = samples.iter().filter(|s| !is_failure(s.1)).count();
     let last = samples.iter().max_by_key(|s| s.0);
     let last_hour = samples.iter().filter(|s| s.0 >= now - 3600);
@@ -278,6 +301,7 @@ pub fn compute_stats(site: &str, now: i64, hours: i64, samples: &[(i64, i64, i64
         failures_1h: last_hour.clone().filter(|s| is_failure(s.1)).count(),
         checks_1h: last_hour.count(),
         buckets,
+        recent,
         interval_secs: interval_secs(),
     }
 }

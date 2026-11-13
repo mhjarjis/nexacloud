@@ -128,6 +128,64 @@ pub fn plan_env(env: &ChangeEnv, p: &Project, params: &EnvParams) -> Result<Chan
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct EnvRawParams {
+    pub id: String,
+    pub content: String,
+}
+
+/// Replace the whole .env ("Edit as text"). Same safety net as [`plan_env`].
+pub fn plan_env_raw(env: &ChangeEnv, p: &Project, params: &EnvRawParams) -> Result<ChangePlan, String> {
+    if params.content.len() > 64_000 {
+        return Err(".env is too large".into());
+    }
+    for (i, l) in params.content.lines().enumerate() {
+        let t = l.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        match t.split_once('=') {
+            Some((k, _)) if valid_env_key(k.trim().trim_start_matches("export ")) => {}
+            _ => return Err(format!("line {}: expected NAME=value", i + 1)),
+        }
+    }
+    let path = format!("{}/.env", p.shared_dir());
+    let exists = env.host_path(&path).exists();
+    let owner = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(env.host_path(&p.shared_dir()))
+            .or_else(|_| std::fs::metadata(env.host_path(&p.dir)))
+            .ok()
+            .map(|m| (m.uid(), m.gid()))
+    };
+    let mut content = params.content.replace("\r\n", "\n");
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    let mut b = ChangePlan::builder("project_env", &format!("Replace .env of {}", p.id), &format!("site:{}", p.site_id))
+        .lock(&format!("site:{}", p.site_id))
+        .sensitive()
+        .write_file_with(
+            &path,
+            crate::changes::Content::Text(content),
+            if exists { None } else { Some(0o640) },
+            if exists { None } else { owner },
+        );
+    if p.kind == "laravel" && env.host_path(&format!("{}/artisan", p.app_dir())).exists() {
+        b = b.command(["runuser", "-u", &p.run_as, "--", "php", &format!("{}/artisan", p.app_dir()), "config:clear"]);
+    }
+    b.verify_command([
+        "sh",
+        "-c",
+        "for i in 1 2 3 4 5 6; do code=$(curl -ks -o /dev/null -w '%{http_code}' --resolve \"$1:80:127.0.0.1\" --resolve \"$1:443:127.0.0.1\" -L \"http://$1/\"); if [ \"$code\" -gt 0 ] && [ \"$code\" -lt 500 ]; then echo \"HTTP $code\"; exit 0; fi; sleep 1; done; echo \"HTTP $code\"; exit 1",
+        "probe",
+        &p.site_id,
+    ])
+    .note("The whole .env is replaced; Laravel's config cache is cleared. If the site then returns errors, the old file is restored automatically.")
+    .build(env)
+    .map_err(|e| format!("{e:#}"))
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct WorkerParams {
     pub id: String,
     pub enabled: bool,
@@ -255,9 +313,38 @@ pub fn plan_worker(env: &ChangeEnv, p: &Project, w: &WorkerParams) -> Result<Cha
         .map_err(|e| format!("{e:#}"))
 }
 
+/// Keep a folder (e.g. `uploads`) between releases: create it in shared/
+/// (copying what the live release has) so every deploy links it.
+pub fn plan_shared(env: &ChangeEnv, p: &Project, name: &str) -> Result<ChangePlan, String> {
+    if p.strategy != "releases" {
+        return Err("in-place projects keep their files between deploys already".into());
+    }
+    if name.is_empty()
+        || name.len() > 60
+        || name.starts_with('.')
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
+    {
+        return Err("folder name: letters, digits, _ - .".into());
+    }
+    if env.host_path(&format!("{}/{name}", p.shared_dir())).exists() {
+        return Err(format!("{name}/ is already kept between releases"));
+    }
+    let script = r#"set -e
+mkdir -p "$1/shared/$2"
+if [ -d "$1/current/$2" ] && [ ! -L "$1/current/$2" ]; then cp -a "$1/current/$2/." "$1/shared/$2/"; fi
+echo "shared/$2 ready — linked into every new release from the next deploy"
+"#;
+    ChangePlan::builder("project_shared", &format!("Keep {name}/ between releases of {}", p.id), &format!("site:{}", p.site_id))
+        .lock(&format!("site:{}", p.site_id))
+        .command(["runuser", "-u", &p.run_as, "--", "bash", "-c", script, "shared", &p.dir, name])
+        .note(format!("Creates {}/shared/{name} (with the files the live release has). From the next deploy, every release links it, so uploads survive deploys and rollbacks.", p.dir))
+        .build(env)
+        .map_err(|e| format!("{e:#}"))
+}
+
 pub fn cron_content(p: &Project) -> String {
     format!(
-        "# Managed by NexaCloud — Laravel scheduler for {}\nSHELL=/bin/sh\n* * * * * {} cd {} && touch storage/framework/.nexacloud-schedule 2>/dev/null; {} artisan schedule:run >> /dev/null 2>&1\n",
+        "# Managed by NexaCloud — Laravel scheduler for {}\nSHELL=/bin/sh\n* * * * * {} cd {} && touch storage/framework/.nexacloud-schedule 2>/dev/null; {} artisan schedule:run >> storage/logs/nexacloud-schedule.log 2>&1\n",
         p.id, p.run_as, p.app_dir(), crate::deploys::php_bin(&p.site_id)
     )
 }
@@ -359,6 +446,16 @@ pub fn plan_scheduler(env: &ChangeEnv, p: &Project, enabled: bool) -> Result<Cha
         ),
         &format!("site:{}", p.site_id),
     );
+    let mut b = b;
+    if enabled && !env.host_path("/usr/sbin/cron").exists() {
+        b = b
+            .lock("apt")
+            .pre_command_timeout(["apt-get", "update", "-q"], 600)
+            .pre_command_timeout(["apt-get", "install", "-y", "-q", "cron"], 900);
+    }
+    if enabled {
+        b = b.pre_command(["systemctl", "enable", "--now", "cron"]);
+    }
     let b = if enabled {
         b.write_file_with(
             &path,

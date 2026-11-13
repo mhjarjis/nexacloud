@@ -19,13 +19,16 @@ interface Worker { name: string; queue: string; processes: number; running: numb
 interface ErrItem { level: string; when: string; count: number; msg: string }
 interface Overview {
   site: { id: string; url: string; ssl: boolean; ssl_days: number | null; php_version: string | null; runtime: string | null; managed: boolean }
-  facts: { laravel?: string | null; queue?: string | null; db?: { connection: string; database: string } | null; queues?: Record<string, number | null>; schedule?: { command: string; expression: string; description: string | null; next: string }[]; failed_24h?: number | null; error?: string; env?: string | null; debug?: boolean | null; dir_bytes?: number | null; logs_bytes?: number | null; collected_at?: number }
+  facts: { laravel?: string | null; queue?: string | null; db?: { connection: string; database: string } | null; queues?: Record<string, number | null>; schedule?: { command: string; expression: string; description: string | null; next: string }[]; failed_24h?: number | null; error?: string; env?: string | null; debug?: boolean | null; dir_bytes?: number | null; logs_bytes?: number | null; uploads_bytes?: number | null; collected_at?: number; collecting?: boolean }
   workers: Worker[]
-  scheduler: { enabled: boolean; last_run: number | null }
+  scheduler: { enabled: boolean; last_run: number | null; runs: { command: string; at: string; ok: boolean }[]; cron_running: boolean }
   maintenance: boolean
   errors: { file: string; items: ErrItem[]; last_hour: number }
-  monitor: { checks: number; uptime: number | null; last_code: number | null; last_ms: number | null; last_at: number | null; failures_1h: number; checks_1h: number; buckets: Bucket[]; interval_secs: number }
+  monitor: { checks: number; uptime: number | null; last_code: number | null; last_ms: number | null; last_at: number | null; failures_1h: number; checks_1h: number; buckets: Bucket[]; recent: Bucket[]; interval_secs: number }
   app_dir: string
+  composer: { lock: boolean; packages: number | null; on_deploy: boolean }
+  shared: string[]
+  uploads_dir: string | null
 }
 interface EnvVar { key: string; value: string | null; secret: boolean }
 
@@ -34,13 +37,14 @@ const ov = useResource<Overview>(`/api/projects/${enc.value}/overview`, { interv
 const php = useResource<PhpInfo>('/api/php')
 const status = useResource<{ artisan: string[] }>(`/api/projects/${enc.value}/status`)
 
-type Tab = 'overview' | 'deploys' | 'env' | 'logs' | 'pipeline' | 'setup'
-const tab = ref<Tab>(route.query.new ? 'setup' : ((route.query.tab as Tab) || 'overview'))
+type Tab = 'overview' | 'env' | 'logs' | 'deploys'
+const qTab = String(route.query.tab ?? '')
+const tab = ref<Tab>(route.query.new || ['setup', 'pipeline', 'deploys'].includes(qTab) ? 'deploys' : (['env', 'logs'].includes(qTab) ? qTab as Tab : 'overview'))
 const err = ref<string | null>(null)
 const deployJob = ref<string | null>(null)
 const isLaravel = computed(() => p.data.value?.kind === 'laravel')
 const tabs: [Tab, string][] = [
-  ['overview', 'Overview'], ['deploys', 'Deploys'], ['env', 'Environment'], ['logs', 'Logs'], ['pipeline', 'Pipeline'], ['setup', 'GitHub setup'],
+  ['overview', 'Overview'], ['env', 'Environment'], ['logs', 'Logs'], ['deploys', 'Deployments'],
 ]
 
 function fail(e: unknown) { if (!(e instanceof SudoCancelled)) err.value = errorMessage(e) }
@@ -110,10 +114,38 @@ async function runArtisan(cmd = artisanCmd.value.trim()) {
   } catch (e) { fail(e) }
 }
 const maintBusy = ref(false)
+interface SiteModelLite { root: string | null; project_dir: string | null; options: Record<string, unknown> & { maintenance?: boolean; front_controller?: boolean } }
+const model = ref<SiteModelLite | null>(null)
+async function loadModel() {
+  if (!p.data.value) return
+  try { model.value = await api.get<SiteModelLite>(`/api/sites/${encodeURIComponent(p.data.value.site_id)}/model`) } catch { model.value = null }
+}
+watch(() => p.data.value?.site_id, (v) => { if (v) loadModel() }, { immediate: true })
+/** Preview + apply a plan in one go (for simple toggles); returns the change status. */
+async function quickPlan(request: { kind: string; params: Record<string, unknown> }): Promise<string> {
+  const pv = await api.post<{ plan_hash: string }>('/api/plans/preview', request)
+  const started = await api.post<{ change_id: string }>('/api/plans/apply', { ...request, plan_hash: pv.plan_hash })
+  for (let i = 0; i < 120; i++) {
+    const c = await api.get<{ status: string; error?: string | null }>(`/api/changes/${started.change_id}`)
+    if (['applied', 'reverted', 'failed', 'revert_failed'].includes(c.status)) return c.status
+    await new Promise((r) => setTimeout(r, 1000))
+  }
+  return 'timeout'
+}
+const maintenanceOn = computed(() => isLaravel.value ? !!ov.data.value?.maintenance : !!model.value?.options?.maintenance)
 async function toggleMaintenance() {
   maintBusy.value = true
-  tab.value = 'overview'
-  try { await runArtisan(ov.data.value?.maintenance ? 'up' : 'down') } finally { maintBusy.value = false }
+  err.value = null
+  try {
+    if (isLaravel.value) {
+      tab.value = 'overview'
+      await runArtisan(ov.data.value?.maintenance ? 'up' : 'down')
+    } else if (model.value) {
+      const st = await quickPlan({ kind: 'site_options', params: { id: p.data.value!.site_id, options: { ...model.value.options, maintenance: !model.value.options.maintenance } } })
+      if (st !== 'applied') err.value = `Maintenance mode change ${st} — see Activity.`
+      await loadModel()
+    }
+  } catch (e) { fail(e) } finally { maintBusy.value = false }
 }
 function onArtisanDone() { setTimeout(() => ov.refresh(), 500) }
 
@@ -131,35 +163,45 @@ const cards = computed<Card[]>(() => {
   if (!o) return []
   const m = o.monitor
   const out: Card[] = []
-  const up = m.uptime !== null ? `${(m.uptime * 100).toFixed(m.uptime === 1 ? 0 : 1)}% up · 24 h` : ''
-  if (m.last_code === null) out.push({ name: 'HTTP check', value: '—', state: 'First check soon', tone: 'off' })
-  else if (m.last_code === 0 || m.last_code >= 500) out.push({ name: 'HTTP check', value: m.last_code === 0 ? 'No answer' : String(m.last_code), state: up || 'Down', tone: 'bad' })
-  else out.push({ name: 'HTTP check', value: `${m.last_code} · ${m.last_ms} ms`, state: up || `Every ${m.interval_secs} s`, tone: 'ok' })
+  // 1 HTTP check
+  if (m.last_code === null) out.push({ name: 'HTTP check', value: '—', state: `Every ${m.interval_secs} s`, tone: 'off' })
+  else if (m.last_code === 0) out.push({ name: 'HTTP check', value: 'No answer', state: 'Down', tone: 'bad' })
+  else if (m.last_code >= 500) out.push({ name: 'HTTP check', value: `${m.last_code} Error`, state: maintenanceOn.value ? 'Maintenance' : 'Down', tone: maintenanceOn.value ? 'warn' : 'bad' })
+  else out.push({ name: 'HTTP check', value: `${m.last_code} ${m.last_code < 300 ? 'OK' : m.last_code < 400 ? 'Redirect' : 'Client error'}`, state: `Every ${m.interval_secs} s`, tone: m.last_code < 400 ? 'ok' : 'warn' })
+  // 2 SSL
   const d = o.site.ssl_days
   out.push(!o.site.ssl
     ? { name: 'SSL certificate', value: 'Off', state: 'Enable HTTPS', tone: 'warn' }
     : d === null ? { name: 'SSL certificate', value: 'On', state: 'Unknown expiry', tone: 'info' }
-      : { name: 'SSL certificate', value: `${d} days`, state: d < 7 ? 'Expiring' : d < 14 ? 'Renew soon' : 'Valid', tone: d < 7 ? 'bad' : d < 14 ? 'warn' : 'ok' })
+      : { name: 'SSL certificate', value: `${d} days`, state: d < 7 ? 'Expiring' : d < 30 ? 'Renewing' : 'Auto-renews', tone: d < 7 ? 'bad' : d < 30 ? 'warn' : 'ok' })
   if (isLaravel.value) {
+    // 3 queue, 4 scheduler
     const pt = pendingTotal.value
-    out.push(!o.workers.length
-      ? { name: 'Queue pending', value: pt === null ? '—' : pt.toLocaleString(), state: 'No workers', tone: pt ? 'warn' : 'off' }
-      : { name: 'Queue pending', value: pt === null ? '—' : pt.toLocaleString(), state: (pt ?? 0) > 500 ? 'Backlog' : 'Normal', tone: (pt ?? 0) > 500 ? 'warn' : 'ok' })
+    out.push({ name: 'Queue pending', value: pt === null ? '—' : pt.toLocaleString(), state: !o.workers.length ? 'No workers' : (pt ?? 0) > 500 ? 'Backlog' : 'Normal', tone: !o.workers.length ? ((pt ?? 0) > 0 ? 'warn' : 'off') : (pt ?? 0) > 500 ? 'warn' : 'ok' })
     const s = o.scheduler
     const late = s.last_run !== null && Date.now() / 1000 - s.last_run > 180
     out.push(!s.enabled
       ? { name: 'Scheduler', value: 'Off', state: 'Not running', tone: 'off' }
+      : !s.cron_running ? { name: 'Scheduler', value: ago(s.last_run), state: 'cron stopped', tone: 'bad' }
       : { name: 'Scheduler', value: ago(s.last_run), state: s.last_run === null ? 'Waiting' : late ? 'Late' : 'Running', tone: s.last_run === null ? 'info' : late ? 'warn' : 'ok' })
   } else {
+    // 3 PHP version, 4 composer
     const e = phpEol.value
-    out.push({ name: 'PHP version', value: o.site.php_version ?? '—', state: e?.label ?? '—', tone: e?.tone ?? 'off' })
-    out.push({ name: 'Failed checks · 1 h', value: `${m.failures_1h} / ${m.checks_1h}`, state: m.failures_1h ? 'Errors' : 'Normal', tone: m.failures_1h ? 'warn' : 'ok' })
+    out.push({ name: 'PHP version', value: o.site.php_version ?? '—', state: e?.tone === 'bad' ? 'End of life' : e?.label ?? '—', tone: e?.tone ?? 'off' })
+    out.push(o.composer.lock
+      ? { name: 'Composer packages', value: `${o.composer.packages}`, state: o.composer.on_deploy ? 'Installed on deploy' : 'Not on deploy', tone: o.composer.on_deploy ? 'ok' : 'info' }
+      : { name: 'Composer packages', value: '—', state: 'No composer.lock', tone: 'off' })
   }
-  const n = o.errors.last_hour
-  out.push({ name: 'Errors logged · 1 h', value: String(n), state: n === 0 ? 'Normal' : n > 50 ? 'High' : 'Some errors', tone: n === 0 ? 'ok' : n > 50 ? 'bad' : 'warn' })
+  // 5 error rate (share of failed checks in the last hour)
+  const rate = m.checks_1h ? (m.failures_1h / m.checks_1h) * 100 : null
+  out.push({ name: 'Error rate · 1 h', value: rate === null ? '—' : `${rate.toFixed(1)}%`, state: rate === null ? 'No checks yet' : rate === 0 ? 'Normal' : rate < 5 ? 'Some errors' : 'High', tone: rate === null ? 'off' : rate === 0 ? 'ok' : rate < 5 ? 'warn' : 'bad' })
+  // 6 storage
   if (isLaravel.value) {
     const b = o.facts?.logs_bytes ?? null
     out.push({ name: 'storage/logs', value: b === null ? '—' : formatBytes(b), state: (b ?? 0) > 500e6 ? 'Rotate logs' : 'OK', tone: (b ?? 0) > 500e6 ? 'warn' : 'ok' })
+  } else if (o.uploads_dir) {
+    const b = o.facts?.uploads_bytes ?? null
+    out.push({ name: `${o.uploads_dir}/`, value: b === null ? '—' : formatBytes(b), state: 'OK', tone: 'ok' })
   } else {
     const b = o.facts?.dir_bytes ?? null
     out.push({ name: 'Project size', value: b === null ? '—' : formatBytes(b), state: 'On disk', tone: 'ok' })
@@ -168,8 +210,21 @@ const cards = computed<Card[]>(() => {
 })
 
 // ------------------------------------------------------------------ chart
+/** Hourly buckets once there are a few hours of data; before that the last 2 h in 5-minute steps. */
+const series = computed(() => {
+  const m = ov.data.value?.monitor
+  if (!m) return { buckets: [] as Bucket[], label: '24 h', fine: false }
+  const filled = m.buckets.filter((x) => x.p50 !== null).length
+  if (filled >= 3) return { buckets: m.buckets, label: '24 h', fine: false }
+  // Start where the data starts (at least 30 minutes wide).
+  const first = m.recent.findIndex((x) => x.checks > 0)
+  const from = first < 0 ? 0 : Math.min(first, m.recent.length - 6)
+  const buckets = m.recent.slice(Math.max(0, from))
+  const mins = buckets.length * 5
+  return { buckets, label: mins >= 120 ? 'last 2 h' : `last ${mins} min`, fine: true }
+})
 const chart = computed(() => {
-  const b = ov.data.value?.monitor.buckets ?? []
+  const b = series.value.buckets
   const vals = b.flatMap((x) => [x.p50, x.p95]).filter((v): v is number => v !== null)
   const max = Math.max(100, ...vals)
   const nice = [100, 200, 250, 500, 1000, 2000, 2500, 5000, 10000].find((n) => n >= max) ?? Math.ceil(max / 1000) * 1000
@@ -193,27 +248,30 @@ const chart = computed(() => {
     .map((d) => ({ x: d.x, y: y(d.v as number) }))
   const fails = b.map((pt, i) => ({ x: x(i), n: pt.failures })).filter((f) => f.n > 0)
   const grid = [nice, nice / 2, 0].map((v) => ({ y: y(v), label: v >= 1000 ? `${v / 1000} s` : `${v} ms` }))
-  const hours = b.length ? [0, 6, 12, 18, b.length - 1].map((i) => ({ x: x(i), label: new Date(b[i]!.ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) })) : []
+  const idx = [...new Set([0, Math.round(b.length / 4), Math.round(b.length / 2), Math.round((3 * b.length) / 4), b.length - 1])].filter((i) => i >= 0 && i < b.length)
+  const hours = b.length ? idx.map((i) => ({ x: x(i), label: new Date(b[i]!.ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) })) : []
   return { p50: path('p50'), p95: path('p95'), dots50: dots('p50'), dots95: dots('p95'), fails, grid, hours }
 })
 const chartNote = computed(() => {
   const o = ov.data.value
   if (!o) return 'Loading response times'
-  const b = o.monitor.buckets.filter((x) => x.p50 !== null)
+  const b = series.value.buckets.filter((x) => x.p50 !== null)
   if (!b.length) return `Collecting data: NexaCloud checks the site every ${o.monitor.interval_secs} s; the first points appear within the hour.`
   const p50s = b.map((x) => x.p50 as number).sort((a, c) => a - c)
   const med = p50s[Math.floor(p50s.length / 2)]
   const worst = Math.max(...b.map((x) => x.p95 ?? 0))
-  const failed = o.monitor.buckets.reduce((a, x) => a + x.failures, 0)
-  return `Typical response ${med} ms, slowest hour p95 ${worst} ms.${failed ? ` ${failed} failed check${failed > 1 ? 's' : ''} in 24 h.` : ' No failed checks in 24 h.'}`
+  const failed = series.value.buckets.reduce((a, x) => a + x.failures, 0)
+  const span = series.value.fine ? `the ${series.value.label}` : '24 h'
+  return `Typical response ${med} ms, slowest ${series.value.fine ? '5 minutes' : 'hour'} p95 ${worst} ms.${failed ? ` ${failed} failed check${failed > 1 ? 's' : ''} in ${span}.` : ` No failed checks in ${span}.`}${series.value.fine ? ' The 24-hour view starts once there are a few hours of data.' : ''}`
 })
 
 // ------------------------------------------------------------------ workers
 const editingWorkers = ref(false)
 const workerRows = ref<{ name: string; queue: string; processes: number }[]>([])
-function startEditWorkers() {
+function startEditWorkers(add = true) {
   workerRows.value = (ov.data.value?.workers ?? []).map((w) => ({ name: w.name, queue: w.queue, processes: w.processes }))
   if (!workerRows.value.length) workerRows.value.push({ name: 'default', queue: 'default', processes: 2 })
+  else if (add) addWorkerRow()
   editingWorkers.value = true
 }
 function addWorkerRow() { workerRows.value.push({ name: `worker-${workerRows.value.length + 1}`, queue: 'default', processes: 1 }) }
@@ -245,6 +303,51 @@ function nextHuman(iso: string) {
   if (s < 5400) return `in ${Math.round(s / 60)} min`
   if (s < 172800) return `in ${Math.round(s / 3600)} h`
   return formatDate(iso)
+}
+
+function lastRun(cmd: string) {
+  const r = ov.data.value?.scheduler.runs?.find((x) => x.command === cmd || cmd.startsWith(x.command) || x.command.startsWith(cmd))
+  return r ?? null
+}
+function runWhen(at: string) {
+  const today = new Date().toISOString().slice(0, 10)
+  return at.startsWith(today) ? `Today ${at.slice(11, 16)}` : at.slice(0, 16)
+}
+
+// ------------------------------------------------------------------ plain PHP settings
+const webRoot = ref('')
+const frontController = ref(true)
+watch(model, (m) => { if (m) { webRoot.value = m.root ?? ''; frontController.value = m.options?.front_controller !== false } }, { immediate: true })
+const composerOnDeploy = computed(() => !!ov.data.value?.composer.on_deploy)
+const COMPOSER_BLOCK = 'if [ -f composer.json ] && command -v composer >/dev/null; then\n  composer install --no-dev --no-interaction --prefer-dist --optimize-autoloader\nfi\n'
+const setBusy = ref(false)
+async function setComposer(on: boolean) {
+  if (!p.data.value) return
+  setBusy.value = true
+  let script = p.data.value.script
+  if (on && !script.includes('composer install')) script = script.replace(/^(#[^\n]*\n)?/, (m) => m + COMPOSER_BLOCK)
+  if (!on) script = script.replace(/if \[ -f composer\.json \][^\n]*\n[^\n]*composer install[^\n]*\nfi\n?/, '').replace(/^.*composer install.*\n?/m, '')
+  try { await api.put(`/api/projects/${enc.value}`, { script }); await p.refresh(); ov.refresh() } catch (e) { fail(e) } finally { setBusy.value = false }
+}
+const uploadsKept = computed(() => (ov.data.value?.shared ?? []).includes('uploads'))
+async function keepUploads() {
+  setBusy.value = true
+  err.value = null
+  try {
+    const st = await quickPlan({ kind: 'project_shared', params: { id: id.value, name: 'uploads' } })
+    if (st !== 'applied') err.value = `Could not keep uploads/ (${st}) — see Activity.`
+    ov.refresh()
+  } catch (e) { fail(e) } finally { setBusy.value = false }
+}
+async function saveFrontController(on: boolean) {
+  if (!model.value || !p.data.value) return
+  setBusy.value = true
+  err.value = null
+  try {
+    const st = await quickPlan({ kind: 'site_options', params: { id: p.data.value.site_id, options: { ...model.value.options, front_controller: on } } })
+    if (st !== 'applied') err.value = `Front controller change ${st} — see Activity.`
+    await loadModel()
+  } catch (e) { fail(e) } finally { setBusy.value = false }
 }
 
 // ------------------------------------------------------------------ errors
@@ -287,6 +390,18 @@ function envApplied(s: string) {
   editingKey.value = null
   loadEnv()
 }
+
+const envText = ref<string | null>(null)
+const envTextOrig = ref('')
+async function editAsText() {
+  if (envText.value !== null) { envText.value = null; return }
+  try {
+    const r = await api.post<{ content: string }>(`/api/projects/${enc.value}/env/raw`, {})
+    envText.value = r.content
+    envTextOrig.value = r.content
+  } catch (e) { fail(e) }
+}
+function envTextApplied(s: string) { if (s === 'applied') { envText.value = null; loadEnv() } }
 
 // ------------------------------------------------------------------ logs
 const logs = ref<{ sources: { id: string; label: string }[]; file: string | null; text: string } | null>(null)
@@ -378,7 +493,7 @@ async function disconnect() {
 <template>
   <header class="phead">
     <div class="stack" style="gap: 10px">
-      <p class="lbl"><NuxtLink to="/projects" class="crumb">Deployments</NuxtLink> / {{ id }}</p>
+      <p class="lbl"><NuxtLink to="/projects" class="crumb">Projects</NuxtLink> / {{ id }}</p>
       <div class="row wrap" style="gap: 12px">
         <h1>{{ id }}</h1>
         <StatusPill :tone="health.tone" :label="health.label" />
@@ -389,8 +504,8 @@ async function disconnect() {
     </div>
     <div class="row wrap" style="gap: 10px">
       <a v-if="ov.data.value" class="btn" :href="ov.data.value.site.url" target="_blank" rel="noopener">Visit site</a>
-      <button v-if="isLaravel && ov.data.value" type="button" class="btn" :disabled="maintBusy" :aria-pressed="ov.data.value.maintenance" @click="toggleMaintenance">
-        Maintenance mode: {{ ov.data.value.maintenance ? 'On' : 'Off' }}
+      <button v-if="ov.data.value && (isLaravel || model)" type="button" class="btn" :class="{ 'btn-warn': maintenanceOn }" :disabled="maintBusy" :aria-pressed="maintenanceOn" @click="toggleMaintenance">
+        {{ maintBusy ? 'Switching…' : `Maintenance mode: ${maintenanceOn ? 'On' : 'Off'}` }}
       </button>
       <button type="button" class="btn btn-p" :disabled="!p.data.value" @click="deploy()"><AppIcon name="play" :size="14" :stroke="2" /> Deploy now</button>
     </div>
@@ -421,7 +536,7 @@ async function disconnect() {
     <div class="split">
       <section class="card chart-card" aria-labelledby="rt">
         <div class="row wrap" style="justify-content: space-between; gap: 10px">
-          <h2 id="rt">Response time · 24 h</h2>
+          <h2 id="rt">Response time · {{ series.label }}</h2>
           <div class="row legend">
             <span><i style="background: #6CB4FF" />p50</span>
             <span><i style="background: #F7C55E" />p95</span>
@@ -464,13 +579,21 @@ async function disconnect() {
           <span class="small text-2">Move this site to a supported PHP version. NexaCloud checks the site after switching and rolls back if it breaks.</span>
           <NuxtLink class="btn btn-s btn-p" :to="`/sites?q=${encodeURIComponent(p.data.value.site_id)}`" style="align-self: flex-start">Review &amp; upgrade</NuxtLink>
         </div>
-        <dl class="facts">
-          <dt>Project folder</dt><dd class="mono">{{ p.data.value.dir }}</dd>
-          <dt>PHP</dt><dd>{{ ov.data.value?.site.php_version ?? '—' }} · {{ ov.data.value?.site.runtime === 'frankenphp' ? 'FrankenPHP' : 'PHP-FPM' }}</dd>
-          <dt>Runs as</dt><dd class="mono">{{ p.data.value.run_as }}</dd>
-          <dt>On deploy</dt><dd>{{ p.data.value.script.includes('composer') ? 'composer install, then your script' : 'your script' }}</dd>
-        </dl>
-        <NuxtLink class="btn btn-s" :to="`/sites?q=${encodeURIComponent(p.data.value.site_id)}`" style="align-self: flex-start">Site settings (web root, PHP, SSL)</NuxtLink>
+        <form class="stack" style="gap: 6px" @submit.prevent="quickPlan({ kind: 'site_root', params: { id: p.data.value.site_id, root: webRoot } }).then((st) => { if (st !== 'applied') err = `Web root change ${st} — see Activity.`; loadModel() }).catch(fail)">
+          <label class="field"><span>Web root</span>
+            <div class="row" style="gap: 8px"><input v-model="webRoot" class="in mono" type="text" :disabled="!model" spellcheck="false"><button type="submit" class="btn btn-s" :disabled="!model || webRoot === (model?.root ?? '')">Save</button></div>
+          </label>
+        </form>
+        <label class="field"><span>Front controller</span>
+          <select class="in mono" :value="frontController ? 'on' : 'off'" :disabled="!model || setBusy" @change="saveFrontController(($event.target as HTMLSelectElement).value === 'on')">
+            <option value="on">index.php (route all requests)</option>
+            <option value="off">none (only real files)</option>
+          </select>
+        </label>
+        <label class="chk"><input type="checkbox" :checked="composerOnDeploy" :disabled="setBusy" @change="setComposer(($event.target as HTMLInputElement).checked)">Run composer install on deploy</label>
+        <label class="chk"><input type="checkbox" :checked="p.data.value.strategy !== 'releases' || uploadsKept" :disabled="setBusy || p.data.value.strategy !== 'releases' || uploadsKept" @change="keepUploads">Keep uploads/ between releases</label>
+        <p v-if="!model" class="small muted">Web root and front controller can be changed once the site is managed by NexaCloud (Sites → Manage with NexaCloud).</p>
+        <p v-else-if="p.data.value.strategy !== 'releases'" class="small muted">In-place deploys keep uploads/ automatically.</p>
       </section>
     </div>
 
@@ -478,7 +601,11 @@ async function disconnect() {
       <div class="row wrap card-top">
         <h2 id="wk">Queue workers · Supervisor</h2>
         <div class="row" style="gap: 8px">
-          <button type="button" class="btn btn-s" @click="editingWorkers ? (editingWorkers = false) : startEditWorkers()">{{ editingWorkers ? 'Close' : ov.data.value.workers.length ? 'Edit workers' : 'Add worker' }}</button>
+          <button v-if="editingWorkers" type="button" class="btn btn-s" @click="editingWorkers = false">Close</button>
+          <template v-else>
+            <button v-if="ov.data.value.workers.length" type="button" class="btn btn-s" @click="startEditWorkers(false)">Edit</button>
+            <button type="button" class="btn btn-s" @click="startEditWorkers(true)">Add worker</button>
+          </template>
           <button v-if="ov.data.value.workers.length" type="button" class="btn btn-s btn-p" :disabled="restartBusy !== null" @click="restartWorker()">Restart all</button>
         </div>
       </div>
@@ -546,12 +673,13 @@ async function disconnect() {
         </div>
         <div v-else class="table-wrap">
           <table>
-            <thead><tr><th>Command</th><th>Runs</th><th>Next run</th></tr></thead>
+            <thead><tr><th>Command</th><th>Runs</th><th>Last run</th><th>Result</th></tr></thead>
             <tbody>
               <tr v-for="s in ov.data.value.facts.schedule" :key="s.command + s.expression">
                 <td class="mono" style="font-size: 13px; white-space: normal">{{ s.command }}</td>
                 <td class="small text-2">{{ cronHuman(s.expression) }}</td>
-                <td class="small text-2">{{ ov.data.value.scheduler.enabled ? nextHuman(s.next) : 'Scheduler off' }}</td>
+                <td class="small text-2">{{ lastRun(s.command) ? runWhen(lastRun(s.command)!.at) : (ov.data.value.scheduler.enabled ? `Not yet · next ${nextHuman(s.next)}` : 'Scheduler off') }}</td>
+                <td><StatusPill v-if="lastRun(s.command)" :tone="lastRun(s.command)!.ok ? 'ok' : 'bad'" :label="lastRun(s.command)!.ok ? 'OK' : 'Failed'" /><span v-else class="small muted">—</span></td>
               </tr>
             </tbody>
           </table>
@@ -618,26 +746,25 @@ async function disconnect() {
         <p class="small text-2">{{ deployNote(shownDeploy) }}</p>
       </section>
     </div>
-    <section v-if="p.data.value.strategy === 'releases'" class="card card-pad stack" aria-labelledby="rel-h" style="gap: 6px">
-      <h2 id="rel-h">Releases on disk</h2>
-      <p class="small muted">Activating an older release only switches the <span class="mono">current</span> link and checks the site — seconds, no rebuild. Database migrations are not undone.</p>
-      <div v-for="r in rel.data.value?.releases ?? []" :key="r.name" class="list-row">
-        <span class="mono grow" style="font-size: 13px">releases/{{ r.name }}</span>
-        <span class="mono small muted">{{ r.commit?.slice(0, 8) }}</span>
-        <span class="small muted ellipsis" style="max-width: 260px">{{ r.message }}</span>
-        <StatusPill v-if="r.current" tone="ok" label="current" />
-        <ConfirmAction v-else :label="activating === r.name ? 'Activating…' : 'Activate'" :question="`Make release ${r.name} live?`" confirm-label="Activate" :busy="activating === r.name" @confirm="activate(r.name)" />
-      </div>
-      <div v-if="!(rel.data.value?.releases ?? []).length" class="small muted">No releases yet — the first deploy creates releases/1.</div>
-    </section>
   </template>
 
   <!-- ================================================================ env -->
   <section v-if="tab === 'env'" class="card card-pad stack" aria-label="Environment variables" style="gap: 14px">
-    <div class="stack" style="gap: 4px">
-      <h2>.env</h2>
-      <p class="small muted">Secrets stay hidden until you reveal one (asks for your password and is logged). Saving clears Laravel's config cache and checks the site; if it breaks, the old file is restored.</p>
+    <div class="row wrap" style="justify-content: space-between; gap: 10px; align-items: flex-start">
+      <div class="stack" style="gap: 4px">
+        <h2>.env</h2>
+        <p class="small muted">Secrets stay hidden until you reveal one (asks for your password and is logged). Saving clears the config cache and checks the site; if it breaks, the old file is restored.</p>
+      </div>
+      <div class="row" style="gap: 8px">
+        <button type="button" class="btn btn-s" :class="{ 'btn-on': envText !== null }" @click="editAsText">{{ envText !== null ? 'Back to table' : 'Edit as text' }}</button>
+        <PlanAction v-if="envText === null" :key="JSON.stringify(envChanges)" :request="{ kind: 'project_env', params: { id, set: envChanges } }" label="Save & reload" :disabled="!Object.keys(envChanges).length" success-text=".env saved and the site still works." @done="envApplied" />
+      </div>
     </div>
+    <template v-if="envText !== null">
+      <textarea v-model="envText" class="in mono envtext" rows="18" spellcheck="false" aria-label=".env file" />
+      <PlanAction :key="envText.length + envText.slice(-30)" :request="{ kind: 'project_env_raw', params: { id, content: envText } }" label="Save & reload" :disabled="envText === envTextOrig" success-text=".env saved and the site still works." @done="envTextApplied" />
+    </template>
+    <template v-if="envText === null">
     <p v-if="envData && !envData.exists" class="note">No .env file yet. Add variables below and save to create it.</p>
     <div class="table-wrap">
       <table>
@@ -674,7 +801,7 @@ async function disconnect() {
       <input v-model="newVal" class="in mono" type="text" placeholder="value" aria-label="New variable value">
       <button type="submit" class="btn btn-s" :disabled="!newKey.trim()">Add variable</button>
     </form>
-    <PlanAction :key="JSON.stringify(envChanges)" :request="{ kind: 'project_env', params: { id, set: envChanges } }" label="Preview & save" :disabled="!Object.keys(envChanges).length" success-text=".env saved and the site still works." @done="envApplied" />
+    </template>
   </section>
 
   <!-- ================================================================ logs -->
@@ -694,7 +821,9 @@ async function disconnect() {
   </section>
 
   <!-- ================================================================ pipeline -->
-  <section v-if="tab === 'pipeline' && p.data.value" class="card card-pad stack" style="gap: 14px">
+  <div v-if="tab === 'deploys' && p.data.value" class="split">
+  <section class="card card-pad stack pipe" aria-labelledby="pipe-h" style="gap: 14px">
+    <h2 id="pipe-h">Pipeline · {{ id }}</h2>
     <div class="fgrid">
       <label class="field"><span>Repository</span><input v-model="settings.repo" class="in mono" type="text"></label>
       <label class="field"><span>Branch</span><input v-model="settings.branch" class="in mono" type="text"></label>
@@ -718,27 +847,36 @@ async function disconnect() {
       <ConfirmAction label="Disconnect" question="Disconnect this site from Git? The site and its files stay." confirm-label="Disconnect" @confirm="disconnect" /></div>
   </section>
 
-  <!-- ================================================================ setup -->
-  <template v-if="tab === 'setup' && p.data.value">
-    <section v-if="p.data.value.needs_key" class="card card-pad stack" style="gap: 10px">
-      <h2>1. Add the deploy key to GitHub</h2>
-      <p class="small text-2">GitHub → your repository → <strong>Settings → Deploy keys → Add deploy key</strong>. Paste this key, leave “Allow write access” off.</p>
-      <div class="code-row"><code class="mono">{{ p.data.value.deploy_key }}</code><button type="button" class="btn btn-s" @click="copy(p.data.value.deploy_key ?? '')">Copy</button></div>
+  <div class="stack pipe-side" style="gap: 16px">
+    <section class="card card-pad stack" style="gap: 12px">
+      <div class="row wrap" style="justify-content: space-between; gap: 10px"><h2>Prefer GitHub Actions?</h2><button type="button" class="btn btn-s" @click="copy(p.data.value.actions_yaml)">Copy file</button></div>
+      <p class="small muted">Add this file as <span class="mono">.github/workflows/deploy.yml</span> with the repository secrets <span class="mono">NEXACLOUD_URL</span> and <span class="mono">NEXACLOUD_SECRET</span>. Tests run on GitHub; NexaCloud only deploys a green build. (Then turn off “Deploy when I push”.)</p>
+      <pre class="yaml mono">{{ p.data.value.actions_yaml }}</pre>
     </section>
-    <section class="card card-pad stack" style="gap: 10px">
-      <h2>{{ p.data.value.needs_key ? '2. ' : '' }}Deploy on push</h2>
-      <p class="small text-2"><strong>Automatic (already works):</strong> with “Deploy when I push” on, NexaCloud checks GitHub every minute and deploys new commits.</p>
-      <p class="small text-2"><strong>Instant (webhook):</strong> GitHub → Settings → Webhooks → Add webhook. Content type <span class="mono">application/json</span>, “Just the push event”. GitHub needs a valid HTTPS certificate, so give the panel its own domain first (Security page).</p>
+    <section v-if="p.data.value.strategy === 'releases'" class="card card-pad stack" aria-labelledby="rel-h" style="gap: 6px">
+      <h2 id="rel-h">Releases on disk</h2>
+      <p class="small muted">Activating an older release only switches the <span class="mono">current</span> link and checks the site — seconds, no rebuild. Database migrations are not undone.</p>
+      <div v-for="r in rel.data.value?.releases ?? []" :key="r.name" class="list-row">
+        <span class="mono grow" style="font-size: 13px">releases/{{ r.name }}</span>
+        <span class="mono small muted">{{ r.commit?.slice(0, 8) }}</span>
+        <span class="small muted ellipsis" style="max-width: 260px">{{ r.message }}</span>
+        <StatusPill v-if="r.current" tone="ok" label="current" />
+        <ConfirmAction v-else :label="activating === r.name ? 'Activating…' : 'Activate'" :question="`Make release ${r.name} live?`" confirm-label="Activate" :busy="activating === r.name" @confirm="activate(r.name)" />
+      </div>
+      <div v-if="!(rel.data.value?.releases ?? []).length" class="small muted">No releases yet — the first deploy creates releases/1.</div>
+    </section>
+    <section id="connect" class="card card-pad stack" style="gap: 10px">
+      <h2>Connect GitHub</h2>
+      <template v-if="p.data.value.needs_key">
+        <p class="small text-2"><strong>1. Deploy key</strong> · GitHub → repository → Settings → Deploy keys → Add deploy key. Leave “Allow write access” off.</p>
+        <div class="code-row"><code class="mono">{{ p.data.value.deploy_key }}</code><button type="button" class="btn btn-s" @click="copy(p.data.value.deploy_key ?? '')">Copy</button></div>
+      </template>
+      <p class="small text-2"><strong>{{ p.data.value.needs_key ? '2. ' : '' }}Deploy on push</strong> · With “Deploy when I push” on, NexaCloud checks the branch every minute. For instant deploys add a webhook (Settings → Webhooks, <span class="mono">application/json</span>, push event); GitHub needs the panel on its own domain with HTTPS (Security page).</p>
       <div class="kv"><span class="lbl">Payload URL</span><div class="code-row"><code class="mono">{{ panelOrigin }}{{ p.data.value.webhook_path }}</code><button type="button" class="btn btn-s" @click="copy(panelOrigin + p.data.value.webhook_path)">Copy</button></div></div>
       <div class="kv"><span class="lbl">Secret</span><div class="code-row"><code class="mono">{{ p.data.value.webhook_secret }}</code><button type="button" class="btn btn-s" @click="copy(p.data.value.webhook_secret)">Copy</button></div></div>
     </section>
-    <section class="card card-pad stack" style="gap: 10px">
-      <h2>Prefer GitHub Actions?</h2>
-      <p class="small text-2">Add this file as <span class="mono">.github/workflows/deploy.yml</span> and the repository secrets <span class="mono">NEXACLOUD_URL</span> and <span class="mono">NEXACLOUD_SECRET</span>. Tests run on GitHub; only a green build triggers the deploy. (Then turn off “Deploy when I push” here.)</p>
-      <pre class="yaml mono">{{ p.data.value.actions_yaml }}</pre>
-      <button type="button" class="btn btn-s" style="align-self: flex-start" @click="copy(p.data.value.actions_yaml)">Copy file</button>
-    </section>
-  </template>
+  </div>
+  </div>
 </template>
 
 <style scoped>
@@ -810,4 +948,10 @@ input[type=checkbox] { accent-color: var(--accent); width: 20px; height: 20px; }
 .sicon.running { background: rgba(108, 180, 255, .14); color: #8CC4FF; }
 .ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .convert { display: flex; flex-direction: column; gap: 10px; padding: 14px; border: 1px solid var(--card-line); border-radius: 10px; }
+.pipe { flex: 1 1 420px; min-width: 0; }
+.pipe-side { flex: 1 1 420px; min-width: 0; }
+.chk { display: flex; align-items: center; gap: 10px; font-size: 14px; }
+.chk input { width: 18px; height: 18px; accent-color: var(--accent); }
+.envtext { min-height: 360px; padding: 12px; line-height: 1.6; font-size: 13px; }
+.btn-warn { border-color: var(--warn); color: var(--warn); }
 </style>

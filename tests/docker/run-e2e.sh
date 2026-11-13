@@ -641,6 +641,25 @@ push_version v6 '<?php echo "app v6 as ".posix_getpwuid(posix_geteuid())["name"]
 jid="$(post_json projects/app.test.local/deploy '{}' | jq -r .job_id)"; st="$(wait_job2 "$jid")"
 check "deploy as the new user → v6 served by its own pool" bash -c "[ '$st' = ok ] && docker exec $NAME curl -s -H 'Host: app.test.local' http://127.0.0.1/ | grep -qx 'app v6 as nc_app_test_local'"
 
+step "Project page actions: maintenance mode, front controller, .env as text"
+sudo_on "$PASS"
+OPTS="$(api sites/app.test.local/model | jq -c '.options')"
+st="$(plan site_options "{\"id\":\"app.test.local\",\"options\":$(printf '%s' "$OPTS" | jq -c '.maintenance=true')}")"
+check "plain PHP maintenance mode on → applied (no probe on purpose)" test "$st" = applied
+check "…site answers 503 with the maintenance page" bash -c "for i in \$(seq 1 10); do docker exec $NAME curl -s -H 'Host: app.test.local' http://127.0.0.1/ | grep -q 'right back' && [ \"\$(docker exec $NAME curl -s -o /dev/null -w '%{http_code}' -H 'Host: app.test.local' http://127.0.0.1/)\" = 503 ] && exit 0; sleep 1; done; exit 1"
+st="$(plan site_options "{\"id\":\"app.test.local\",\"options\":$(printf '%s' "$OPTS" | jq -c '.maintenance=false | .front_controller=false')}")"
+check "maintenance off + front controller off → applied" test "$st" = applied
+check "…unknown paths now 404 instead of index.php" bash -c "for i in \$(seq 1 10); do [ \"\$(docker exec $NAME curl -s -o /dev/null -w '%{http_code}' -H 'Host: app.test.local' http://127.0.0.1/nope)\" = 404 ] && exit 0; sleep 1; done; exit 1"
+st="$(plan site_options "{\"id\":\"app.test.local\",\"options\":$(printf '%s' "$OPTS" | jq -c '.front_controller=true')}")"
+check "front controller back on → /nope served by index.php" bash -c "[ '$st' = applied ] && for i in \$(seq 1 10); do docker exec $NAME curl -s -H 'Host: app.test.local' http://127.0.0.1/nope | grep -q 'app v6' && exit 0; sleep 1; done; exit 1"
+RAW="$(post_json projects/crm.test.local/env/raw '{}')"
+check ".env as text (sudo) returns the whole file" jqe "$RAW" '(.content|test("DB_PASSWORD="))'
+st="$(plan project_env_raw "$(jq -nc --arg c "$(printf '%s' "$RAW" | jq -r .content)
+EXTRA_FLAG=on" '{id:"crm.test.local",content:$c}')")"
+check "save .env as text → applied" bash -c "[ '$st' = applied ] && docker exec $NAME grep -qx 'EXTRA_FLAG=on' /var/www/crm.test.local/shared/.env"
+check "a broken .env line is refused" test "$(post_code plans/preview '{"kind":"project_env_raw","params":{"id":"crm.test.local","content":"not a valid line"}}')" = 409
+check "overview reports composer, shared folders and schedule runs" jqe "$(api 'projects/crm.test.local/overview')" '(.composer.lock==true) and ((.shared|index(".env"))!=null) and (.scheduler.runs|type)=="array" and (.monitor.recent|length)==24'
+
 step "Encrypted off-site backups and restore to staging"
 sudo_on "$PASS"
 ENC="$(post_json backup/destinations "{\"name\":\"NAS encrypted\",\"kind\":\"sftp\",\"config\":{\"host\":\"127.0.0.1\",\"port\":22,\"user\":\"nas\",\"path\":\"/home/nas/enc\",\"encrypt_password\":\"correct horse battery staple\"}}")"

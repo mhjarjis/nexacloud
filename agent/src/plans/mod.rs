@@ -50,6 +50,9 @@ pub enum PlanRequest {
     SiteAdopt(sites::AdoptParams),
     FirewallEnable(runtime::FirewallParams),
     SiteIsolate { id: String },
+    SiteRoot { id: String, root: String },
+    ProjectEnvRaw(projects::EnvRawParams),
+    ProjectShared { id: String, name: String },
     ProjectReleases { id: String },
 }
 
@@ -76,6 +79,9 @@ impl PlanRequest {
             PlanRequest::SiteAdopt(_) => "site_adopt",
             PlanRequest::FirewallEnable(_) => "firewall_enable",
             PlanRequest::SiteIsolate { .. } => "site_isolate",
+            PlanRequest::SiteRoot { .. } => "site_root",
+            PlanRequest::ProjectEnvRaw(_) => "project_env",
+            PlanRequest::ProjectShared { .. } => "project_shared",
             PlanRequest::ProjectReleases { .. } => "project_releases",
         }
     }
@@ -102,6 +108,9 @@ pub async fn build(state: &AppState, req: &PlanRequest) -> Result<ChangePlan, St
             let p = crate::deploys::get_project(&state.db, id).ok().flatten();
             sites::plan_isolate(env, id, p.as_ref())
         }
+        PlanRequest::SiteRoot { id, root } => sites::plan_root(env, id, root),
+        PlanRequest::ProjectShared { id, name } => projects::plan_shared(env, &project(id)?, name),
+        PlanRequest::ProjectEnvRaw(p) => projects::plan_env_raw(env, &project(&p.id)?, p),
         PlanRequest::ProjectReleases { id } => projects::plan_releases(env, &project(id)?),
         PlanRequest::SiteRuntime(p) => runtime::plan_runtime(env, p),
         PlanRequest::SiteAdopt(p) => sites::plan_adopt(env, p),

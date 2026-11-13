@@ -69,6 +69,13 @@ pub struct SiteOptions {
     pub cache_static: bool,
     #[serde(default = "yes")]
     pub block_hidden: bool,
+    /// PHP sites: send every request that isn't a file to index.php.
+    #[serde(default = "yes")]
+    pub front_controller: bool,
+    /// Answer every request with a "back soon" page (503), except
+    /// Let's Encrypt challenges.
+    #[serde(default)]
+    pub maintenance: bool,
 }
 
 impl Default for SiteOptions {
@@ -79,9 +86,13 @@ impl Default for SiteOptions {
             hsts: false,
             cache_static: true,
             block_hidden: true,
+            front_controller: true,
+            maintenance: false,
         }
     }
 }
+
+const MAINTENANCE_PAGE: &str = "<!doctype html><meta charset=utf-8><meta name=viewport content=\\\"width=device-width\\\"><title>Back soon</title><body style=\\\"font-family:system-ui;background:#0B0E12;color:#E7ECF2;display:grid;place-items:center;height:100vh;margin:0\\\"><div style=\\\"text-align:center\\\"><h1>We'll be right back</h1><p style=\\\"color:#A3AEBD\\\">This site is down for maintenance.</p></div>";
 
 /// Everything a managed nginx site is rendered from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -372,6 +383,12 @@ fn body(m: &SiteModel, acme: &str) -> String {
         b.push_str("    add_header Referrer-Policy \"strict-origin-when-cross-origin\" always;\n");
     }
     b.push_str(acme);
+    if o.maintenance && m.kind != SiteKind::Redirect {
+        b.push_str("    set $nc_maint 1;\n    if ($request_uri ~ \"^/\\.well-known/acme-challenge/\") { set $nc_maint 0; }\n    if ($nc_maint = 1) { return 503; }\n    error_page 503 @nc_maintenance;\n");
+        b.push_str(&format!(
+            "    location @nc_maintenance {{\n        default_type text/html;\n        add_header Retry-After 300 always;\n        return 503 \"{MAINTENANCE_PAGE}\";\n    }}\n"
+        ));
+    }
     match m.kind {
         SiteKind::Redirect => {
             b.push_str(&format!(
@@ -415,7 +432,11 @@ fn body(m: &SiteModel, acme: &str) -> String {
                     .fpm_socket
                     .clone()
                     .unwrap_or_else(|| format!("/run/php/php{v}-fpm.sock"));
-                b.push_str("    location / {\n        try_files $uri $uri/ /index.php?$query_string;\n    }\n");
+                b.push_str(if o.front_controller || m.kind == SiteKind::Laravel {
+                    "    location / {\n        try_files $uri $uri/ /index.php?$query_string;\n    }\n"
+                } else {
+                    "    location / {\n        try_files $uri $uri/ =404;\n    }\n"
+                });
                 b.push_str("    location = /favicon.ico { access_log off; log_not_found off; }\n");
                 b.push_str("    location = /robots.txt  { access_log off; log_not_found off; }\n");
                 b.push_str(&format!(
@@ -848,6 +869,14 @@ pub fn plan_options(env: &ChangeEnv, p: &OptionsParams) -> Result<ChangePlan, St
         }
         new.domains = d;
     }
+    if new.options.maintenance {
+        // The site answers 503 on purpose: check nginx only.
+        validate(&new)?;
+        let b = ChangePlan::builder("site_options", &format!("Maintenance mode on for {}", p.id), &format!("site:{}", p.id))
+            .lock(&format!("site:{}", p.id))
+            .write_file(&conf_path(&p.id), render(&new));
+        return nginx_apply(b).build(env).map_err(|e| format!("{e:#}"));
+    }
     plan_model_update(
         env,
         &old,
@@ -855,6 +884,29 @@ pub fn plan_options(env: &ChangeEnv, p: &OptionsParams) -> Result<ChangePlan, St
         "site_options",
         format!("Update settings of {}", p.id),
     )
+}
+
+/// Serve a different folder (inside the site's project folder).
+pub fn plan_root(env: &ChangeEnv, id: &str, root: &str) -> Result<ChangePlan, String> {
+    let old = load_model(env, id)?;
+    let root = root.trim().trim_end_matches('/').to_string();
+    if !valid_path(&root) {
+        return Err("web root: a folder under /var/www, /home or /srv".into());
+    }
+    if let Some(pd) = &old.project_dir {
+        if !(root == *pd || root.starts_with(&format!("{pd}/"))) {
+            return Err(format!("the web root must be inside {pd}"));
+        }
+    }
+    if !host_exists(env, &root) {
+        return Err(format!("{root} does not exist"));
+    }
+    if old.root.as_deref() == Some(root.as_str()) {
+        return Err("that is already the web root".into());
+    }
+    let mut new = old.clone();
+    new.root = Some(root.clone());
+    plan_model_update(env, &old, new, "site_root", format!("Serve {root} for {id}"))
 }
 
 /// Switch PHP version: managed → re-render; unmanaged → rewrite the socket
@@ -1444,6 +1496,8 @@ pub fn plan_adopt(env: &ChangeEnv, p: &AdoptParams) -> Result<ChangePlan, String
             hsts: false,
             cache_static: false,
             block_hidden: true,
+            front_controller: true,
+            maintenance: false,
         },
         fpm_socket,
         ssl_cert: site.ssl_certificate.clone(),
