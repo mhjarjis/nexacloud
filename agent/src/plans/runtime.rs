@@ -14,8 +14,11 @@ use crate::changes::{ChangeEnv, ChangePlan};
 use crate::plans::sites::{self, Runtime, SiteModel};
 
 pub const FRANKENPHP_BIN: &str = "/usr/local/bin/frankenphp";
+/// Pinned release + checksum (never "latest"): bump both together.
+pub const FRANKENPHP_VERSION: &str = "v1.13.5";
 const FRANKENPHP_URL: &str =
-    "https://github.com/php/frankenphp/releases/latest/download/frankenphp-linux-x86_64";
+    "https://github.com/php/frankenphp/releases/download/v1.13.5/frankenphp-linux-x86_64";
+const FRANKENPHP_SHA256: &str = "52d262be9b107a1a6f5f1d2945393dd838e89e4735c38a376b940e9fa9e1c881";
 pub const GUARD_UNIT: &str = "nexacloud-firewall-guard";
 
 fn unit_name(id: &str) -> String {
@@ -126,6 +129,13 @@ pub fn plan_runtime(env: &ChangeEnv, p: &RuntimeParams) -> Result<ChangePlan, St
                         1800,
                     )
                     .pre_command([
+                        "sh",
+                        "-c",
+                        "echo \"$1  /usr/local/bin/frankenphp.download\" | sha256sum -c - || { rm -f /usr/local/bin/frankenphp.download; echo 'checksum mismatch: refusing to install FrankenPHP'; exit 1; }",
+                        "verify",
+                        FRANKENPHP_SHA256,
+                    ])
+                    .pre_command([
                         "install",
                         "-m",
                         "0755",
@@ -150,7 +160,7 @@ pub fn plan_runtime(env: &ChangeEnv, p: &RuntimeParams) -> Result<ChangePlan, St
                 .command(["systemctl", "reload", "nginx"])
                 .on_revert(["sh", "-c", "systemctl disable --now \"$1\" 2>/dev/null; systemctl daemon-reload; systemctl reload nginx", "revert", &unit_n])
                 .note(format!(
-                    "Starts FrankenPHP (classic mode, its own bundled PHP) for {} on 127.0.0.1:{port} as {user}, then points nginx at it. The PHP-FPM pool is kept so you can switch back in one click. Check that your app's PHP extensions are in FrankenPHP's build (frankenphp php-cli -m).",
+                    "Starts FrankenPHP {FRANKENPHP_VERSION} (classic mode, its own bundled PHP) for {} on 127.0.0.1:{port} as {user}, then points nginx at it. The PHP-FPM pool is kept so you can switch back in one click. Check that your app's PHP extensions are in FrankenPHP's build (frankenphp php-cli -m).",
                     p.id
                 ));
         }
@@ -254,9 +264,26 @@ pub fn plan_firewall(
 }
 
 fn sshd_port(env: &ChangeEnv) -> u16 {
-    std::fs::read_to_string(env.host_path("/etc/ssh/sshd_config"))
-        .ok()
-        .and_then(|t| {
+    // The effective config (includes sshd_config.d/*), when sshd is present.
+    if env.root == std::path::Path::new("/") {
+        if let Ok(o) = std::process::Command::new("sshd").arg("-T").output() {
+            let t = String::from_utf8_lossy(&o.stdout);
+            if let Some(p) = t
+                .lines()
+                .find_map(|l| l.strip_prefix("port ").and_then(|p| p.trim().parse().ok()))
+            {
+                return p;
+            }
+        }
+    }
+    let mut files = vec![env.host_path("/etc/ssh/sshd_config")];
+    if let Ok(rd) = std::fs::read_dir(env.host_path("/etc/ssh/sshd_config.d")) {
+        files.extend(rd.flatten().map(|e| e.path()));
+    }
+    files
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .find_map(|t| {
             t.lines().find_map(|l| {
                 let l = l.trim();
                 l.strip_prefix("Port ").and_then(|p| p.trim().parse().ok())

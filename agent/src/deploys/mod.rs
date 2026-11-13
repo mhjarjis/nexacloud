@@ -269,6 +269,54 @@ fn in_flight(db: &Db, project: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The PHP binary the site's nginx config uses (`php8.3`), or `php`.
+pub fn php_bin(site_id: &str) -> String {
+    let blocks = crate::nginx::merge_blocks(crate::routes::sites::read_blocks(
+        Path::new("/etc/nginx/sites-enabled"),
+        Path::new("/etc/nginx/conf.d"),
+    ));
+    blocks
+        .iter()
+        .find(|b| b.id() == site_id)
+        .and_then(|b| {
+            b.fastcgi_pass
+                .as_deref()
+                .and_then(crate::nginx::php_version_from_socket)
+        })
+        .or_else(|| {
+            crate::plans::sites::load_model(
+                &crate::changes::ChangeEnv::system(PathBuf::from("/tmp")),
+                site_id,
+            )
+            .ok()
+            .and_then(|m| m.php_version)
+        })
+        .filter(|v| Path::new(&format!("/usr/bin/php{v}")).exists())
+        .map(|v| format!("php{v}"))
+        .unwrap_or_else(|| "php".into())
+}
+
+/// A directory whose `php` is the site's PHP version, to prepend to PATH so
+/// `php artisan …` and `composer` in deploy scripts use the right version.
+fn php_path_dir(site_id: &str) -> Option<String> {
+    let bin = php_bin(site_id);
+    if bin == "php" {
+        return None;
+    }
+    let dir = format!("/var/lib/nexacloud/phpbin/{bin}");
+    let _ = std::fs::create_dir_all(&dir);
+    let link = format!("{dir}/php");
+    if !Path::new(&link).exists() {
+        let _ = std::os::unix::fs::symlink(format!("/usr/bin/{bin}"), &link);
+    }
+    let _ = std::fs::set_permissions(
+        "/var/lib/nexacloud/phpbin",
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    );
+    let _ = std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o755));
+    Some(dir)
+}
+
 // ------------------------------------------------------------------ keys
 
 pub fn key_path(state: &AppState, id: &str) -> PathBuf {
@@ -484,7 +532,12 @@ async fn as_user(
         "-E",
         "COMPOSER_HOME=/tmp/nexacloud-composer",
         "-E",
-        "PATH=/usr/local/bin:/usr/bin:/bin",
+        &format!(
+            "PATH={}/usr/local/bin:/usr/bin:/bin",
+            php_path_dir(&p.site_id)
+                .map(|d| format!("{d}:"))
+                .unwrap_or_default()
+        ),
     ]);
     for (k, v) in env {
         c = c.args(["-E", &format!("{k}={v}")]);
@@ -508,11 +561,7 @@ async fn as_user(
 }
 
 async fn head_info(p: &Project, env: &[(String, String)]) -> Option<(String, String, String)> {
-    let mut c = Cmd::new("git").args([
-        "-c",
-        &format!("safe.directory={}", p.dir),
-        "-C",
-        &p.dir,
+    let mut c = crate::util::git_as_owner(Path::new(&p.dir)).args([
         "log",
         "-1",
         "--format=%H%x1f%s%x1f%an",
@@ -707,10 +756,19 @@ async fn run(
     match (&script_res, healthy) {
         (Ok(()), Some(code)) => {
             job.log(&format!("Health check: HTTP {code} — deploy is live"));
-            let mut proj = p.clone();
-            proj.last_commit = d.commit.clone();
-            proj.last_deploy_at = Some(now());
-            save_project(&state.db, &proj)?;
+            // Targeted update: settings edited during the deploy are kept.
+            state.db.conn().execute(
+                "UPDATE projects SET last_commit = ?2, last_deploy_at = ?3 WHERE id = ?1",
+                rusqlite::params![p.id, d.commit, now()],
+            )?;
+            if d.trigger == "rollback" && p.auto_deploy {
+                // Otherwise the poller would redeploy the newer (bad) commit within a minute.
+                state
+                    .db
+                    .conn()
+                    .execute("UPDATE projects SET auto_deploy = 0 WHERE id = ?1", [&p.id])?;
+                job.log("Auto-deploy paused because you rolled back. Turn it on again after pushing a fix.");
+            }
             Ok(false)
         }
         _ => {

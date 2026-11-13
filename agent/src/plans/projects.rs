@@ -41,6 +41,13 @@ pub fn plan_env(env: &ChangeEnv, p: &Project, params: &EnvParams) -> Result<Chan
     }
     let path = format!("{}/.env", p.dir);
     let current = std::fs::read_to_string(env.host_path(&path)).unwrap_or_default();
+    let exists = env.host_path(&path).exists();
+    let owner = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(env.host_path(&p.dir))
+            .ok()
+            .map(|m| (m.uid(), m.gid()))
+    };
     let mut remaining = params.set.clone();
     for k in remaining.keys() {
         if !valid_env_key(k) {
@@ -80,7 +87,14 @@ pub fn plan_env(env: &ChangeEnv, p: &Project, params: &EnvParams) -> Result<Chan
         &format!("site:{}", p.site_id),
     )
     .lock(&format!("site:{}", p.site_id))
-    .write_file_with(&path, crate::changes::Content::Text(out), Some(0o640), None);
+    .sensitive()
+    // Keep the existing mode/owner; a new .env belongs to the site user.
+    .write_file_with(
+        &path,
+        crate::changes::Content::Text(out),
+        if exists { None } else { Some(0o640) },
+        if exists { None } else { owner },
+    );
     if p.kind == "laravel" {
         b = b.command([
             "runuser",
@@ -92,7 +106,14 @@ pub fn plan_env(env: &ChangeEnv, p: &Project, params: &EnvParams) -> Result<Chan
             "config:clear",
         ]);
     }
-    b.note("Values are written to the project's .env; Laravel's config cache is cleared so they take effect.")
+    b = b.verify_command([
+        "sh",
+        "-c",
+        "for i in 1 2 3 4 5 6; do code=$(curl -ks -o /dev/null -w '%{http_code}' --resolve \"$1:80:127.0.0.1\" --resolve \"$1:443:127.0.0.1\" -L \"http://$1/\"); if [ \"$code\" -gt 0 ] && [ \"$code\" -lt 500 ]; then echo \"HTTP $code\"; exit 0; fi; sleep 1; done; echo \"HTTP $code\"; exit 1",
+        "probe",
+        &p.site_id,
+    ]);
+    b.note("Values are written to the project's .env; Laravel's config cache is cleared so they take effect. If the site then returns errors, the old .env is restored automatically.")
         .build(env)
         .map_err(|e| format!("{e:#}"))
 }
@@ -149,8 +170,8 @@ pub fn plan_worker(env: &ChangeEnv, p: &Project, w: &WorkerParams) -> Result<Cha
     }
     if w.enabled {
         let conf = format!(
-            "; Managed by NexaCloud — queue workers for {id}\n[program:nexacloud-{name}]\nprocess_name=%(program_name)s_%(process_num)02d\ncommand=php {dir}/artisan queue:work --queue={q} --sleep=3 --tries=3 --max-time=3600\ndirectory={dir}\nuser={user}\nnumprocs={n}\nautostart=true\nautorestart=true\nstopasgroup=true\nkillasgroup=true\nstopwaitsecs=3600\nredirect_stderr=true\nstdout_logfile={dir}/storage/logs/worker.log\nstdout_logfile_maxbytes=10MB\nstdout_logfile_backups=3\n",
-            id = p.id, dir = p.dir, q = w.queue, user = p.run_as, n = w.processes
+            "; Managed by NexaCloud — queue workers for {id}\n[program:nexacloud-{name}]\nprocess_name=%(program_name)s_%(process_num)02d\ncommand={php} {dir}/artisan queue:work --queue={q} --sleep=3 --tries=3 --max-time=3600\ndirectory={dir}\nuser={user}\nnumprocs={n}\nautostart=true\nautorestart=true\nstopasgroup=true\nkillasgroup=true\nstopwaitsecs=3600\nredirect_stderr=true\nstdout_logfile={dir}/storage/logs/worker.log\nstdout_logfile_maxbytes=10MB\nstdout_logfile_backups=3\n",
+            id = p.id, dir = p.dir, q = w.queue, user = p.run_as, n = w.processes, php = crate::deploys::php_bin(&p.site_id)
         );
         b = b.write_file(&path, conf);
     } else {
@@ -181,8 +202,8 @@ pub fn plan_scheduler(env: &ChangeEnv, p: &Project, enabled: bool) -> Result<Cha
         b.write_file_with(
             &path,
             crate::changes::Content::Text(format!(
-                "# Managed by NexaCloud — Laravel scheduler for {}\nSHELL=/bin/sh\n* * * * * {} cd {} && php artisan schedule:run >> /dev/null 2>&1\n",
-                p.id, p.run_as, p.dir
+                "# Managed by NexaCloud — Laravel scheduler for {}\nSHELL=/bin/sh\n* * * * * {} cd {} && {} artisan schedule:run >> /dev/null 2>&1\n",
+                p.id, p.run_as, p.dir, crate::deploys::php_bin(&p.site_id)
             )),
             Some(0o644),
             Some((0, 0)),

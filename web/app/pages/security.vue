@@ -138,6 +138,7 @@ const okCount = computed(() => checks.value.filter((c) => c.tone === 'ok').lengt
   <InfoNote>One-click fixes go through NexaCloud's change pipeline: you see exactly what changes, files are snapshotted first, and anything that fails is reverted automatically. The other checks tell you how to fix them by hand for now.</InfoNote>
 
   <FirewallCard v-if="sec.data.value" :active="sec.data.value.ufw.active" @changed="sec.refresh()" />
+  <PanelDomain />
 
   <section class="card fix" aria-labelledby="fix-nginx-h">
     <div class="check" style="border-bottom: 0">

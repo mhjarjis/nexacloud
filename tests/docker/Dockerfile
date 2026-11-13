@@ -16,7 +16,7 @@ RUN apt-get update \
 RUN useradd -m -s /bin/bash nas && install -d -o nas -g nas -m 700 /home/nas/.ssh /home/nas/backups
 
 # FrankenPHP binary cached in the image (177 MB) so e2e runs don't depend on download speed
-RUN curl -fsSL --retry 5 -o /usr/local/bin/frankenphp https://github.com/php/frankenphp/releases/latest/download/frankenphp-linux-x86_64 && chmod 755 /usr/local/bin/frankenphp
+RUN curl -fsSL --retry 5 -o /usr/local/bin/frankenphp https://github.com/php/frankenphp/releases/download/v1.13.5/frankenphp-linux-x86_64 && chmod 755 /usr/local/bin/frankenphp
 
 COPY fixtures/ /fixtures/
 RUN bash /fixtures/setup-sites.sh

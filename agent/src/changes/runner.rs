@@ -47,11 +47,15 @@ impl Runner for SystemRunner {
                     ..Default::default()
                 };
             };
-            Cmd::new(prog)
-                .args(args)
-                .timeout(timeout)
-                .run_streaming(log)
-                .await
+            let mut c = Cmd::new(prog);
+            if prog == "apt-get" {
+                // Never prompt, and wait (up to 5 min) for unattended-upgrades
+                // to release the dpkg lock instead of failing at once.
+                c = c
+                    .env("DEBIAN_FRONTEND", "noninteractive")
+                    .args(["-o", "DPkg::Lock::Timeout=300"]);
+            }
+            c.args(args).timeout(timeout).run_streaming(log).await
         })
     }
 

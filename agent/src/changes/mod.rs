@@ -121,6 +121,10 @@ pub struct PlannedFile {
     pub old: FileState,
     /// Content when the plan was made (for diffs; None if missing or large).
     pub old_content: Option<Content>,
+    /// SHA-256 of the real new content when `content` was redacted for
+    /// storage (sensitive plans); used by the rollback drift check.
+    #[serde(default)]
+    pub content_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -191,6 +195,10 @@ pub struct ChangePlan {
     /// place on revert).
     #[serde(default)]
     pub create_parents: bool,
+    /// Files hold secrets (e.g. `.env`): previews and the stored record mask
+    /// secret values.
+    #[serde(default)]
+    pub sensitive: bool,
 }
 
 struct FileSpec {
@@ -230,6 +238,7 @@ impl ChangePlan {
                 rollback_of: None,
                 pre_commands: Vec::new(),
                 create_parents: false,
+                sensitive: false,
             },
             files: Vec::new(),
         }
@@ -370,6 +379,12 @@ impl ChangePlanBuilder {
         self
     }
 
+    /// Mask secret values (KEY/SECRET/PASSWORD/TOKEN) in previews and storage.
+    pub fn sensitive(mut self) -> Self {
+        self.plan.sensitive = true;
+        self
+    }
+
     /// Create missing parent directories of planned files.
     pub fn create_parents(mut self) -> Self {
         self.plan.create_parents = true;
@@ -471,6 +486,7 @@ impl ChangePlanBuilder {
                 .filter(|b| b.len() <= MAX_DIFF_BYTES)
                 .map(Content::from_bytes);
             self.plan.files.push(PlannedFile {
+                content_sha256: None,
                 path: spec.path,
                 content: spec.content,
                 mode: spec.mode,
@@ -556,6 +572,48 @@ pub struct Preview {
     pub on_revert: Vec<Vec<String>>,
 }
 
+/// `KEY=value` lines whose key looks secret get their value masked.
+pub fn redact_secrets(text: &str) -> String {
+    text.lines()
+        .map(|l| match l.split_once('=') {
+            Some((k, _))
+                if !l.trim_start().starts_with('#')
+                    && ["PASSWORD", "SECRET", "KEY", "TOKEN", "PASS"]
+                        .iter()
+                        .any(|w| k.to_ascii_uppercase().contains(w)) =>
+            {
+                format!("{k}=••••••")
+            }
+            _ => l.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Copy of a sensitive plan with secrets masked (for previews and storage).
+pub fn redacted_plan(plan: &ChangePlan) -> ChangePlan {
+    let mut p = plan.clone();
+    if !p.sensitive {
+        return p;
+    }
+    for f in p.files.iter_mut() {
+        if let Some(c) = &f.content {
+            f.content_sha256 = Some(c.sha256());
+            if let Some(t) = c.as_text() {
+                f.content = Some(Content::Text(redact_secrets(t)));
+            }
+        }
+        if let Some(t) = f
+            .old_content
+            .as_ref()
+            .and_then(|c| c.as_text().map(str::to_string))
+        {
+            f.old_content = Some(Content::Text(redact_secrets(&t)));
+        }
+    }
+    p
+}
+
 fn file_preview(f: &PlannedFile) -> FilePreview {
     let action = match (&f.content, f.old.exists) {
         (None, _) => "delete",
@@ -624,7 +682,7 @@ pub fn preview(plan: &ChangePlan) -> Preview {
         note: plan.note.clone(),
         plan_hash: plan.hash(),
         locks: plan.locks.clone(),
-        files: plan.files.iter().map(file_preview).collect(),
+        files: redacted_plan(plan).files.iter().map(file_preview).collect(),
         commands: plan
             .pre_commands
             .iter()
@@ -738,7 +796,7 @@ fn insert_change(db: &Db, id: &str, plan: &ChangePlan, actor_ip: Option<&str>) -
             plan.kind,
             plan.title,
             plan.target,
-            serde_json::to_string(plan)?,
+            serde_json::to_string(&redacted_plan(plan))?,
             plan.hash(),
             actor_ip,
             fmt_ts(Utc::now()),
@@ -1376,7 +1434,10 @@ pub fn plan_rollback(
     let mut drift = Vec::new();
     for f in &rec.plan.files {
         let (cur, _) = read_current(env, &f.path)?;
-        let expected = f.content.as_ref().map(Content::sha256);
+        let expected = f
+            .content_sha256
+            .clone()
+            .or_else(|| f.content.as_ref().map(Content::sha256));
         let ok = cur.sha256 == expected
             || (rec.status == ChangeStatus::Interrupted && cur.sha256 == f.old.sha256);
         if !ok {

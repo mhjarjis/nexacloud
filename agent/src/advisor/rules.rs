@@ -215,7 +215,7 @@ pub async fn evaluate(env: &ChangeEnv, db: &Db) -> Report {
         {
             out.push(
                 finding(&format!("php-tuning-{v}"), "warning", "php", format!("PHP {v} uses default OPcache and upload limits"), "Default OPcache (128 MB, 10k files) is too small for several Laravel apps, and the 2 MB upload limit breaks image uploads.")
-                    .cur("opcache 128M · upload 2M").rec("opcache 256M/20k files · upload 64M · memory 256M").fix("restart"),
+                    .cur("opcache 128M · upload 2M").rec("opcache 256M/20k files · upload 64M").fix("restart"),
             );
         }
     }
@@ -521,7 +521,7 @@ pub async fn fix_plan(env: &ChangeEnv, rule: &str) -> Result<ChangePlan, String>
             build(
                 ChangePlan::builder("advisor_fix", &format!("Tune PHP {v} (OPcache, upload limits)"), &format!("php:{v}"))
                     .lock(&format!("php:{v}"))
-                    .write_file(&php_tuning_path(v), "; Managed by NexaCloud (advisor)\nopcache.enable = 1\nopcache.memory_consumption = 256\nopcache.interned_strings_buffer = 16\nopcache.max_accelerated_files = 20000\nupload_max_filesize = 64M\npost_max_size = 64M\nmemory_limit = 256M\n")
+                    .write_file(&php_tuning_path(v), "; Managed by NexaCloud (advisor)\nopcache.enable = 1\nopcache.memory_consumption = 256\nopcache.interned_strings_buffer = 16\nopcache.max_accelerated_files = 20000\nupload_max_filesize = 64M\npost_max_size = 64M\n")
                     .command([&format!("php-fpm{v}"), "-t"])
                     .command(["systemctl", "reload", &format!("php{v}-fpm")])
                     .verify_command(["systemctl", "is-active", "--quiet", &format!("php{v}-fpm")])
@@ -544,7 +544,9 @@ pub async fn fix_plan(env: &ChangeEnv, rule: &str) -> Result<ChangePlan, String>
                     .or_insert_with(|| "100".into());
             } else {
                 keys.insert("bind-address".into(), "127.0.0.1".into());
-                keys.insert("mysqlx-bind-address".into(), "127.0.0.1".into());
+                if !crate::dbm::is_mariadb() {
+                    keys.insert("mysqlx-bind-address".into(), "127.0.0.1".into());
+                }
             }
             let mut s = String::from(
                 "# Managed by NexaCloud (advisor). Remove this file to undo.\n[mysqld]\n",

@@ -147,6 +147,8 @@ async fn mysql(db: Option<&str>, sql: &str, timeout: Duration) -> Result<Table, 
         "--batch",
         "--column-names",
         "--default-character-set=utf8mb4",
+        // Disable client-side commands (\\!, system, source, DELIMITER, \\g ...).
+        "--skip-commands",
     ]);
     if let Some(d) = db {
         c = c.arg(format!("--database={d}"));
@@ -281,6 +283,185 @@ async fn psql(db: &str, sql: &str, timeout: Duration) -> Result<Table, String> {
             .to_string());
     }
     Ok(parse_csv(&o.stdout))
+}
+
+/// Read-only PostgreSQL console: psql runs as `nobody` and connects over TCP
+/// as `nexacloud_ro` (member of pg_read_all_data), so neither psql
+/// meta-commands nor server-side tricks can write or run programs.
+const PG_RO_PW: &str = "/etc/nexacloud/pg_ro.pw";
+
+async fn ensure_pg_ro() -> Result<String, String> {
+    if let Ok(p) = std::fs::read_to_string(PG_RO_PW) {
+        if !p.trim().is_empty() {
+            return Ok(p.trim().to_string());
+        }
+    }
+    let pw = gen_password();
+    psql(
+        "postgres",
+        &format!(
+            "DO $nc$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'nexacloud_ro') THEN CREATE ROLE nexacloud_ro LOGIN; END IF; END $nc$;\nALTER ROLE nexacloud_ro LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD {};\nGRANT pg_read_all_data TO nexacloud_ro;",
+            qv_pg(&pw)
+        ),
+        QUERY_TIMEOUT,
+    )
+    .await?;
+    crate::util::write_private_file(std::path::Path::new(PG_RO_PW), pw.as_bytes())
+        .map_err(|e| e.to_string())?;
+    Ok(pw)
+}
+
+async fn psql_ro(db: &str, sql: &str, timeout: Duration) -> Result<Table, String> {
+    let pw = ensure_pg_ro().await?;
+    let o = Cmd::new("runuser")
+        .args([
+            "-u",
+            "nobody",
+            "--",
+            "psql",
+            "-X",
+            "-q",
+            "--csv",
+            "-v",
+            "ON_ERROR_STOP=1",
+            &format!("host=127.0.0.1 user=nexacloud_ro dbname={db} sslmode=prefer"),
+        ])
+        .env("PGPASSWORD", &pw)
+        .env(
+            "PGOPTIONS",
+            "-c default_transaction_read_only=on -c statement_timeout=30000",
+        )
+        .stdin(sql.as_bytes().to_vec())
+        .timeout(timeout)
+        .current_dir("/tmp")
+        .run()
+        .await;
+    if !o.ok {
+        return Err(o
+            .stderr
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("PostgreSQL error")
+            .trim()
+            .to_string());
+    }
+    Ok(parse_csv(&o.stdout))
+}
+
+/// PostgreSQL-aware scan: strings have no backslash escapes, `$tag$` dollar
+/// quoting, `--` and `/* */` comments. Returns (normalized upper-case text
+/// outside quotes, found an unquoted backslash).
+pub fn normalize_pg(sql: &str) -> (String, bool) {
+    let b: Vec<char> = sql.chars().collect();
+    let mut out = String::new();
+    let mut backslash = false;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match c {
+            '\'' | '"' => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == c {
+                        if i + 1 < b.len() && b[i + 1] == c {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push(' ');
+            }
+            '$' => {
+                let mut j = i + 1;
+                while j < b.len() && (b[j].is_alphanumeric() || b[j] == '_') {
+                    j += 1;
+                }
+                if j < b.len() && b[j] == '$' {
+                    let tag: Vec<char> = b[i..=j].to_vec();
+                    let mut k = j + 1;
+                    let mut found = None;
+                    while k + tag.len() <= b.len() {
+                        if b[k..k + tag.len()] == tag[..] {
+                            found = Some(k);
+                            break;
+                        }
+                        k += 1;
+                    }
+                    i = match found {
+                        Some(e) => e + tag.len() - 1,
+                        None => b.len(),
+                    };
+                    out.push(' ');
+                } else {
+                    out.push('$');
+                }
+            }
+            '-' if b.get(i + 1) == Some(&'-') => {
+                while i < b.len() && b[i] != '\n' {
+                    i += 1;
+                }
+                out.push(' ');
+            }
+            '/' if b.get(i + 1) == Some(&'*') => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == '*' && b[i + 1] == '/') {
+                    i += 1;
+                }
+                i += 1;
+                out.push(' ');
+            }
+            '\\' => {
+                backslash = true;
+                out.push(' ');
+            }
+            c => out.push(c.to_ascii_uppercase()),
+        }
+        i += 1;
+    }
+    (out, backslash)
+}
+
+/// Extra checks for console input. Err = refuse.
+pub fn console_guard(engine: &str, sql: &str) -> Result<(), String> {
+    if engine == "postgres" {
+        let (n, backslash) = normalize_pg(sql);
+        if backslash {
+            return Err(
+                "psql meta-commands (backslash commands) are not allowed in the console".into(),
+            );
+        }
+        let body = n.trim().trim_end_matches(';').trim();
+        if body.contains(';') {
+            return Err("run one statement at a time".into());
+        }
+        let first = body.split_whitespace().next().unwrap_or("");
+        if first == "COPY" || body.split_whitespace().any(|w| w == "PROGRAM") {
+            return Err("COPY is not allowed in the console (use Backups to export)".into());
+        }
+    }
+    Ok(())
+}
+
+/// The local server is MariaDB (different syntax for statement time limits).
+pub fn is_mariadb() -> bool {
+    static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        std::process::Command::new("mysql")
+            .arg("--version")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("MariaDB"))
+            .unwrap_or(false)
+    })
+}
+
+fn time_limit_sql() -> &'static str {
+    if is_mariadb() {
+        "SET SESSION max_statement_time=30;"
+    } else {
+        "SET SESSION MAX_EXECUTION_TIME=30000;"
+    }
 }
 
 // ------------------------------------------------------------------ validation
@@ -483,7 +664,7 @@ pub async fn rows(
     );
     let count_sql = format!("SELECT COUNT(*) {base}");
     let (data, count) = if my {
-        let pre = "SET SESSION TRANSACTION READ ONLY; SET SESSION MAX_EXECUTION_TIME=30000;\n";
+        let pre = format!("SET SESSION TRANSACTION READ ONLY; {}\n", time_limit_sql());
         (
             mysql(Some(&db), &format!("{pre}{sql}"), QUERY_TIMEOUT).await,
             mysql(Some(&db), &format!("{pre}{count_sql}"), QUERY_TIMEOUT).await,
@@ -568,7 +749,18 @@ fn normalize(sql: &str) -> String {
 
 /// (single statement?, destructive?)
 pub fn classify(sql: &str) -> (bool, bool) {
-    let n = normalize(sql);
+    classify_with(normalize(sql))
+}
+
+pub fn classify_engine(engine: &str, sql: &str) -> (bool, bool) {
+    if engine == "postgres" {
+        classify_with(normalize_pg(sql).0)
+    } else {
+        classify(sql)
+    }
+}
+
+fn classify_with(n: String) -> (bool, bool) {
     let body = n.trim().trim_end_matches(';').trim();
     let single = !body.contains(';');
     let destructive = body.split(';').any(|stmt| {
@@ -583,17 +775,18 @@ pub fn classify(sql: &str) -> (bool, bool) {
 }
 
 async fn run_console(engine: &str, db: &str, sql: &str, write: bool) -> Result<Value, String> {
-    let (single, _) = classify(sql);
+    let (single, _) = classify_engine(engine, sql);
     if !single {
         return Err("run one statement at a time".into());
     }
+    console_guard(engine, sql)?;
     let started = Instant::now();
     let stmt = sql.trim().trim_end_matches(';');
     let t = if engine == "mysql" {
         let pre = if write {
-            "SET SESSION MAX_EXECUTION_TIME=30000;\n"
+            format!("{}\n", time_limit_sql())
         } else {
-            "SET SESSION TRANSACTION READ ONLY; SET SESSION MAX_EXECUTION_TIME=30000;\n"
+            format!("SET SESSION TRANSACTION READ ONLY; {}\n", time_limit_sql())
         };
         mysql(
             Some(db),
@@ -602,12 +795,16 @@ async fn run_console(engine: &str, db: &str, sql: &str, write: bool) -> Result<V
         )
         .await?
     } else {
-        let pre = if write {
-            "SET statement_timeout = 30000;\n"
+        if write {
+            psql(
+                db,
+                &format!("SET statement_timeout = 30000;\n{stmt};"),
+                QUERY_TIMEOUT,
+            )
+            .await?
         } else {
-            "SET default_transaction_read_only = on; SET statement_timeout = 30000;\n"
-        };
-        psql(db, &format!("{pre}{stmt};"), QUERY_TIMEOUT).await?
+            psql_ro(db, &format!("{stmt};"), QUERY_TIMEOUT).await?
+        }
     };
     // MySQL prints the result set then the ROW_COUNT set; split them.
     let (mut table, affected) = if engine == "mysql" {
@@ -697,7 +894,7 @@ pub async fn query_write(
     );
     let res = async {
         engine_db(&engine, &db)?;
-        let (_, destructive) = classify(&b.sql);
+        let (_, destructive) = classify_engine(&engine, &b.sql);
         if destructive && b.confirm.as_deref() != Some(db.as_str()) {
             return Err(ApiError::new(axum::http::StatusCode::PRECONDITION_REQUIRED, format!("confirm_required: this statement can destroy data. Type the database name ({db}) to run it.")));
         }
@@ -1018,6 +1215,24 @@ mod tests {
         assert_eq!(classify("SELECT 1; DROP TABLE t"), (false, true));
         assert_eq!(classify("SELECT ';' -- ; drop\n"), (true, false));
         assert_eq!(classify("UPDATE t SET a = 'where'"), (true, true));
+    }
+
+    #[test]
+    fn pg_guard() {
+        assert!(console_guard("postgres", "SELECT * FROM t").is_ok());
+        assert!(console_guard("postgres", "SELECT 1 \\! id").is_err());
+        assert!(console_guard("postgres", "\\copy t to '/tmp/x'").is_err());
+        assert!(console_guard("postgres", "COPY t TO PROGRAM 'id'").is_err());
+        assert!(console_guard("postgres", "SELECT 'a\\b'").is_ok());
+        // a backslash does not escape the quote in Postgres
+        assert!(console_guard(
+            "postgres",
+            "SELECT '\\'; SET default_transaction_read_only=off; DROP TABLE t"
+        )
+        .is_err());
+        assert!(console_guard("postgres", "SELECT $$a;b$$").is_ok());
+        assert!(console_guard("postgres", "SELECT $x$;$x$; DROP TABLE t").is_err());
+        assert_eq!(classify_engine("postgres", "DELETE FROM t"), (true, true));
     }
 
     #[test]

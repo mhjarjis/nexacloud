@@ -47,6 +47,7 @@ pub enum PlanRequest {
     ProjectWorker(projects::WorkerParams),
     ProjectScheduler { id: String, enabled: bool },
     SiteRuntime(runtime::RuntimeParams),
+    SiteAdopt(sites::AdoptParams),
     FirewallEnable(runtime::FirewallParams),
 }
 
@@ -70,6 +71,7 @@ impl PlanRequest {
             PlanRequest::ProjectWorker(_) => "project_worker",
             PlanRequest::ProjectScheduler { .. } => "project_scheduler",
             PlanRequest::SiteRuntime(_) => "site_runtime",
+            PlanRequest::SiteAdopt(_) => "site_adopt",
             PlanRequest::FirewallEnable(_) => "firewall_enable",
         }
     }
@@ -93,6 +95,7 @@ pub async fn build(state: &AppState, req: &PlanRequest) -> Result<ChangePlan, St
         }
         PlanRequest::SiteCreate(p) => sites::plan_create(env, p),
         PlanRequest::SiteRuntime(p) => runtime::plan_runtime(env, p),
+        PlanRequest::SiteAdopt(p) => sites::plan_adopt(env, p),
         PlanRequest::FirewallEnable(p) => {
             let port = state
                 .config

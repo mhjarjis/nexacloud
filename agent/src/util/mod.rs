@@ -128,6 +128,50 @@ pub fn atomic_write(
     result
 }
 
+/// Login name for a uid, from /etc/passwd (no subprocess).
+pub fn user_name(uid: u32) -> Option<String> {
+    std::fs::read_to_string("/etc/passwd")
+        .ok()?
+        .lines()
+        .find_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            (f.len() > 2 && f[2] == uid.to_string()).then(|| f[0].to_string())
+        })
+}
+
+/// A `git` command that runs as the owner of `dir` (never as root inside a
+/// tree another user controls: their `.git/config` could make git run
+/// programs). Falls back to running directly when root owns the tree.
+pub fn git_as_owner(dir: &Path) -> crate::util::cmd::Cmd {
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata(dir).map(|m| m.uid()).unwrap_or(0);
+    let base = if uid != 0 {
+        match user_name(uid) {
+            Some(name) => crate::util::cmd::Cmd::new("runuser").args(["-u", &name, "--", "git"]),
+            None => crate::util::cmd::Cmd::new("setpriv").args([
+                &format!("--reuid={uid}"),
+                &format!("--regid={uid}"),
+                "--clear-groups",
+                "git",
+            ]),
+        }
+    } else {
+        crate::util::cmd::Cmd::new("git")
+    };
+    base.args([
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "log.showSignature=false",
+        "--no-optional-locks",
+        "-C",
+    ])
+    .arg(dir.to_string_lossy())
+    .env("GIT_TERMINAL_PROMPT", "0")
+    .env("GIT_OPTIONAL_LOCKS", "0")
+    .current_dir("/tmp")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

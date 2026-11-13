@@ -120,21 +120,7 @@ pub fn redact_remote(remote: &str) -> String {
 }
 
 fn git(dir: &Path) -> Cmd {
-    Cmd::new("git")
-        .args([
-            "-c",
-            "safe.directory=*",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "log.showSignature=false",
-            "--no-optional-locks",
-            "-C",
-        ])
-        .arg(dir.to_string_lossy())
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .timeout(Duration::from_secs(10))
+    crate::util::git_as_owner(dir).timeout(Duration::from_secs(10))
 }
 
 async fn git_info(dir: &Path) -> Option<GitInfo> {

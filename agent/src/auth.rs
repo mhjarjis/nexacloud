@@ -324,13 +324,31 @@ struct LoginBody {
     password: String,
 }
 
+/// The client IP for throttling: the socket peer, or — only when the peer is
+/// loopback (nginx in front of the panel on its own domain) — `X-Real-IP`.
+pub fn throttle_ip(addr: &SocketAddr, headers: &axum::http::HeaderMap) -> IpAddr {
+    let peer = addr.ip().to_canonical();
+    if peer.is_loopback() {
+        if let Some(ip) = headers
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        {
+            return ip.to_canonical();
+        }
+    }
+    peer
+}
+
 pub async fn login(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
+    let ip = throttle_ip(&addr, &headers);
     audited(
-        login_inner(state, addr, body).await,
+        login_inner(state, ip, body).await,
         AuditInfo::action("auth.login", "admin"),
     )
 }
@@ -372,10 +390,11 @@ async fn check_password(state: &AppState, ip: IpAddr, body: &[u8]) -> Result<(),
 pub async fn sudo(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     axum::Extension(SessionToken(token)): axum::Extension<SessionToken>,
     body: Bytes,
 ) -> Response {
-    let ip = addr.ip().to_canonical();
+    let ip = throttle_ip(&addr, &headers);
     let resp = match check_password(&state, ip, &body).await {
         Err(e) => {
             tracing::warn!(%ip, "failed sudo attempt");
@@ -392,8 +411,7 @@ pub async fn sudo(
     audited(resp, AuditInfo::action("auth.sudo", "admin"))
 }
 
-async fn login_inner(state: AppState, addr: SocketAddr, body: Bytes) -> Response {
-    let ip = addr.ip().to_canonical();
+async fn login_inner(state: AppState, ip: IpAddr, body: Bytes) -> Response {
     if let Err(e) = check_password(&state, ip, &body).await {
         if e.status == StatusCode::UNAUTHORIZED {
             tracing::warn!(%ip, "failed login");

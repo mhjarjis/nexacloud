@@ -8,7 +8,8 @@ const api = useApi()
 
 const managed = computed(() => props.site.config_path.startsWith('/etc/nginx/conf.d/nexacloud-'))
 const model = ref<SiteModel | null>(null)
-const tab = ref<'' | 'php' | 'ssl' | 'settings' | 'nginx' | 'remove' | 'runtime'>('')
+const tab = ref<'' | 'php' | 'ssl' | 'settings' | 'nginx' | 'remove' | 'runtime' | 'adopt'>('')
+const acceptCustom = ref(false)
 
 async function loadModel() {
   if (!managed.value) return
@@ -62,6 +63,9 @@ function done(s: string) {
       <span class="tag" :style="managed ? 'border-color: var(--accent); color: var(--accent)' : ''">
         {{ managed ? 'Managed by NexaCloud' : 'Existing config (unmanaged)' }}
       </span>
+      <button v-if="!managed && (site.root || site.proxy_pass)" type="button" class="btn btn-s btn-p" @click="tab = tab === 'adopt' ? '' : 'adopt'">
+        <AppIcon name="check" :size="14" :stroke="2" /> Manage with NexaCloud
+      </button>
       <button v-if="site.php_version" type="button" class="btn btn-s" :class="{ 'btn-on': tab === 'php' }" @click="tab = tab === 'php' ? '' : 'php'">
         <AppIcon name="php" :size="14" :stroke="2" /> Switch PHP
       </button>
@@ -96,6 +100,20 @@ function done(s: string) {
         label="Preview switch"
         :disabled="!phpTarget || phpTarget === site.php_version"
         :success-text="`${site.id} now runs on PHP ${phpTarget}.`"
+        @done="done"
+      />
+    </div>
+
+    <div v-if="tab === 'adopt'" class="stack" style="gap: 10px">
+      <p class="small text-2">NexaCloud rebuilds this site's nginx config from what it reads (domains, web root, PHP version, certificate), keeps your original file disabled on disk, and checks the site still answers — if not, everything is put back automatically.
+        Afterwards you get HTTPS, settings, FrankenPHP and one-click PHP switching for this site too.</p>
+      <label class="small"><input v-model="acceptCustom" type="checkbox"> I've read the list of custom rules (if any) and will re-add them in the site's custom.conf</label>
+      <PlanAction
+        :key="`adopt-${acceptCustom}`"
+        :request="{ kind: 'site_adopt', params: { id: site.id, accept_custom: acceptCustom } }"
+        label="Preview"
+        apply-label="Manage this site"
+        success-text="This site is now managed by NexaCloud."
         @done="done"
       />
     </div>

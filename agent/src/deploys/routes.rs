@@ -423,7 +423,8 @@ pub async fn artisan(
             .actor(Some(client_ip(&addr)));
         let job = state.jobs.submit(spec, move |ctx| async move {
             let script = format!(
-                "php artisan {}",
+                "{} artisan {}",
+                php_bin(&p.site_id),
                 args.iter()
                     .map(|a| format!("'{a}'"))
                     .collect::<Vec<_>>()

@@ -115,6 +115,14 @@ pub struct SiteModel {
     pub ssl: bool,
     #[serde(default)]
     pub options: SiteOptions,
+    /// Adopted sites: keep their own PHP-FPM socket (e.g. a per-site pool).
+    #[serde(default)]
+    pub fpm_socket: Option<String>,
+    /// Adopted sites: keep their existing certificate paths.
+    #[serde(default)]
+    pub ssl_cert: Option<String>,
+    #[serde(default)]
+    pub ssl_key: Option<String>,
 }
 
 // ------------------------------------------------------------------ validation
@@ -161,7 +169,7 @@ fn valid_body_size(s: &str) -> bool {
 }
 
 fn valid_path(p: &str) -> bool {
-    p.starts_with("/var/www/")
+    (p.starts_with("/var/www/") || p.starts_with("/home/") || p.starts_with("/srv/"))
         && !p.contains("..")
         && p.len() < 200
         && p.bytes()
@@ -233,6 +241,21 @@ pub fn validate(m: &SiteModel) -> Result<(), String> {
             }
         }
     }
+    let safe_file = |p: &str| {
+        p.starts_with('/')
+            && !p.contains("..")
+            && p.len() < 200
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b))
+    };
+    for p in [&m.fpm_socket, &m.ssl_cert, &m.ssl_key]
+        .into_iter()
+        .flatten()
+    {
+        if !safe_file(p) {
+            return Err(format!("unsupported path {p:?}"));
+        }
+    }
     if m.runtime == Runtime::Frankenphp && m.runtime_port.is_none() {
         return Err("FrankenPHP runtime needs a port".into());
     }
@@ -267,8 +290,9 @@ pub fn render(m: &SiteModel) -> String {
             "server {{\n    listen 80;\n    listen [::]:80;\n    server_name {names};\n{acme}    location / {{\n        return 301 https://$host$request_uri;\n    }}\n}}\n\n"
         ));
         out.push_str(&format!(
-            "server {{\n    listen 443 ssl http2;\n    listen [::]:443 ssl http2;\n    server_name {names};\n    ssl_certificate {cd}/fullchain.pem;\n    ssl_certificate_key {cd}/privkey.pem;\n    ssl_protocols TLSv1.2 TLSv1.3;\n    ssl_session_cache shared:NexaSSL:10m;\n",
-            cd = cert_dir(&m.id)
+            "server {{\n    listen 443 ssl http2;\n    listen [::]:443 ssl http2;\n    server_name {names};\n    ssl_certificate {cert};\n    ssl_certificate_key {key};\n    ssl_protocols TLSv1.2 TLSv1.3;\n    ssl_session_cache shared:NexaSSL:10m;\n",
+            cert = m.ssl_cert.clone().unwrap_or_else(|| format!("{}/fullchain.pem", cert_dir(&m.id))),
+            key = m.ssl_key.clone().unwrap_or_else(|| format!("{}/privkey.pem", cert_dir(&m.id))),
         ));
         if m.options.hsts {
             out.push_str("    add_header Strict-Transport-Security \"max-age=31536000\" always;\n");
@@ -338,11 +362,15 @@ fn body(m: &SiteModel, acme: &str) -> String {
                 b.push_str(&proxy_location("@app", &up));
             } else if php {
                 let v = m.php_version.as_deref().unwrap_or("8.3");
+                let sock = m
+                    .fpm_socket
+                    .clone()
+                    .unwrap_or_else(|| format!("/run/php/php{v}-fpm.sock"));
                 b.push_str("    location / {\n        try_files $uri $uri/ /index.php?$query_string;\n    }\n");
                 b.push_str("    location = /favicon.ico { access_log off; log_not_found off; }\n");
                 b.push_str("    location = /robots.txt  { access_log off; log_not_found off; }\n");
                 b.push_str(&format!(
-                    "    location ~ \\.php$ {{\n        fastcgi_pass unix:/run/php/php{v}-fpm.sock;\n        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;\n        include fastcgi_params;\n        fastcgi_hide_header X-Powered-By;\n        fastcgi_read_timeout 120;\n    }}\n"
+                    "    location ~ \\.php$ {{\n        fastcgi_pass unix:{sock};\n        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;\n        include fastcgi_params;\n        fastcgi_hide_header X-Powered-By;\n        fastcgi_read_timeout 120;\n    }}\n"
                 ));
             } else {
                 b.push_str("    location / {\n        try_files $uri $uri/ =404;\n    }\n");
@@ -489,6 +517,9 @@ pub fn model_from_create(p: &CreateParams) -> SiteModel {
         redirect_code: p.redirect_code,
         ssl: false,
         options: p.options.clone().unwrap_or_default(),
+        fpm_socket: None,
+        ssl_cert: None,
+        ssl_key: None,
     }
 }
 
@@ -650,6 +681,9 @@ pub fn plan_php_switch(env: &ChangeEnv, id: &str, version: &str) -> Result<Chang
         }
         let mut new = old.clone();
         new.php_version = Some(version.to_string());
+        if let Some(sock) = &old.fpm_socket {
+            new.fpm_socket = Some(replace_php_sockets(sock, version).0);
+        }
         return plan_model_update(
             env,
             &old,
@@ -930,4 +964,337 @@ mod tests {
         assert!(out.contains("php8.3-fpm-portal.sock"));
         assert!(out.contains("# php is fun"));
     }
+}
+
+// ------------------------------------------------------------------ adopt
+
+/// Directives the managed template reproduces; anything else in an adopted
+/// config is reported so nothing is lost silently.
+const KNOWN_DIRECTIVES: &[&str] = &[
+    "listen",
+    "server_name",
+    "root",
+    "index",
+    "charset",
+    "location",
+    "ssl_certificate",
+    "ssl_certificate_key",
+    "ssl_protocols",
+    "ssl_ciphers",
+    "ssl_prefer_server_ciphers",
+    "ssl_session_cache",
+    "ssl_session_timeout",
+    "ssl_session_tickets",
+    "ssl_dhparam",
+    "include",
+    "add_header",
+    "client_max_body_size",
+    "try_files",
+    "fastcgi_pass",
+    "fastcgi_param",
+    "fastcgi_index",
+    "fastcgi_split_path_info",
+    "fastcgi_hide_header",
+    "fastcgi_read_timeout",
+    "fastcgi_buffers",
+    "fastcgi_buffer_size",
+    "return",
+    "access_log",
+    "error_log",
+    "log_not_found",
+    "expires",
+    "deny",
+    "allow",
+    "error_page",
+    "http2",
+    "server_tokens",
+    "sendfile",
+    "gzip",
+    "gzip_types",
+    "gzip_vary",
+    "proxy_pass",
+    "proxy_http_version",
+    "proxy_set_header",
+    "proxy_read_timeout",
+    "proxy_connect_timeout",
+    "proxy_send_timeout",
+    "proxy_buffering",
+    "proxy_redirect",
+    "default_type",
+    "autoindex",
+];
+
+fn known_location(args: &[String]) -> bool {
+    let a = args.join(" ");
+    matches!(
+        a.as_str(),
+        "/" | "~ \\.php$"
+            | "~ [^/]\\.php(/|$)"
+            | "= /favicon.ico"
+            | "= /robots.txt"
+            | "~ /\\.(?!well-known).*"
+            | "~ /\\.ht"
+            | "~ /\\."
+            | "^~ /.well-known/acme-challenge/"
+            | "/.well-known/acme-challenge/"
+            | "~ /.well-known/acme-challenge"
+    ) || a.starts_with("~* \\.(")
+}
+
+fn collect_custom(ds: &[crate::nginx::Directive], out: &mut Vec<String>) {
+    for d in ds {
+        if d.name == "location" {
+            if !known_location(&d.args) {
+                out.push(format!("location {}", d.args.join(" ")));
+            }
+            if let Some(b) = &d.block {
+                collect_custom(b, out);
+            }
+        } else if d.name == "if" || !KNOWN_DIRECTIVES.contains(&d.name.as_str()) {
+            out.push(
+                format!("{} {}", d.name, d.args.join(" "))
+                    .trim()
+                    .to_string(),
+            );
+        } else if d.name == "listen" && d.args.iter().any(|a| a == "default_server") {
+            out.push(format!("listen {} (default_server)", d.args.join(" ")));
+        }
+    }
+}
+
+fn find_servers(ds: &[crate::nginx::Directive], out: &mut Vec<crate::nginx::Directive>) {
+    for d in ds {
+        if d.name == "server" && d.block.is_some() {
+            out.push(d.clone());
+        } else if let Some(b) = &d.block {
+            find_servers(b, out);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdoptParams {
+    pub id: String,
+    /// Required when the existing config has directives the template doesn't cover.
+    #[serde(default)]
+    pub accept_custom: bool,
+}
+
+pub fn plan_adopt(env: &ChangeEnv, p: &AdoptParams) -> Result<ChangePlan, String> {
+    if load_model(env, &p.id).is_ok() {
+        return Err(format!("{} is already managed by NexaCloud", p.id));
+    }
+    let raw = crate::routes::sites::read_blocks(
+        &env.host_path("/etc/nginx/sites-enabled"),
+        &env.host_path("/etc/nginx/conf.d"),
+    );
+    let merged = crate::nginx::merge_blocks(raw.clone());
+    let site = merged
+        .iter()
+        .find(|b| b.id() == p.id)
+        .ok_or_else(|| format!("site {} not found", p.id))?;
+    let names: Vec<String> = raw
+        .iter()
+        .filter(|b| b.server_names.iter().any(|n| site.server_names.contains(n)))
+        .flat_map(|b| b.server_names.clone())
+        .fold(Vec::new(), |mut v, n| {
+            if !v.contains(&n) {
+                v.push(n);
+            }
+            v
+        });
+    let mut domains = vec![p.id.clone()];
+    for n in &names {
+        if n != "_" && !domains.contains(n) {
+            domains.push(n.clone());
+        }
+    }
+    for d in &domains {
+        if !valid_domain(d) {
+            return Err(format!(
+                "{d:?} can't be managed (wildcard/regex server names are not supported yet)"
+            ));
+        }
+    }
+    // Files involved must only serve this site.
+    let files: Vec<std::path::PathBuf> = raw
+        .iter()
+        .filter(|b| b.server_names.iter().any(|n| names.contains(n)))
+        .map(|b| b.config_path.clone())
+        .fold(Vec::new(), |mut v, f| {
+            if !v.contains(&f) {
+                v.push(f);
+            }
+            v
+        });
+    for f in &files {
+        for b in raw.iter().filter(|b| &b.config_path == f) {
+            if let Some(other) = b
+                .server_names
+                .iter()
+                .find(|n| !names.contains(n) && *n != "_")
+            {
+                return Err(format!(
+                    "{} also serves {other}; split that file first",
+                    f.display()
+                ));
+            }
+        }
+    }
+    // Detect kind and build the model.
+    let root = site.root.clone();
+    let kind = if site.proxy_pass.is_some() && site.fastcgi_pass.is_none() {
+        SiteKind::Proxy
+    } else if site.fastcgi_pass.is_some() {
+        let is_laravel = root
+            .as_deref()
+            .and_then(|r| {
+                std::path::Path::new(r)
+                    .parent()
+                    .map(|d| env.host_path(&d.join("artisan").to_string_lossy()).exists())
+            })
+            .unwrap_or(false);
+        if is_laravel {
+            SiteKind::Laravel
+        } else {
+            SiteKind::Php
+        }
+    } else if root.is_some() {
+        SiteKind::Static
+    } else {
+        return Err("this site has neither a web root nor a proxy; adopt is not supported".into());
+    };
+    let php_version = site
+        .fastcgi_pass
+        .as_deref()
+        .and_then(crate::nginx::php_version_from_socket);
+    let fpm_socket = site
+        .fastcgi_pass
+        .as_deref()
+        .and_then(|s| s.strip_prefix("unix:"))
+        .filter(|s| {
+            php_version
+                .as_deref()
+                .is_none_or(|v| *s != format!("/run/php/php{v}-fpm.sock"))
+        })
+        .map(String::from);
+    if site
+        .fastcgi_pass
+        .as_deref()
+        .is_some_and(|s| !s.starts_with("unix:"))
+    {
+        return Err("PHP over TCP (fastcgi_pass host:port) is not supported by adopt yet".into());
+    }
+    let mut custom = Vec::new();
+    let mut ssl_key = None;
+    for f in &files {
+        let text = std::fs::read_to_string(f).map_err(|e| format!("{}: {e}", f.display()))?;
+        let mut servers = Vec::new();
+        find_servers(&crate::nginx::parse(&text), &mut servers);
+        for srv in servers {
+            if let Some(body) = &srv.block {
+                if let Some(k) = body.iter().find(|d| d.name == "ssl_certificate_key") {
+                    ssl_key = k.args.first().cloned();
+                }
+                collect_custom(body, &mut custom);
+            }
+        }
+    }
+    custom.sort();
+    custom.dedup();
+    custom.retain(|c| {
+        !c.starts_with("include snippets/fastcgi-php.conf")
+            && !c.starts_with("include fastcgi_params")
+    });
+    if !custom.is_empty() && !p.accept_custom {
+        return Err(format!(
+            "custom_directives: The current config has rules the NexaCloud template doesn't reproduce: {}. After adopting, put them in /etc/nginx/nexacloud/{}.custom.conf, or keep the site unmanaged.",
+            custom.join("; "),
+            p.id
+        ));
+    }
+    let m = SiteModel {
+        id: p.id.clone(),
+        kind,
+        domains,
+        project_dir: root
+            .as_deref()
+            .and_then(|r| std::path::Path::new(r).parent())
+            .map(|d| d.to_string_lossy().into_owned()),
+        root,
+        php_version,
+        runtime: Runtime::Fpm,
+        runtime_port: None,
+        upstream: site.proxy_pass.clone(),
+        redirect_to: None,
+        redirect_code: None,
+        ssl: site.ssl() && site.ssl_certificate.is_some() && ssl_key.is_some(),
+        options: SiteOptions {
+            client_max_body_size: "64M".into(),
+            security_headers: false,
+            hsts: false,
+            cache_static: false,
+            block_hidden: true,
+        },
+        fpm_socket,
+        ssl_cert: site.ssl_certificate.clone(),
+        ssl_key,
+    };
+    validate(&m)?;
+    let mut b = ChangePlan::builder(
+        "site_adopt",
+        &format!("Manage {} with NexaCloud", p.id),
+        &format!("site:{}", p.id),
+    )
+    .lock(&format!("site:{}", p.id))
+    .lock("nginx")
+    .create_parents();
+    for f in &files {
+        let fs = f.to_string_lossy().into_owned();
+        let plan_path = fs
+            .strip_prefix(&env.root.to_string_lossy().trim_end_matches('/').to_string())
+            .map(String::from)
+            .unwrap_or(fs.clone());
+        let plan_path = if plan_path.starts_with('/') {
+            plan_path
+        } else {
+            format!("/{plan_path}")
+        };
+        let meta = std::fs::symlink_metadata(f).map_err(|e| e.to_string())?;
+        if meta.file_type().is_symlink() {
+            // sites-enabled symlink: disable it (the target in sites-available stays).
+            let target = std::fs::read_link(f).map_err(|e| e.to_string())?;
+            b = b.command(["rm", "-f", &plan_path]).on_revert([
+                "ln",
+                "-sfn",
+                &target.to_string_lossy(),
+                &plan_path,
+            ]);
+        } else {
+            // A real file: keep a disabled copy, then remove it (snapshotted).
+            let text = std::fs::read_to_string(f).map_err(|e| e.to_string())?;
+            let name = std::path::Path::new(&plan_path)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            b = b
+                .write_file(&format!("{CUSTOM_DIR}/adopted/{name}.disabled"), text)
+                .delete_file(&plan_path);
+        }
+    }
+    b = b.write_file(&conf_path(&p.id), render(&m));
+    // Commands: the symlink removal happens before nginx -t (commands run in order).
+    let mut b2 = b
+        .command(["nginx", "-t"])
+        .command(["systemctl", "reload", "nginx"])
+        .verify_command(["systemctl", "is-active", "--quiet", "nginx"])
+        .on_revert(["systemctl", "reload", "nginx"]);
+    b2 = probe(b2, &m);
+    let note = if custom.is_empty() {
+        "Replaces the hand-written config with a NexaCloud-managed one serving the same domains, web root, PHP version and certificate. The original stays on disk (disabled). If the site doesn't answer afterwards, everything is put back automatically.".to_string()
+    } else {
+        format!("Custom rules that are NOT carried over: {}. Re-add them in /etc/nginx/nexacloud/{}.custom.conf. The original config stays on disk (disabled).", custom.join("; "), p.id)
+    };
+    b2.note(note).build(env).map_err(|e| format!("{e:#}"))
 }

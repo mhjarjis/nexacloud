@@ -499,6 +499,28 @@ else
 fi
 
 sudo_on "$PASS"
+step "Security fixes (Fable review): console escapes, adopt existing sites"
+sudo_on "$PASS"
+post_code dbm/mysql/shop_prod/query '{"sql":"SELECT 1 \\! touch /tmp/pwned_mysql"}' >/dev/null
+check "MySQL console: \\! shell escape does not run" in_box "[ ! -e /tmp/pwned_mysql ]"
+check "PostgreSQL console: backslash meta-command refused" test "$(post_code dbm/postgres/api_prod/query '{"sql":"SELECT 1 \\! touch /tmp/pwned_pg"}')" = 400
+check "PostgreSQL console: quote trick to escape read-only refused" test "$(post_code dbm/postgres/api_prod/query "$(jq -nc '{sql: "SELECT '"'"'\\'"'"'; SET default_transaction_read_only=off; DROP TABLE events"}')")" = 400
+check "PostgreSQL console: read-only role cannot create tables" test "$(post_code dbm/postgres/api_prod/query '{"sql":"CREATE TABLE pwn (a int)"}')" = 400
+check "events table still there" in_box "runuser -u postgres -- psql -Atc 'SELECT count(*) FROM events' -d api_prod >/dev/null"
+check "COPY ... TO PROGRAM refused" test "$(post_code dbm/postgres/api_prod/query "$(jq -nc '{sql: "COPY events TO PROGRAM '"'"'id'"'"'"}')")" = 400
+
+st="$(plan site_adopt '{"id":"shop.test.local","accept_custom":true}')"
+check "adopt existing HTTPS Laravel site shop.test.local → applied ($st)" test "$st" = applied
+check "shop is now managed (conf.d) and keeps its certificate" in_box "grep -q 'ssl_certificate /etc/nginx/ssl/shop.crt' /etc/nginx/conf.d/nexacloud-shop.test.local.conf"
+check "old sites-enabled symlink disabled, original file kept" in_box "[ ! -e /etc/nginx/sites-enabled/shop.test.local ] && [ -f /etc/nginx/sites-available/shop.test.local ]"
+check "shop still serves over HTTPS after adopt" bash -c "docker exec $NAME curl -sk -H 'Host: shop.test.local' https://127.0.0.1/ | grep -q 'shop ok'"
+check "adopted model detected Laravel + PHP" jqe "$(api sites/shop.test.local/model)" '.kind=="laravel" and (.php_version|type)=="string" and .ssl==true'
+CID="$(api 'changes?limit=5' | jq -r '[.[] | select(.kind=="site_adopt")][0].id')"
+check "roll back the adopt" bash -c "curl -fsSk -b $JAR -H 'Origin: $U' -X POST $U/api/changes/$CID/rollback >/dev/null"
+for _ in $(seq 1 30); do in_box "[ -L /etc/nginx/sites-enabled/shop.test.local ]" 2>/dev/null && break; sleep 1; done
+check "rollback restored the original symlink and removed the managed conf" in_box "[ -L /etc/nginx/sites-enabled/shop.test.local ] && [ ! -e /etc/nginx/conf.d/nexacloud-shop.test.local.conf ]"
+check "shop serves over HTTPS after rollback" bash -c "docker exec $NAME curl -sk -H 'Host: shop.test.local' https://127.0.0.1/ | grep -q 'shop ok'"
+
 st="$(plan site_delete '{"id":"blog.test.local"}')"
 check "remove site → applied" test "$st" = applied
 gone=0; for _ in $(seq 1 10); do docker exec $NAME curl -s -H 'Host: blog.test.local' http://127.0.0.1/ | grep -q 'is ready' || { gone=1; break; }; sleep 1; done
