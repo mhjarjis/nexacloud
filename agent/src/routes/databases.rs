@@ -347,13 +347,28 @@ async fn run_backup(
     name: &str,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
-    use std::os::unix::fs::OpenOptionsExt;
 
     let backup_dir = state.config.backup_dir.clone();
     let dir = backup_dir.join(engine.as_str()).join(name);
     for d in [&backup_dir, &backup_dir.join(engine.as_str()), &dir] {
         create_private_dir(d).with_context(|| format!("creating {}", d.display()))?;
     }
+    let final_path = dump_into(job, engine, name, &dir).await?;
+    let size = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
+    let rel = relative(&backup_dir, &final_path);
+    job.log(&format!("Wrote {rel} ({size} bytes)"));
+    Ok(())
+}
+
+/// Dump `name` into `dir/<name>-<stamp>.sql.gz` (mode 0600). Returns the path.
+pub async fn dump_into(
+    job: &JobCtx,
+    engine: Engine,
+    name: &str,
+    dir: &Path,
+) -> anyhow::Result<PathBuf> {
+    use anyhow::Context;
+    use std::os::unix::fs::OpenOptionsExt;
     let stamp = Utc::now().format("%Y%m%d-%H%M%S");
     let final_path = dir.join(format!("{name}-{stamp}.sql.gz"));
     let tmp_path = dir.join(format!(".{name}-{stamp}.sql.gz.partial"));
@@ -371,10 +386,7 @@ async fn run_backup(
     std::fs::rename(&tmp_path, &final_path)
         .with_context(|| format!("renaming to {}", final_path.display()))?;
     partial.0 = None;
-    let size = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
-    let rel = relative(&backup_dir, &final_path);
-    job.log(&format!("Wrote {rel} ({size} bytes)"));
-    Ok(())
+    Ok(final_path)
 }
 
 fn relative(base: &Path, p: &Path) -> String {

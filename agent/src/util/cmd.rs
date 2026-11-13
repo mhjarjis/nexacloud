@@ -78,6 +78,8 @@ pub struct Cmd {
     args: Vec<String>,
     envs: Vec<(String, String)>,
     timeout: Duration,
+    input: Option<Vec<u8>>,
+    cwd: Option<std::path::PathBuf>,
 }
 
 impl Cmd {
@@ -87,6 +89,8 @@ impl Cmd {
             args: Vec::new(),
             envs: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
+            input: None,
+            cwd: None,
         }
     }
 
@@ -115,6 +119,18 @@ impl Cmd {
         self
     }
 
+    /// Feed these bytes to the process's stdin (`run` only). Use it for SQL
+    /// and secrets so they never appear on a command line.
+    pub fn stdin(mut self, data: impl Into<Vec<u8>>) -> Self {
+        self.input = Some(data.into());
+        self
+    }
+
+    pub fn current_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.cwd = Some(dir.into());
+        self
+    }
+
     /// Build the underlying tokio command (used by pipelines that need
     /// custom stdio). Always: no shell, LC_ALL=C, stdin closed, kill on drop.
     pub fn command(&self) -> Command {
@@ -127,13 +143,19 @@ impl Cmd {
         for (k, v) in &self.envs {
             c.env(k, v);
         }
+        if let Some(d) = &self.cwd {
+            c.current_dir(d);
+        }
         c
     }
 
     pub async fn run(self) -> CmdOutput {
         let mut c = self.command();
         c.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let child = match c.spawn() {
+        if self.input.is_some() {
+            c.stdin(Stdio::piped());
+        }
+        let mut child = match c.spawn() {
             Ok(ch) => ch,
             Err(e) => {
                 return CmdOutput {
@@ -144,6 +166,13 @@ impl Cmd {
                 }
             }
         };
+        if let (Some(data), Some(mut sin)) = (self.input.clone(), child.stdin.take()) {
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let _ = sin.write_all(&data).await;
+                let _ = sin.shutdown().await;
+            });
+        }
         // If the timeout fires, the future (and with it the child) is dropped,
         // and kill_on_drop terminates the process.
         match tokio::time::timeout(self.timeout, child.wait_with_output()).await {

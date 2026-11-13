@@ -14,6 +14,10 @@ const versions = computed<PhpVersion[]>(() =>
   [...(php.data.value?.versions ?? [])].sort((a, b) => versionKey(b.version) - versionKey(a.version)),
 )
 const cli = computed(() => php.data.value?.cli_default ?? null)
+const ALL = ['8.5', '8.4', '8.3', '8.2', '8.1', '8.0', '7.4']
+const notInstalled = computed(() => ALL.filter((v) => !(php.data.value?.versions ?? []).some((x) => x.version === v && x.fpm_installed)))
+const installV = ref('8.4')
+watch(notInstalled, (n) => { if (!n.includes(installV.value)) installV.value = n[0] ?? '' }, { immediate: true })
 </script>
 
 <template>
@@ -24,7 +28,23 @@ const cli = computed(() => php.data.value?.cli_default ?? null)
     </span>
   </PageHeader>
 
-  <InfoNote>Installing new PHP versions and switching a site's version arrive in v0.2.</InfoNote>
+  <section class="card card-pad stack" style="gap: 10px" aria-label="Install PHP">
+    <div class="row wrap" style="gap: 10px; align-items: center">
+      <strong>Install a PHP version</strong>
+      <select v-model="installV" class="in-sel" aria-label="PHP version to install">
+        <option v-for="v in notInstalled" :key="v" :value="v">PHP {{ v }}</option>
+      </select>
+      <span class="small muted">From the ondrej/php PPA, with FPM and Laravel's extensions. Existing sites are not touched; switch a site from the Sites page.</span>
+    </div>
+    <PlanAction
+      :key="installV"
+      :request="{ kind: 'php_install', params: { version: installV } }"
+      label="Preview install"
+      :disabled="!installV"
+      :success-text="`PHP ${installV} is installed.`"
+      @done="php.refresh()"
+    />
+  </section>
 
   <div v-if="php.loading.value" class="grid-fill">
     <div v-for="i in 3" :key="i" class="card card-pad"><SkeletonRows :rows="4" label="Loading PHP versions" /></div>
@@ -64,6 +84,7 @@ const cli = computed(() => php.data.value?.cli_default ?? null)
           </li>
         </ul>
       </div>
+      <PhpVersionTools v-if="v.fpm_installed" :version="v.version" :is-cli="v.version === cli" @changed="php.refresh()" />
     </article>
   </section>
 </template>
@@ -75,4 +96,5 @@ const cli = computed(() => php.data.value?.cli_default ?? null)
 .used-by { display: flex; flex-direction: column; gap: 6px; padding-top: 10px; border-top: 1px solid var(--row-line); }
 .site-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
 .site-list a { overflow-wrap: anywhere; }
+.in-sel { min-height: 40px; padding: 0 10px; background: var(--sunken, #0F1318); border: 1px solid var(--btn-line, #2A3441); border-radius: 8px; color: var(--text); }
 </style>

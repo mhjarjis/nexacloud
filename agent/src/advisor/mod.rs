@@ -3,3 +3,4 @@
 //! pipeline (preview → snapshot → apply → verify → auto-revert).
 
 pub mod nginx_hardening;
+pub mod rules;

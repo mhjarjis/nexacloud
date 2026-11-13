@@ -4,13 +4,17 @@ mod advisor;
 mod alerts;
 mod audit;
 mod auth;
+mod backups;
 mod changes;
 mod cli;
 mod config;
 mod db;
+mod dbm;
+mod deploys;
 mod error;
 mod jobs;
 mod nginx;
+mod plans;
 mod routes;
 mod state;
 mod util;
@@ -180,6 +184,8 @@ async fn run(cfg: Config) -> Result<()> {
         tracing::warn!("marked {jobs} job(s) and {chg} change(s) as interrupted");
     }
     routes::system::CpuSampler::spawn(state.clone());
+    backups::spawn_scheduler(state.clone());
+    deploys::spawn_poller(state.clone());
     let app = routes::router(state.clone()).into_make_service_with_connect_info::<SocketAddr>();
 
     let handle: axum_server::Handle<SocketAddr> = axum_server::Handle::new();

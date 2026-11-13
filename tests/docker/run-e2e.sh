@@ -299,6 +299,210 @@ check "old password refused" test "$(code -H "Origin: $U" -H 'Content-Type: appl
 check "new password works immediately" login "$NEWPASS"
 PASS="$NEWPASS"
 
+# ------------------------------------------------------------------ Phase 1
+step "Phase 1: sites, PHP, services, advisor, backups (all through the change pipeline)"
+sudo_on "$PASS"
+# plan <kind> <params-json> → applies via preview+apply, waits, echoes change status
+plan() {
+  local body="{\"kind\":\"$1\",\"params\":$2}" pv hash started cid jid st
+  pv="$(post_json plans/preview "$body")" || { echo "preview failed"; return 1; }
+  hash="$(printf '%s' "$pv" | jq -r .plan_hash)"
+  started="$(post_json plans/apply "{\"kind\":\"$1\",\"params\":$2,\"plan_hash\":\"$hash\"}")" || { echo "apply failed"; return 1; }
+  cid="$(printf '%s' "$started" | jq -r .change_id)"; jid="$(printf '%s' "$started" | jq -r .job_id)"
+  for _ in $(seq 1 600); do
+    st="$(api "changes/$cid" | jq -r .status)"
+    case "$st" in applied|reverted|failed|revert_failed) break ;; esac
+    sleep 1
+  done
+  [ "$st" = applied ] || { api "jobs/$jid" | jq -r .log | tail -25 >&2; }
+  echo "$st"
+}
+site_body() { in_box "curl -s -H 'Host: $1' http://127.0.0.1/"; }
+
+st="$(plan site_create '{"kind":"laravel","domain":"blog.test.local","aliases":["www.blog.test.local"],"php_version":"8.3"}')"
+check "create Laravel site blog.test.local → applied ($st)" test "$st" = applied
+check "new site answers with its placeholder" bash -c "docker exec $NAME curl -s -H 'Host: blog.test.local' http://127.0.0.1/ | grep -q 'blog.test.local is ready'"
+check "site listed as managed laravel" jqe "$(api sites)" '.[] | select(.id=="blog.test.local") | .kind=="laravel" and (.config_path|startswith("/etc/nginx/conf.d/nexacloud-"))'
+check "site model readable" jqe "$(api sites/blog.test.local/model)" '.domains==["blog.test.local","www.blog.test.local"] and .php_version=="8.3"'
+check "duplicate domain refused" test "$(post_code plans/preview '{"kind":"site_create","params":{"kind":"static","domain":"shop.test.local"}}')" = 409
+check "path injection refused" test "$(post_code plans/preview '{"kind":"site_create","params":{"kind":"static","domain":"x.test.local","root":"/etc/nginx"}}')" = 409
+
+st="$(plan site_options '{"id":"blog.test.local","options":{"client_max_body_size":"128M","security_headers":true,"hsts":false,"cache_static":true,"block_hidden":true}}')"
+check "change site settings → applied" test "$st" = applied
+check "nginx config has the new upload limit" in_box "grep -q 'client_max_body_size 128M' /etc/nginx/conf.d/nexacloud-blog.test.local.conf"
+
+broken="$(jq -Rs . <<<'server { this is not valid nginx }')"
+st="$(plan nginx_raw "{\"path\":\"/etc/nginx/conf.d/nexacloud-blog.test.local.conf\",\"content\":$broken}")"
+check "broken raw nginx edit is reverted automatically ($st)" test "$st" = reverted
+check "site still answers after the failed edit" bash -c "docker exec $NAME curl -s -H 'Host: blog.test.local' http://127.0.0.1/ | grep -q 'is ready'"
+
+st="$(plan php_ini '{"version":"8.3","settings":{"memory_limit":"512M","upload_max_filesize":"64M"}}')"
+check "php.ini drop-in → applied" test "$st" = applied
+check "PHP-FPM 8.3 picked up memory_limit=512M" in_box "php-fpm8.3 -i 2>/dev/null | grep -q 'memory_limit => 512M' || grep -q 'memory_limit = 512M' /etc/php/8.3/fpm/conf.d/99-nexacloud.ini"
+check "bad ini value refused" test "$(post_code plans/preview '{"kind":"php_ini","params":{"version":"8.3","settings":{"memory_limit":"1G\nextension=x"}}}')" = 409
+
+st="$(plan php_extensions '{"version":"8.3","extensions":["bcmath","intl"]}')"
+check "install PHP extensions bcmath+intl → applied" test "$st" = applied
+check "php8.3 -m lists bcmath" in_box "php8.3 -m | grep -qx bcmath"
+
+st="$(plan php_install '{"version":"8.4"}')"
+check "install PHP 8.4 from ondrej PPA → applied" test "$st" = applied
+check "php8.4-fpm active" in_box "systemctl is-active --quiet php8.4-fpm"
+st="$(plan site_php '{"id":"blog.test.local","version":"8.4"}')"
+check "switch managed site to PHP 8.4 → applied" test "$st" = applied
+check "blog served by php8.4-fpm" in_box "grep -q php8.4-fpm.sock /etc/nginx/conf.d/nexacloud-blog.test.local.conf"
+st="$(plan site_php '{"id":"portal.test.local","version":"8.4"}')"
+check "switch unmanaged site (portal) to PHP 8.4 → applied" test "$st" = applied
+check "portal still answers on 8.4" bash -c "docker exec $NAME curl -s -H 'Host: portal.test.local' http://127.0.0.1/ | grep -q 'portal ok'"
+check "PHP page shows 8.4 used by portal" jqe "$(api php)" '.versions[] | select(.version=="8.4") | (.sites|index("portal.test.local"))!=null'
+
+st="$(plan service_install '{"id":"redis"}')"
+check "one-click install Redis → applied" test "$st" = applied
+check "redis-server active" in_box "systemctl is-active --quiet redis-server"
+check "catalog marks redis installed" jqe "$(api catalog)" '.[] | select(.id=="redis") | .installed==true'
+
+adv="$(api advisor)"; echo "    advisor score $(printf '%s' "$adv" | jq .score), findings: $(printf '%s' "$adv" | jq -c '[.findings[].id]')"
+check "advisor reports findings with a score" jqe "$adv" '(.score|type)=="number" and (.findings|length)>0'
+check "advisor: no backups finding present" jqe "$adv" '[.findings[].id] | index("backups") != null'
+st="$(plan advisor_fix '{"rule":"nginx-gzip"}')"
+check "advisor fix: gzip for css/js/json → applied" test "$st" = applied
+in_box "head -c 5000 /dev/zero | tr '\\000' a > /var/www/shop/public/t.css"
+check "nginx now gzips CSS" bash -c "docker exec $NAME curl -sk -H 'Accept-Encoding: gzip' -H 'Host: shop.test.local' -o /dev/null -D - https://127.0.0.1/t.css | grep -qi '^content-encoding: gzip'"
+st="$(plan advisor_fix '{"rule":"mysql-buffer-pool"}')"
+check "advisor fix: MySQL buffer pool (restarts MySQL) → applied" test "$st" = applied
+check "MySQL is running with the new buffer pool" in_box "mysqladmin ping >/dev/null && [ \$(mysql -N -e 'SELECT @@innodb_buffer_pool_size') -ge 134217728 ]"
+check "dismiss a finding" post_json advisor/journald-size/dismiss '{"days":7}'
+
+# ---- backups
+st_dest="$(post_json backup/destinations '{"name":"Second disk","kind":"local","config":{"path":"/var/backups/offsite"}}')"
+LOCAL_ID="$(printf '%s' "$st_dest" | jq -r .id)"
+check "add local destination" test -n "$LOCAL_ID"
+KEY="$(api backup/ssh-key | jq -r .public_key)"
+check "panel SSH key generated" bash -c "printf '%s' '$KEY' | grep -q '^ssh-ed25519 '"
+in_box "systemctl enable --now ssh >/dev/null 2>&1; printf '%s\n' '$KEY' > /home/nas/.ssh/authorized_keys; chown nas:nas /home/nas/.ssh/authorized_keys; chmod 600 /home/nas/.ssh/authorized_keys"
+SFTP_ID="$(post_json backup/destinations '{"name":"Synology (test)","kind":"sftp","config":{"host":"127.0.0.1","port":22,"user":"nas","path":"/home/nas/backups"}}' | jq -r .id)"
+check "add SFTP destination (fake Synology)" test -n "$SFTP_ID"
+check "bad SFTP host refused" test "$(post_code backup/destinations '{"name":"x","kind":"sftp","config":{"host":"a;b","user":"nas","path":"/x"}}')" = 400
+wait_job2() { local id="$1" s=""; for _ in $(seq 1 600); do s="$(api "jobs/$id" | jq -r .status)"; case "$s" in ok|failed|cancelled|interrupted) break ;; esac; sleep 1; done; echo "$s"; }
+jid="$(post_json "backup/destinations/$SFTP_ID/test" '{}' | jq -r .job_id)"; st="$(wait_job2 "$jid")"
+[ "$st" = ok ] || api "jobs/$jid" | jq -r .log | tail -20
+check "SFTP destination test (installs rclone, pins host key, writes+deletes) → ok" test "$st" = ok
+PLAN_ID="$(post_json backup/plans "{\"name\":\"Nightly\",\"destination_id\":\"$SFTP_ID\",\"databases\":[\"all\"],\"paths\":[\"/var/www/shop/public\"],\"schedule\":\"daily 03:00\"}" | jq -r .id)"
+check "create backup plan" test -n "$PLAN_ID"
+check "bad schedule refused" test "$(post_code backup/plans '{"name":"x","databases":["all"],"schedule":"sometimes"}')" = 400
+jid="$(post_json "backup/plans/$PLAN_ID/run" '{}' | jq -r .job_id)"; st="$(wait_job2 "$jid")"
+[ "$st" = ok ] || api "jobs/$jid" | jq -r .log | tail -30
+check "backup run (3 databases + folder → SFTP) → ok" test "$st" = ok
+RUN="$(api "backup/runs?plan=$PLAN_ID" | jq '.[0]')"
+check "run recorded with 4 items and a remote copy" jqe "$RUN" '.status=="ok" and (.items|length)==4 and (.remote_path|type)=="string"'
+check "files arrived on the fake NAS" in_box "ls /home/nas/backups/nightly/*/ | grep -q 'shop_prod-.*\.sql\.gz'"
+RUN_ID="$(printf '%s' "$RUN" | jq -r .id)"
+res="$(post_json "backup/runs/$RUN_ID/restore" '{"source":"mysql/shop_prod"}')"
+TARGET="$(printf '%s' "$res" | jq -r .target_database)"; st="$(wait_job2 "$(printf '%s' "$res" | jq -r .job_id)")"
+check "restore shop_prod into a copy ($TARGET) → ok" test "$st" = ok
+check "restored copy has the 2 orders rows; live DB untouched" in_box "[ \$(mysql -N -e 'SELECT COUNT(*) FROM \`$TARGET\`.orders') = 2 ] && [ \$(mysql -N -e 'SELECT COUNT(*) FROM shop_prod.orders') = 2 ]"
+check "advisor no longer reports missing backups" jqe "$(api advisor)" '[.findings[].id] | index("backups") == null'
+check "disk usage endpoint" jqe "$(api disk)" 'length > 0 and (.[0].bytes|type)=="number"'
+
+step "Database manager (phpMyAdmin-style)"
+sudo_on "$PASS"
+check "tables of shop_prod include orders" jqe "$(api dbm/mysql/shop_prod/tables)" '[.[].name] | index("orders") != null'
+check "structure shows primary key id" jqe "$(api dbm/mysql/shop_prod/tables/orders/structure)" '.primary_key == ["id"]'
+check "browse rows (2, paginated)" jqe "$(api 'dbm/mysql/shop_prod/tables/orders/rows?page=1&per=10&sort=id&dir=desc')" '.total == 2 and (.rows|length) == 2 and .rows[0][0] == "2"'
+check "search rows" jqe "$(api 'dbm/mysql/shop_prod/tables/orders/rows?q=99')" '.total == 1'
+check "SQL console read" jqe "$(post_json dbm/mysql/shop_prod/query '{"sql":"SELECT COUNT(*) AS n FROM orders"}')" '.rows[0][0] == "2" and .read_only == true'
+check "read-only console refuses a write" test "$(post_code dbm/mysql/shop_prod/query '{"sql":"DELETE FROM orders WHERE id = 1"}')" = 400
+check "multiple statements refused" test "$(post_code dbm/mysql/shop_prod/query '{"sql":"SELECT 1; DROP TABLE orders"}')" = 400
+check "edit row by primary key (sudo)" jqe "$(post_json dbm/mysql/shop_prod/tables/orders/rows/update '{"pk":{"id":"1"},"set":{"total":"11.50"}}')" '.affected == 1'
+check "row change stored" in_box "[ \$(mysql -N -e 'SELECT total FROM shop_prod.orders WHERE id=1') = 11.50 ]"
+check "write mode: DELETE without WHERE needs the db name (428)" test "$(post_code dbm/mysql/$TARGET/query/write '{"sql":"DELETE FROM orders"}')" = 428
+WBODY="$(jq -nc --arg t "$TARGET" '{sql: "DELETE FROM orders", confirm: $t}')"
+check "write mode with confirmation" jqe "$(post_json "dbm/mysql/$TARGET/query/write" "$WBODY")" '.affected == 2'
+NEW="$(post_json dbm/mysql/databases '{"name":"newapp","user":"newapp_user"}')"
+NPW="$(printf '%s' "$NEW" | jq -r .password)"
+check "create database + user, password returned once" test "${#NPW}" -ge 20
+check "new user can log in to its database" in_box "MYSQL_PWD='$NPW' mysql --no-defaults -unewapp_user -h127.0.0.1 newapp -e 'SELECT 1' >/dev/null"
+check "users list includes newapp_user" jqe "$(api dbm/mysql/users)" '[.[].user] | index("newapp_user") != null'
+check "PostgreSQL tables of api_prod" jqe "$(api dbm/postgres/api_prod/tables)" '[.[].name] | index("events") != null'
+check "PostgreSQL rows" jqe "$(api dbm/postgres/api_prod/tables/events/rows)" '.total >= 1 and .rows[0][1] == "hello"'
+check "PostgreSQL read-only console" jqe "$(post_json dbm/postgres/api_prod/query '{"sql":"SELECT body FROM events"}')" '.rows[0][0] == "hello"'
+check "dbm write without sudo is refused" bash -c "curl -sk -c /tmp/j2 -H 'Origin: $U' -H 'Content-Type: application/json' -d '{\"password\":\"$PASS\"}' $U/api/auth/login >/dev/null && [ \"\$(curl -sk -b /tmp/j2 -H 'Origin: $U' -H 'Content-Type: application/json' -d '{\"sql\":\"SELECT 1\"}' $U/api/dbm/mysql/shop_prod/query/write)\" = '{\"error\":\"sudo_required\"}' ]"
+
+step "Git deploys (local repo, webhook, auto-rollback, polling)"
+sudo_on "$PASS"
+in_box 'set -e
+git config --global init.defaultBranch main
+rm -rf /srv/git /tmp/appsrc && mkdir -p /srv/git /tmp/appsrc/public
+git init -q --bare /srv/git/app.git
+cd /tmp/appsrc && git init -q && git config user.email dev@example.com && git config user.name Dev
+echo "<?php echo \"app v1\";" > public/index.php && git add -A && git commit -qm "v1" && git remote add origin /srv/git/app.git && git push -q origin main
+chown -R www-data:www-data /srv/git'
+push_version() { printf '%s\n' "$2" | docker exec -i "$NAME" bash -c 'cat > /tmp/appsrc/public/index.php'; in_box "set -e; cd /tmp/appsrc && git commit -qam '$1' && chown -R root /srv/git && git push -q origin main && chown -R www-data:www-data /srv/git"; }
+st="$(plan site_create '{"kind":"php","domain":"app.test.local","php_version":"8.3"}')"
+check "create site app.test.local → applied" test "$st" = applied
+PROJ="$(post_json projects '{"site_id":"app.test.local","repo":"/srv/git/app.git","branch":"main","migrate":false}')"
+check "connect site to repository" jqe "$PROJ" '.id=="app.test.local" and .kind=="php" and .dir=="/var/www/app.test.local" and .run_as=="www-data"'
+check "bad repository refused" test "$(post_code projects '{"site_id":"shop.test.local","repo":"--upload-pack=touch /tmp/pwn"}')" = 400
+deploy_wait() { local jid="$1" s; s="$(wait_job2 "$jid")"; echo "$s"; }
+jid="$(post_json projects/app.test.local/deploy '{}' | jq -r .job_id)"; st="$(deploy_wait "$jid")"
+[ "$st" = ok ] || api "jobs/$jid" | jq -r .log | tail -30
+check "first deploy (git init + fetch + checkout as www-data) → ok" test "$st" = ok
+check "site serves v1" bash -c "docker exec $NAME curl -s -H 'Host: app.test.local' http://127.0.0.1/ | grep -qx 'app v1'"
+check "checkout owned by www-data (not root)" in_box "[ \$(stat -c %U /var/www/app.test.local/.git) = www-data ]"
+SECRET="$(api projects/app.test.local | jq -r .webhook_secret)"
+push_version v2 '<?php echo "app v2";'
+BODY='{"ref":"refs/heads/main","after":"x"}'
+SIG="sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.* //')"
+check "webhook with a bad signature → 401" test "$(curl -sk -o /dev/null -w '%{http_code}' -H 'X-GitHub-Event: push' -H 'X-Hub-Signature-256: sha256=00' -d "$BODY" "$U/hooks/github/app.test.local")" = 401
+HOOK="$(curl -sk -H 'Content-Type: application/json' -H 'X-GitHub-Event: push' -H "X-Hub-Signature-256: $SIG" -d "$BODY" "$U/hooks/github/app.test.local")"
+jid="$(printf '%s' "$HOOK" | jq -r .job_id)"; st="$(deploy_wait "$jid")"
+check "signed GitHub webhook triggers a deploy → ok" test "$st" = ok
+check "site serves v2" bash -c "docker exec $NAME curl -s -H 'Host: app.test.local' http://127.0.0.1/ | grep -qx 'app v2'"
+push_version v3-broken '<?php http_response_code(500); echo "broken";'
+jid="$(post_json projects/app.test.local/deploy '{}' | jq -r .job_id)"; st="$(deploy_wait "$jid")"
+check "broken deploy fails its health check" test "$st" = failed
+check "…and was rolled back automatically (site serves v2 again)" bash -c "docker exec $NAME curl -s -H 'Host: app.test.local' http://127.0.0.1/ | grep -qx 'app v2'"
+check "deploy history shows rolled_back" jqe "$(api projects/app.test.local/deploys)" '.[0].status=="rolled_back" and .[1].status=="ok" and .[1].trigger=="webhook"'
+push_version v4 '<?php echo "app v4";'
+curl -fsSk -b "$JAR" -H "Origin: $U" -H 'Content-Type: application/json' -X PUT -d '{"auto_deploy":true}' "$U/api/projects/app.test.local" >/dev/null
+ok=0; for _ in $(seq 1 150); do docker exec $NAME curl -s -H 'Host: app.test.local' http://127.0.0.1/ | grep -qx 'app v4' && { ok=1; break; }; sleep 1; done
+check "auto-deploy polling picked up v4 within 2.5 minutes" test "$ok" = 1
+st="$(plan project_env '{"id":"app.test.local","set":{"APP_ENV":"production","GREETING":"hello world"}}')"
+check "edit .env through the change pipeline → applied" test "$st" = applied
+check ".env has the new values" in_box "grep -qx 'GREETING=\"hello world\"' /var/www/app.test.local/.env"
+check "project status endpoint" jqe "$(api projects/app.test.local/status)" '.worker==false and (.artisan|length)>5'
+
+step "Phase 3: FrankenPHP runtime and firewall with anti-lockout guard"
+sudo_on "$PASS"
+st="$(plan site_runtime '{"id":"app.test.local","runtime":"frankenphp"}')"
+check "switch app.test.local to FrankenPHP (starts unit) → applied ($st)" test "$st" = applied
+check "FrankenPHP unit is running" in_box "systemctl is-active --quiet nexacloud-frankenphp-app-test-local"
+check "site still serves the app through FrankenPHP" bash -c "docker exec $NAME curl -s -H 'Host: app.test.local' http://127.0.0.1/ | grep -qx 'app v4'"
+check "/index.php is executed, never served as source" bash -c "! docker exec $NAME curl -s -H 'Host: app.test.local' http://127.0.0.1/index.php | grep -q '<?php'"
+check "nginx proxies PHP to FrankenPHP (no fastcgi)" in_box "grep -q 'proxy_pass http://127.0.0.1:81' /etc/nginx/conf.d/nexacloud-app.test.local.conf && ! grep -q fastcgi_pass /etc/nginx/conf.d/nexacloud-app.test.local.conf"
+st="$(plan site_runtime '{"id":"app.test.local","runtime":"fpm"}')"
+check "switch back to PHP-FPM → applied" test "$st" = applied
+check "FrankenPHP unit removed" in_box "! systemctl is-active --quiet nexacloud-frankenphp-app-test-local && [ ! -e /etc/systemd/system/nexacloud-frankenphp-app-test-local.service ]"
+check "site serves via PHP-FPM again" bash -c "docker exec $NAME curl -s -H 'Host: app.test.local' http://127.0.0.1/ | grep -qx 'app v4'"
+
+st="$(plan firewall_enable '{"extra_ports":[]}')"
+if [ "$st" = applied ]; then
+  pass "turn on UFW (SSH limited, 80, 443, panel) → applied"
+  check "UFW is active" in_box "ufw status | grep -q '^Status: active'"
+  check "anti-lockout guard timer is armed" jqe "$(api firewall/guard)" '.armed == true'
+  check "panel still reachable through the firewall" curl -fsk "$U/api/health"
+  check "confirm keeps the firewall on (guard disarmed)" bash -c "curl -fsSk -b $JAR -H 'Origin: $U' -X POST $U/api/firewall/confirm >/dev/null && [ \"\$(curl -fsSk -b $JAR $U/api/firewall/guard | jq -r .armed)\" = false ]"
+  in_box "ufw --force disable >/dev/null"
+else
+  echo "    (UFW could not be enabled inside this container: $st — kernel/iptables restriction; the change was reverted)"
+  check "failed firewall change was reverted (UFW inactive)" in_box "! ufw status 2>/dev/null | grep -q '^Status: active'"
+fi
+
+sudo_on "$PASS"
+st="$(plan site_delete '{"id":"blog.test.local"}')"
+check "remove site → applied" test "$st" = applied
+check "blog no longer served (files kept)" bash -c "! docker exec $NAME curl -s -H 'Host: blog.test.local' http://127.0.0.1/ | grep -q 'is ready' && docker exec $NAME test -f /var/www/blog.test.local/public/index.php"
+
 # ------------------------------------------------------------------ throttle
 step "Login throttling"
 for _ in 1 2 3 4 5 6; do code -H "Origin: $U" -H 'Content-Type: application/json' -d '{"password":"bad"}' "$U/api/auth/login" >/dev/null; done

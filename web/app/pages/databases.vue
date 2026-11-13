@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { Backup, DatabasesInfo, Engine, Job } from '~/types/api'
 
-useHead({ title: 'Databases & Backups · NexaCloud' })
+useHead({ title: 'Databases · NexaCloud' })
 
 const api = useApi()
 const dbs = useResource<DatabasesInfo>('/api/databases')
@@ -223,7 +223,7 @@ function progressClass(job: Job | null): string {
             </thead>
             <tbody>
               <tr v-for="d in current.databases" :key="d.name">
-                <td class="mono" style="font-weight: 500">{{ d.name }}</td>
+                <td class="mono" style="font-weight: 500"><NuxtLink :to="`/db/${engine}/${encodeURIComponent(d.name)}`">{{ d.name }}</NuxtLink></td>
                 <td class="mono num" style="font-size: 13px">{{ formatBytes(d.size_bytes) }}</td>
                 <td class="mono num" style="font-size: 13px">{{ d.tables }}</td>
                 <td>
@@ -317,6 +317,7 @@ function progressClass(job: Job | null): string {
       </table>
     </div>
   </section>
+  <DbAdmin v-if="current?.available" :engine="engine" @changed="dbs.refresh()" />
 </template>
 
 <style scoped>

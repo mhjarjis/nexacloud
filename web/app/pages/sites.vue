@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import type { Site } from '~/types/api'
+import type { PhpInfo, Site } from '~/types/api'
 
 useHead({ title: 'Sites · NexaCloud' })
 
 const route = useRoute()
 const sites = useResource<Site[]>('/api/sites')
+const php = useResource<PhpInfo>('/api/php')
+const creating = ref(false)
 
 const initialQ = typeof route.query.q === 'string' ? route.query.q : ''
 const query = ref(initialQ)
@@ -49,11 +51,12 @@ function rowId(id: string) {
       <span class="sr-only">Search sites</span>
       <input v-model="query" type="search" placeholder="Search domains, paths, PHP, branch">
     </label>
+    <button type="button" class="btn btn-p" @click="creating = !creating">
+      <AppIcon name="plus" :size="16" :stroke="2.2" /> New site
+    </button>
   </PageHeader>
 
-  <InfoNote>
-    NexaCloud reads your existing Nginx config (read-only). Creating and editing sites arrives in v0.2.
-  </InfoNote>
+  <SiteCreate v-if="creating" @close="creating = false" @done="sites.refresh()" />
 
   <section class="card" aria-labelledby="sites-h" style="overflow: hidden">
     <div class="card-head">
@@ -180,6 +183,9 @@ function rowId(id: string) {
                     <dd><span class="mono">{{ s.git.commit }}</span><template v-if="s.git.message"> · {{ s.git.message }}</template></dd>
                   </div>
                 </dl>
+                <div style="margin-top: 16px; padding-top: 14px; border-top: 1px solid #1B222B">
+                  <SiteManage :site="s" :php="php.data.value ?? null" @changed="sites.refresh(); php.refresh()" />
+                </div>
               </td>
             </tr>
           </template>

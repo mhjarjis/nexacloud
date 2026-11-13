@@ -237,3 +237,110 @@ export interface SecurityInfo {
 }
 
 export type Tone = 'ok' | 'warn' | 'bad' | 'info' | 'off'
+
+// ---------------------------------------------------------------- Phase 1
+
+export interface SiteOptions {
+  client_max_body_size: string
+  security_headers: boolean
+  hsts: boolean
+  cache_static: boolean
+  block_hidden: boolean
+}
+
+export interface SiteModel {
+  id: string
+  kind: 'laravel' | 'php' | 'static' | 'proxy' | 'redirect'
+  domains: string[]
+  project_dir: string | null
+  root: string | null
+  php_version: string | null
+  runtime: 'fpm' | 'frankenphp'
+  runtime_port: number | null
+  upstream: string | null
+  redirect_to: string | null
+  redirect_code: number | null
+  ssl: boolean
+  options: SiteOptions
+}
+
+export interface PhpConfig {
+  version: string
+  loaded_modules: string[]
+  optional_extensions: string[]
+  ini: Record<string, string>
+  ini_keys: { key: string; type: string }[]
+}
+
+export interface CatalogItem {
+  id: string
+  label: string
+  description: string
+  packages: string[]
+  unit: string | null
+  probe: string
+  installed: boolean
+}
+
+export interface Finding {
+  id: string
+  severity: AlertLevel
+  category: string
+  title: string
+  detail: string
+  current: string | null
+  recommended: string | null
+  tier: 'safe' | 'restart' | 'manual'
+  fixable: boolean
+  link: string | null
+  dismissed_until: string | null
+}
+
+export interface AdvisorReport {
+  score: number
+  findings: Finding[]
+  dismissed: Finding[]
+  ram_bytes: number
+}
+
+export interface BackupDestination {
+  id: string
+  name: string
+  kind: 'local' | 'sftp' | 's3'
+  config: Record<string, unknown>
+  created_at: string
+}
+
+export interface BackupPlan {
+  id: string
+  name: string
+  destination_id: string | null
+  databases: string[]
+  paths: string[]
+  schedule: string
+  keep_daily: number
+  keep_weekly: number
+  keep_monthly: number
+  enabled: boolean
+  last_run_at: string | null
+  created_at: string
+}
+
+export interface BackupRunItem { kind: 'database' | 'files'; source: string; file: string; size_bytes: number }
+
+export interface BackupRun {
+  id: string
+  plan_id: string
+  job_id: string | null
+  status: 'running' | 'ok' | 'failed' | 'interrupted'
+  stamp: string
+  started_at: string
+  finished_at: string | null
+  size_bytes: number
+  items: BackupRunItem[]
+  local_path: string | null
+  remote_path: string | null
+  error: string | null
+}
+
+export interface DiskUsageItem { path: string; label: string; bytes: number }

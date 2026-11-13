@@ -5,6 +5,8 @@ useHead({ title: 'Services · NexaCloud' })
 
 const api = useApi()
 const services = useResource<Service[]>('/api/services', { interval: 15_000 })
+const catalog = useResource<import('~/types/api').CatalogItem[]>('/api/catalog')
+function onInstalled() { catalog.refresh(); services.refresh() }
 
 const installed = computed(() => (services.data.value ?? []).filter((s) => s.installed))
 const missing = computed(() => (services.data.value ?? []).filter((s) => !s.installed))
@@ -120,12 +122,33 @@ async function restart(s: Service) {
           </div>
         </div>
       </div>
-      <p class="small muted">Installing services from the panel arrives in a later version.</p>
+      <section aria-labelledby="cat-h" class="stack" style="gap: 12px; margin-top: 8px">
+        <h2 id="cat-h" style="font-size: 17px">Install software</h2>
+        <div v-if="catalog.data.value" class="cat-grid">
+          <article v-for="c in catalog.data.value" :key="c.id" class="card cat">
+            <div class="row" style="justify-content: space-between; gap: 8px">
+              <strong>{{ c.label }}</strong>
+              <StatusPill :tone="c.installed ? 'ok' : 'off'" :label="c.installed ? 'Installed' : 'Not installed'" />
+            </div>
+            <span class="small text-2">{{ c.description }}</span>
+            <span class="small muted mono">apt: {{ c.packages.join(' ') }}</span>
+            <PlanAction
+              v-if="!c.installed"
+              :request="{ kind: 'service_install', params: { id: c.id } }"
+              label="Install"
+              :success-text="`${c.label} is installed.`"
+              @done="onInstalled"
+            />
+          </article>
+        </div>
+      </section>
     </section>
   </template>
 </template>
 
 <style scoped>
+.cat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+.cat { padding: 16px; display: flex; flex-direction: column; gap: 8px; }
 .section-h { font-size: 18px; }
 .svc { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
 .svc-off { gap: 0; }

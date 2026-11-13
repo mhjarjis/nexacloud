@@ -183,6 +183,14 @@ pub struct ChangePlan {
     pub note: Option<String>,
     /// Set on `rollback` plans: the change being rolled back.
     pub rollback_of: Option<String>,
+    /// Commands run *before* files are written (e.g. `apt-get install`,
+    /// `useradd`, `install -d`). Not undone by revert except via `on_revert`.
+    #[serde(default)]
+    pub pre_commands: Vec<PlannedCommand>,
+    /// Create missing parent directories of planned files (they are left in
+    /// place on revert).
+    #[serde(default)]
+    pub create_parents: bool,
 }
 
 struct FileSpec {
@@ -220,6 +228,8 @@ impl ChangePlan {
                 on_revert: Vec::new(),
                 note: None,
                 rollback_of: None,
+                pre_commands: Vec::new(),
+                create_parents: false,
             },
             files: Vec::new(),
         }
@@ -227,7 +237,7 @@ impl ChangePlan {
 
     /// No file changes and no commands.
     pub fn is_noop(&self) -> bool {
-        self.files.is_empty() && self.commands.is_empty()
+        self.files.is_empty() && self.commands.is_empty() && self.pre_commands.is_empty()
     }
 
     /// SHA-256 over everything that would be done (paths, old states, new
@@ -249,6 +259,8 @@ impl ChangePlan {
             commands: &'a [PlannedCommand],
             verify: &'a [VerifyStep],
             on_revert: &'a [PlannedCommand],
+            pre_commands: &'a [PlannedCommand],
+            create_parents: bool,
         }
         let h = H {
             kind: &self.kind,
@@ -267,6 +279,8 @@ impl ChangePlan {
             commands: &self.commands,
             verify: &self.verify,
             on_revert: &self.on_revert,
+            pre_commands: &self.pre_commands,
+            create_parents: self.create_parents,
         };
         sha256_hex(&serde_json::to_vec(&h).unwrap_or_default())
     }
@@ -335,6 +349,33 @@ impl ChangePlanBuilder {
         self
     }
 
+    /// Command run before any file is written.
+    pub fn pre_command<I, S>(self, argv: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.pre_command_timeout(argv, DEFAULT_STEP_TIMEOUT_SECS)
+    }
+
+    pub fn pre_command_timeout<I, S>(mut self, argv: I, timeout_secs: u64) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.plan.pre_commands.push(PlannedCommand {
+            argv: argv_of(argv),
+            timeout_secs,
+        });
+        self
+    }
+
+    /// Create missing parent directories of planned files.
+    pub fn create_parents(mut self) -> Self {
+        self.plan.create_parents = true;
+        self
+    }
+
     /// Verify step: the command must exit 0.
     pub fn verify_command<I, S>(mut self, argv: I) -> Self
     where
@@ -385,7 +426,13 @@ impl ChangePlanBuilder {
     /// Read the current state of every file, drop writes that would change
     /// nothing, and validate paths/commands.
     pub fn build(mut self, env: &ChangeEnv) -> Result<ChangePlan> {
-        for c in self.plan.commands.iter().chain(&self.plan.on_revert) {
+        for c in self
+            .plan
+            .commands
+            .iter()
+            .chain(&self.plan.on_revert)
+            .chain(&self.plan.pre_commands)
+        {
             if c.argv.is_empty() || c.argv[0].is_empty() {
                 bail!("empty command in plan");
             }
@@ -410,7 +457,7 @@ impl ChangePlanBuilder {
             if unchanged {
                 continue;
             }
-            if spec.content.is_some() {
+            if spec.content.is_some() && !self.plan.create_parents {
                 let parent = env.host_path(&spec.path);
                 let parent = parent.parent().map(PathBuf::from).unwrap_or_default();
                 if !parent.is_dir() {
@@ -578,7 +625,12 @@ pub fn preview(plan: &ChangePlan) -> Preview {
         plan_hash: plan.hash(),
         locks: plan.locks.clone(),
         files: plan.files.iter().map(file_preview).collect(),
-        commands: plan.commands.iter().map(|c| c.argv.clone()).collect(),
+        commands: plan
+            .pre_commands
+            .iter()
+            .chain(&plan.commands)
+            .map(|c| c.argv.clone())
+            .collect(),
         verify: plan.verify.clone(),
         on_revert: plan.on_revert.iter().map(|c| c.argv.clone()).collect(),
     }
@@ -1047,10 +1099,17 @@ async fn execute(
     log: &JobLog,
     results: &mut Vec<VerifyResult>,
 ) -> std::result::Result<(), String> {
+    run_commands(env, &plan.pre_commands, log).await?;
     for f in &plan.files {
         let hp = env.host_path(&f.path);
         match &f.content {
             Some(c) => {
+                if plan.create_parents {
+                    if let Some(parent) = hp.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| format!("creating directory for {}: {e}", f.path))?;
+                    }
+                }
                 let bytes = c.to_bytes();
                 let mode = f.mode.or(f.old.mode).unwrap_or(0o644);
                 let owner = f.owner.or(match (f.old.uid, f.old.gid) {

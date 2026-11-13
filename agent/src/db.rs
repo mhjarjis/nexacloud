@@ -77,6 +77,79 @@ const MIGRATIONS: &[&str] = &[
         value TEXT NOT NULL
     );
     "#,
+    // v2 — Phase 1: backups.
+    r#"
+    CREATE TABLE backup_destinations (
+        id         TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        kind       TEXT NOT NULL,
+        config     TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE backup_plans (
+        id             TEXT PRIMARY KEY,
+        name           TEXT NOT NULL,
+        destination_id TEXT,
+        databases      TEXT NOT NULL DEFAULT '[]',
+        paths          TEXT NOT NULL DEFAULT '[]',
+        schedule       TEXT NOT NULL,
+        keep_daily     INTEGER NOT NULL DEFAULT 7,
+        keep_weekly    INTEGER NOT NULL DEFAULT 4,
+        keep_monthly   INTEGER NOT NULL DEFAULT 3,
+        enabled        INTEGER NOT NULL DEFAULT 1,
+        last_run_at    TEXT,
+        created_at     TEXT NOT NULL
+    );
+    CREATE TABLE backup_runs (
+        id          TEXT PRIMARY KEY,
+        plan_id     TEXT NOT NULL,
+        job_id      TEXT,
+        status      TEXT NOT NULL,
+        stamp       TEXT NOT NULL,
+        started_at  TEXT NOT NULL,
+        finished_at TEXT,
+        size_bytes  INTEGER NOT NULL DEFAULT 0,
+        items       TEXT NOT NULL DEFAULT '[]',
+        local_path  TEXT,
+        remote_path TEXT,
+        error       TEXT
+    );
+    CREATE INDEX backup_runs_plan ON backup_runs (plan_id, started_at);
+    "#,
+    // v3 — Phase 2: projects and deploys.
+    r#"
+    CREATE TABLE projects (
+        id             TEXT PRIMARY KEY,
+        site_id        TEXT NOT NULL,
+        kind           TEXT NOT NULL,
+        dir            TEXT NOT NULL,
+        repo           TEXT NOT NULL,
+        branch         TEXT NOT NULL,
+        run_as         TEXT NOT NULL,
+        script         TEXT NOT NULL,
+        migrate        INTEGER NOT NULL DEFAULT 1,
+        auto_deploy    INTEGER NOT NULL DEFAULT 0,
+        webhook_secret TEXT NOT NULL,
+        created_at     TEXT NOT NULL,
+        last_deploy_at TEXT,
+        last_commit    TEXT
+    );
+    CREATE TABLE deploys (
+        id              TEXT PRIMARY KEY,
+        project_id      TEXT NOT NULL,
+        job_id          TEXT,
+        status          TEXT NOT NULL,
+        trigger         TEXT NOT NULL,
+        commit_sha      TEXT,
+        message         TEXT,
+        author          TEXT,
+        previous_commit TEXT,
+        started_at      TEXT NOT NULL,
+        finished_at     TEXT,
+        error           TEXT
+    );
+    CREATE INDEX deploys_project ON deploys (project_id, started_at);
+    "#,
 ];
 
 /// Latest schema version this binary knows.

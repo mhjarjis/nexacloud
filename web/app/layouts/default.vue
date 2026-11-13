@@ -5,9 +5,12 @@ import type { IconName } from '~/utils/icons'
 const NAV: { to: string; label: string; icon: IconName }[] = [
   { to: '/', label: 'Dashboard', icon: 'dashboard' },
   { to: '/sites', label: 'Sites', icon: 'sites' },
+  { to: '/projects', label: 'Deployments', icon: 'git' },
   { to: '/php', label: 'PHP', icon: 'php' },
   { to: '/services', label: 'Services', icon: 'services' },
-  { to: '/databases', label: 'Databases & Backups', icon: 'databases' },
+  { to: '/databases', label: 'Databases', icon: 'databases' },
+  { to: '/backups', label: 'Backups', icon: 'backup' },
+  { to: '/advisor', label: 'Advisor', icon: 'advisor' },
   { to: '/security', label: 'Security', icon: 'security' },
   { to: '/activity', label: 'Activity', icon: 'activity' },
 ]

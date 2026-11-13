@@ -22,6 +22,14 @@ export const ICONS = {
   git: 'M6 3v12M18 9a3 3 0 100-6 3 3 0 000 6zM6 21a3 3 0 100-6 3 3 0 000 6zM18 9a9 9 0 01-9 9',
   lock: 'M6 11h12v10H6zM8 11V7a4 4 0 018 0v4',
   close: 'M6 6l12 12M18 6L6 18',
+  plus: 'M12 5v14M5 12h14',
+  advisor: 'M9 18h6M10 21h4M12 3a6 6 0 00-3.5 10.9c.6.5 1 1.2 1 2.1h5c0-.9.4-1.6 1-2.1A6 6 0 0012 3z',
+  cloud: 'M7 18a5 5 0 01-.6-9.96A6 6 0 0118 9a4.5 4.5 0 01-.5 9H7z',
+  trash: 'M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3',
+  edit: 'M4 20h4L19 9l-4-4L4 16v4zM14 6l4 4',
+  key: 'M15 7a4 4 0 11-3.9 5H8v3H5v-3H3v-3h8.1A4 4 0 0115 7z',
+  play: 'M7 4l13 8-13 8V4z',
+  ssl: 'M6 11h12v10H6zM8 11V7a4 4 0 018 0v4M12 15v2',
 } as const
 
 export type IconName = keyof typeof ICONS

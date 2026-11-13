@@ -235,6 +235,27 @@ pub async fn scan(with_git: bool) -> Vec<Site> {
         .into_iter()
         .flatten()
         .collect();
+    // Managed sites: the stored model is the truth (a fresh Laravel site has
+    // no artisan file yet).
+    for s in sites.iter_mut() {
+        if s.config_path
+            .starts_with(crate::plans::sites::MANAGED_PREFIX)
+        {
+            if let Some(m) = std::fs::read_to_string(&s.config_path)
+                .ok()
+                .and_then(|t| crate::plans::sites::parse_model(&t))
+            {
+                s.kind = match m.kind {
+                    crate::plans::sites::SiteKind::Laravel => "laravel",
+                    crate::plans::sites::SiteKind::Php => "php",
+                    crate::plans::sites::SiteKind::Static => "static",
+                    crate::plans::sites::SiteKind::Proxy
+                    | crate::plans::sites::SiteKind::Redirect => "proxy",
+                }
+                .to_string();
+            }
+        }
+    }
     sites.sort_by(|a, b| a.id.cmp(&b.id));
     sites
 }

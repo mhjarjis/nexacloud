@@ -78,6 +78,12 @@ try {
     ['/databases', '06-databases', ['shop_prod', 'portal_db']],
     ['/security', '07-security', ['UFW', 'Hide nginx version']],
     ['/activity', '08-activity', ['Timeline', 'Hide nginx version', 'Roll back: Hide nginx version']],
+    ['/advisor', '11-advisor', ['Advisor', 'Tuned for']],
+    ['/backups', '12-backups', ['Backup plans', 'Nightly', 'Destinations', 'Synology (test)', 'Restore points']],
+    ['/projects', '13-deployments', ['Deployments', 'app.test.local', '/srv/git/app.git']],
+    ['/projects/app.test.local', '14-project', ['Deploy now', 'Rolled back', 'Live']],
+    ['/db/mysql/shop_prod', '15-db-browser', ['orders', 'SQL']],
+    ['/db/mysql/shop_prod?t=orders', '16-db-rows', ['orders', '11.50', 'Insert row']],
   ]
   for (const [path, name, needles] of pages) {
     await go(path, 3000)

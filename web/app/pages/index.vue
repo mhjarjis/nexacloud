@@ -8,6 +8,12 @@ const overview = useResource<Overview>('/api/overview', { interval: REFRESH_MS }
 const system = useResource<SystemInfo>('/api/system', { interval: REFRESH_MS })
 const services = useResource<Service[]>('/api/services', { interval: REFRESH_MS })
 const sites = useResource<Site[]>('/api/sites', { interval: REFRESH_MS })
+const advisor = useResource<import('~/types/api').AdvisorReport>('/api/advisor', { interval: 60_000 })
+const bruns = useResource<import('~/types/api').BackupRun[]>('/api/backup/runs?limit=10', { interval: 30_000 })
+const bplans = useResource<import('~/types/api').BackupPlan[]>('/api/backup/plans')
+const changes = useResource<import('~/types/api').ChangeSummary[]>('/api/changes?limit=5', { interval: 30_000 })
+const lastBackup = computed(() => bruns.data.value?.find((r) => r.status === 'ok') ?? null)
+const scoreTone = computed(() => { const s = advisor.data.value?.score ?? 100; return s >= 85 ? 'ok' : s >= 60 ? 'warn' : 'bad' })
 
 const hostname = computed(() => overview.data.value?.hostname ?? system.data.value?.hostname ?? 'Server')
 useHead({ title: () => `${hostname.value} · NexaCloud` })
@@ -255,6 +261,34 @@ function retryAll() {
       </template>
     </section>
   </div>
+
+  <div class="grid-cards" style="grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); display: grid; gap: 16px">
+    <section class="card card-pad stack" aria-labelledby="adv-h" style="gap: 10px">
+      <div class="row" style="justify-content: space-between"><h2 id="adv-h">Advisor</h2><NuxtLink to="/advisor" class="small">Open</NuxtLink></div>
+      <div v-if="advisor.data.value" class="row" style="gap: 14px">
+        <span class="dash-score" :class="scoreTone">{{ advisor.data.value.score }}</span>
+        <span class="small text-2">{{ advisor.data.value.findings.length ? `${advisor.data.value.findings.length} recommendations — ${advisor.data.value.findings.filter((f) => f.fixable).length} can be fixed in one click.` : 'No recommendations. Nice.' }}</span>
+      </div>
+      <ul v-if="advisor.data.value?.findings.length" class="mini-list">
+        <li v-for="f in advisor.data.value.findings.slice(0, 4)" :key="f.id"><StatusPill v-bind="alertTone(f.severity)" /> <span class="small">{{ f.title }}</span></li>
+      </ul>
+    </section>
+    <section class="card card-pad stack" aria-labelledby="bk-h" style="gap: 10px">
+      <div class="row" style="justify-content: space-between"><h2 id="bk-h">Backups</h2><NuxtLink to="/backups" class="small">Manage</NuxtLink></div>
+      <div class="row wrap" style="gap: 10px">
+        <StatusPill :tone="lastBackup ? 'ok' : 'warn'" :label="lastBackup ? 'Last run OK' : 'No backup yet'" />
+        <span v-if="lastBackup" class="small text-2">{{ formatRelative(lastBackup.finished_at ?? lastBackup.started_at) }} · {{ lastBackup.items.length }} items · {{ formatBytes(lastBackup.size_bytes) }}</span>
+      </div>
+      <span class="small muted">{{ bplans.data.value?.length ? `${bplans.data.value.length} plan(s), ${bplans.data.value.filter((p) => p.destination_id).length} with an off-site copy` : 'No backup plan — create one to back up every night.' }}</span>
+    </section>
+    <section class="card card-pad stack" aria-labelledby="chg-h" style="gap: 10px">
+      <div class="row" style="justify-content: space-between"><h2 id="chg-h">Recent changes</h2><NuxtLink to="/activity" class="small">Activity</NuxtLink></div>
+      <ul v-if="changes.data.value?.length" class="mini-list">
+        <li v-for="c in changes.data.value" :key="c.id"><StatusPill v-bind="changeStatus(c.status)" /> <span class="small">{{ c.title }}</span> <span class="small muted">{{ formatRelative(c.created_at) }}</span></li>
+      </ul>
+      <span v-else class="small muted">No changes made from the panel yet.</span>
+    </section>
+  </div>
 </template>
 
 <style scoped>
@@ -281,4 +315,8 @@ function retryAll() {
 .site-link { color: var(--text); font-weight: 600; text-decoration: none; }
 .site-link:hover { color: var(--link-hover); text-decoration: underline; }
 .truncate { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+.dash-score { width: 54px; height: 54px; border-radius: 50%; display: grid; place-items: center; font-family: var(--font-head); font-size: 20px; font-weight: 600; border: 3px solid; flex: none; }
+.dash-score.ok { color: var(--ok); } .dash-score.warn { color: var(--warn); } .dash-score.bad { color: var(--bad); }
+.mini-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.mini-list li { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 </style>

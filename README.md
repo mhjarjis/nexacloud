@@ -3,30 +3,44 @@
 A small, self-hosted control panel for **one VPS that runs Laravel and plain PHP sites**.
 One Rust binary (the agent) runs on your server and serves a Nuxt web panel over HTTPS.
 
-> **Status: v0.2 (early).** NexaCloud *reads* your server, and every change it makes goes
-> through a safety pipeline: preview the exact diff, snapshot, apply, verify, revert
-> automatically on failure, roll back later with one click (or `nexacloud rollback --last`).
-> The first one-click fix ships now (hide the nginx version); creating sites, SSL, PHP
-> installs and Git deploys build on this — see [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Status: v0.3.** Every change NexaCloud makes goes through a safety pipeline: preview
+> the exact diff, snapshot, apply, verify (e.g. `nginx -t` + "does the site still answer?"),
+> revert automatically on failure, roll back later with one click (or `nexacloud rollback --last`).
 
 ## What it does
 
-- **Dashboard** — CPU, memory, disk, uptime, plus a "needs attention" list
-  (end-of-life PHP, firewall off, stopped services, certificates about to expire, full disks).
-- **Sites** — reads your nginx config and shows every site, whether it is Laravel or plain PHP,
-  its PHP version, SSL expiry date and Git branch/commit.
-- **PHP** — installed versions, which sites use each one, and their support status.
-- **Services** — nginx, PHP-FPM, MySQL, PostgreSQL, Redis, Supervisor, cron… with a Restart button.
-- **Databases & backups** — MySQL and PostgreSQL databases with sizes, one-click
-  compressed backup, and download.
-- **Security** — firewall (UFW), fail2ban, automatic updates, SSH password login, and the
-  first one-click fix: hide the nginx version (Preview → Apply → Rollback).
-- **Activity** — every change (with its diff, commands, checks and a Rollback button) and
-  every background job (live log, cancel), kept across restarts.
+- **Dashboard** — CPU, memory, disk, uptime, attention list, advisor score, backup status, recent changes.
+- **Sites** — every nginx site (Laravel / plain PHP / static / proxy detected). **Create** sites,
+  subdomains, redirects and proxies; **Let's Encrypt HTTPS**; per-site **PHP version switch**
+  (managed and existing configs); security headers, upload limit, HSTS; a raw **nginx editor**
+  that only saves configs passing `nginx -t`.
+- **FrankenPHP** — switch any managed PHP site between PHP-FPM and FrankenPHP; NexaCloud runs it as
+  its own systemd service behind nginx and switches back in one click.
+- **Deployments** — connect a site to GitHub (read-only deploy key), deploy on push (webhook with
+  HMAC or 1-minute polling), Laravel pipeline (composer, npm build, DB backup, migrate, optimize,
+  queue:restart) run as the site user, **automatic rollback** when the site returns 5xx, generated
+  GitHub Actions workflow, deploy history with roll-back-to-commit. Artisan runner, queue workers
+  (Supervisor), scheduler (cron), `.env` editor, log viewer.
+- **Databases** — phpMyAdmin-style browser for MySQL and PostgreSQL: tables, structure, rows
+  (search, sort, paging), edit/insert/delete by primary key, SQL console (read-only by default,
+  write mode needs your password, typed confirmation for DROP/TRUNCATE/WHERE-less DELETE),
+  create database + user, reset passwords.
+- **Backups** — scheduled plans (databases + folders), off-site copies to **Synology** (SFTP —
+  Tailscale-friendly — with a panel SSH key), S3-compatible storage (Synology C2, AWS, MinIO, B2) or
+  a local disk, 7 daily / 4 weekly / 3 monthly retention, restore into a copy (never over live data),
+  disk usage + cleanup.
+- **PHP & Services** — install PHP versions (ondrej PPA), extensions, php.ini settings, CLI default;
+  one-click install of Redis, Supervisor, Fail2ban, UFW, Certbot, Composer, Node.js, rclone, ClamAV…
+- **Advisor** — server score and tuned recommendations for your RAM (PHP OPcache, MySQL buffer pool,
+  swap, gzip, DB bound to localhost, fail2ban, automatic updates, APP_DEBUG in production, backups…)
+  with one-click fixes, dismiss and snooze.
+- **Security** — firewall on with safe defaults and an **anti-lockout timer** (turns itself off unless
+  you confirm within 3 minutes), fail2ban, updates, SSH checks.
+- **Activity** — every change and job with diffs, live logs and Rollback; append-only audit log.
 
-Safety rules: NexaCloud only writes its own drop-in files (e.g. `/etc/nginx/conf.d/zz-nexacloud.conf`),
-never your vendor or site files; dangerous actions ask for your password again ("sudo mode",
-15 minutes); everything that changes the server is in an append-only audit log.
+Safety rules: NexaCloud writes its own drop-in files where possible, dangerous actions ask for your
+password again ("sudo mode", 15 minutes), code from your repos never runs as root, and everything
+that changes the server is in the audit log.
 
 ## Install
 

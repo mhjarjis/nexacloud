@@ -12,7 +12,7 @@ export class ApiError extends Error {
 }
 
 interface RequestOptions {
-  method?: 'GET' | 'POST'
+  method?: 'GET' | 'POST' | 'PUT' | 'DELETE'
   body?: Record<string, unknown>
   /** Don't redirect to /login on 401 (used by the login form itself). */
   allowUnauthorized?: boolean
@@ -78,5 +78,7 @@ export function useApi() {
     request,
     get: <T>(path: string) => request<T>(path),
     post: <T>(path: string, body?: Record<string, unknown>) => request<T>(path, { method: 'POST', body }),
+    put: <T>(path: string, body?: Record<string, unknown>) => request<T>(path, { method: 'PUT', body }),
+    del: <T>(path: string) => request<T>(path, { method: 'DELETE' }),
   }
 }
