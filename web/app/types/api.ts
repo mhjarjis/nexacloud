@@ -262,6 +262,8 @@ export interface SiteModel {
   redirect_code: number | null
   ssl: boolean
   options: SiteOptions
+  fpm_socket?: string | null
+  user?: string | null
 }
 
 export interface PhpConfig {

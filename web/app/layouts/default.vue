@@ -10,6 +10,7 @@ const NAV: { to: string; label: string; icon: IconName }[] = [
   { to: '/services', label: 'Services', icon: 'services' },
   { to: '/databases', label: 'Databases', icon: 'databases' },
   { to: '/backups', label: 'Backups', icon: 'backup' },
+  { to: '/monitoring', label: 'Monitoring', icon: 'pulse' },
   { to: '/advisor', label: 'Advisor', icon: 'advisor' },
   { to: '/security', label: 'Security', icon: 'security' },
   { to: '/activity', label: 'Activity', icon: 'activity' },

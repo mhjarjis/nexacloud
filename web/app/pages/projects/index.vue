@@ -33,7 +33,8 @@ function deployLabel(s?: string) { return ({ ok: 'Live', running: 'Deploying', q
 
 <template>
   <PageHeader title="Deployments" crumb="Connect sites to Git and deploy on push">
-    <button type="button" class="btn btn-p" @click="connecting = !connecting"><AppIcon name="git" :size="16" :stroke="2" /> Connect a site</button>
+    <button type="button" class="btn" @click="connecting = !connecting"><AppIcon name="git" :size="16" :stroke="2" /> Connect an existing site</button>
+    <NuxtLink to="/apps/new" class="btn btn-p"><AppIcon name="plus" :size="16" :stroke="2" /> New app</NuxtLink>
   </PageHeader>
 
   <section v-if="connecting" class="card card-pad stack" style="gap: 14px" aria-label="Connect a site to Git">

@@ -1027,6 +1027,42 @@ pub struct CreateDb {
     user: Option<String>,
 }
 
+/// Create a database (and optionally a user owning it). Returns the new
+/// user's password. Names must already be validated.
+pub async fn create_db_with_user(
+    engine: &str,
+    name: &str,
+    user: Option<&str>,
+) -> Result<Option<String>, String> {
+    let password = user.map(|_| gen_password());
+    if engine == "mysql" {
+        let mut sql = format!(
+            "CREATE DATABASE {} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n",
+            qi_my(name)
+        );
+        if let (Some(u), Some(p)) = (user, &password) {
+            for host in ["localhost", "127.0.0.1"] {
+                sql.push_str(&format!(
+                    "CREATE USER {u}@{h} IDENTIFIED BY {pw};\nGRANT ALL PRIVILEGES ON {db}.* TO {u}@{h};\n",
+                    u = qv_my(u), h = qv_my(host), pw = qv_my(p), db = qi_my(name)
+                ));
+            }
+            sql.push_str("FLUSH PRIVILEGES;\n");
+        }
+        mysql(None, &sql, QUERY_TIMEOUT).await.map_err(|e| format!("{e:#}"))?;
+    } else if engine == "postgres" {
+        if let (Some(u), Some(p)) = (user, &password) {
+            psql("postgres", &format!("CREATE ROLE {} LOGIN PASSWORD {};", qi_pg(u), qv_pg(p)), QUERY_TIMEOUT).await.map_err(|e| format!("{e:#}"))?;
+            psql("postgres", &format!("CREATE DATABASE {} OWNER {};", qi_pg(name), qi_pg(u)), QUERY_TIMEOUT).await.map_err(|e| format!("{e:#}"))?;
+        } else {
+            psql("postgres", &format!("CREATE DATABASE {};", qi_pg(name)), QUERY_TIMEOUT).await.map_err(|e| format!("{e:#}"))?;
+        }
+    } else {
+        return Err("engine must be mysql or postgres".into());
+    }
+    Ok(password)
+}
+
 pub async fn create_database(
     UrlPath(engine): UrlPath<String>,
     Json(b): Json<CreateDb>,
@@ -1042,27 +1078,9 @@ pub async fn create_database(
                 return Err(ApiError::bad_request("invalid user name"));
             }
         }
-        let password = b.user.as_ref().map(|_| gen_password());
-        if engine == "mysql" {
-            let mut sql = format!("CREATE DATABASE {} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n", qi_my(&b.name));
-            if let (Some(u), Some(p)) = (&b.user, &password) {
-                for host in ["localhost", "127.0.0.1"] {
-                    sql.push_str(&format!(
-                        "CREATE USER {u}@{h} IDENTIFIED BY {pw};\nGRANT ALL PRIVILEGES ON {db}.* TO {u}@{h};\n",
-                        u = qv_my(u), h = qv_my(host), pw = qv_my(p), db = qi_my(&b.name)
-                    ));
-                }
-                sql.push_str("FLUSH PRIVILEGES;\n");
-            }
-            mysql(None, &sql, QUERY_TIMEOUT).await.map_err(bad)?;
-        } else {
-            if let (Some(u), Some(p)) = (&b.user, &password) {
-                psql("postgres", &format!("CREATE ROLE {} LOGIN PASSWORD {};", qi_pg(u), qv_pg(p)), QUERY_TIMEOUT).await.map_err(bad)?;
-                psql("postgres", &format!("CREATE DATABASE {} OWNER {};", qi_pg(&b.name), qi_pg(u)), QUERY_TIMEOUT).await.map_err(bad)?;
-            } else {
-                psql("postgres", &format!("CREATE DATABASE {};", qi_pg(&b.name)), QUERY_TIMEOUT).await.map_err(bad)?;
-            }
-        }
+        let password = create_db_with_user(&engine, &b.name, b.user.as_deref())
+            .await
+            .map_err(ApiError::bad_request)?;
         Ok(Json(json!({
             "database": b.name, "user": b.user, "password": password, "host": "127.0.0.1",
             "port": if engine == "mysql" { 3306 } else { 5432 },

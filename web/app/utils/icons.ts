@@ -29,6 +29,8 @@ export const ICONS = {
   edit: 'M4 20h4L19 9l-4-4L4 16v4zM14 6l4 4',
   key: 'M15 7a4 4 0 11-3.9 5H8v3H5v-3H3v-3h8.1A4 4 0 0115 7z',
   play: 'M7 4l13 8-13 8V4z',
+  pulse: 'M3 12h4l2-5 4 10 2-5h6',
+  bell: 'M6 16V11a6 6 0 0112 0v5l2 2H4l2-2zM10 21h4',
   ssl: 'M6 11h12v10H6zM8 11V7a4 4 0 018 0v4M12 15v2',
 } as const
 

@@ -70,6 +70,8 @@ pub struct CreateBody {
     auto_deploy: bool,
     run_as: Option<String>,
     script: Option<String>,
+    #[serde(default)]
+    run_tests: bool,
 }
 fn main() -> String {
     "main".into()
@@ -103,10 +105,17 @@ pub async fn create(State(state): State<AppState>, Json(b): Json<CreateBody>) ->
         } else {
             "static"
         };
-        let dir = if kind == "laravel" || root.ends_with("/public") || root.ends_with("/public_html") {
+        let mut dir = if kind == "laravel" || root.ends_with("/public") || root.ends_with("/public_html") {
             std::path::Path::new(&root).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or(root.clone())
         } else {
             root.clone()
+        };
+        // A web root inside `<dir>/current` means zero-downtime release folders.
+        let strategy = if let Some(base) = dir.strip_suffix("/current") {
+            dir = base.to_string();
+            "releases"
+        } else {
+            "in_place"
         };
         if !dir.starts_with("/var/www/") && !dir.starts_with("/srv/") && !dir.starts_with("/home/") {
             return Err(ApiError::bad_request(format!("project directory {dir} must be under /var/www, /srv or /home")));
@@ -140,6 +149,10 @@ pub async fn create(State(state): State<AppState>, Json(b): Json<CreateBody>) ->
             created_at: now(),
             last_deploy_at: None,
             last_commit: site.git.as_ref().map(|g| g.commit.clone()),
+            strategy: strategy.into(),
+            keep_releases: 5,
+            run_tests: b.run_tests,
+            notify: true,
         };
         if p.script.len() > 20_000 {
             return Err(ApiError::bad_request("deploy script too long"));
@@ -164,6 +177,9 @@ pub struct UpdateBody {
     migrate: Option<bool>,
     auto_deploy: Option<bool>,
     run_as: Option<String>,
+    run_tests: Option<bool>,
+    notify: Option<bool>,
+    keep_releases: Option<u32>,
 }
 
 pub async fn update(
@@ -204,6 +220,18 @@ pub async fn update(
         }
         if let Some(a) = b.auto_deploy {
             p.auto_deploy = a;
+        }
+        if let Some(t) = b.run_tests {
+            p.run_tests = t;
+        }
+        if let Some(n) = b.notify {
+            p.notify = n;
+        }
+        if let Some(k) = b.keep_releases {
+            if !(1..=20).contains(&k) {
+                return Err(ApiError::bad_request("keep 1–20 releases"));
+            }
+            p.keep_releases = k;
         }
         save_project(&state.db, &p)?;
         Ok(Json(view(&state, &p)).into_response())
@@ -325,44 +353,201 @@ pub async fn github_hook(
 #[derive(Deserialize)]
 pub struct LinesQuery {
     lines: Option<usize>,
+    /// a source id from `sources` (default: newest app log)
     file: Option<String>,
+    /// case-insensitive substring filter
+    q: Option<String>,
 }
 
-/// Tail of a Laravel log (storage/logs/*.log) — read-only.
+/// Log sources of a project: its storage/logs files, nginx errors for its
+/// domain and the PHP-FPM log of its PHP version.
+fn log_sources(p: &Project) -> Vec<(String, String, std::path::PathBuf)> {
+    let dir = std::path::Path::new(&p.shared_dir()).join("storage/logs");
+    let mut files: Vec<(std::time::SystemTime, String)> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    n.ends_with(".log").then(|| {
+                        (
+                            e.metadata()
+                                .and_then(|m| m.modified())
+                                .unwrap_or(std::time::UNIX_EPOCH),
+                            n,
+                        )
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files.reverse();
+    let mut out: Vec<(String, String, std::path::PathBuf)> = files
+        .into_iter()
+        .map(|(_, n)| (n.clone(), n.clone(), dir.join(&n)))
+        .collect();
+    if p.kind != "laravel" {
+        for n in ["error_log", "php_errors.log"] {
+            let f = std::path::Path::new(&p.dir).join(n);
+            if f.is_file() {
+                out.push((n.into(), n.into(), f));
+            }
+        }
+    }
+    out.push((
+        "nginx-error".into(),
+        format!("nginx error.log ({})", p.site_id),
+        "/var/log/nginx/error.log".into(),
+    ));
+    let php = php_bin(&p.site_id);
+    if let Some(v) = php.strip_prefix("php") {
+        let f = std::path::PathBuf::from(format!("/var/log/php{v}-fpm.log"));
+        if f.exists() {
+            out.push((format!("php{v}-fpm"), format!("php{v}-fpm.log"), f));
+        }
+    }
+    out
+}
+
+/// Tail of one of the project's logs — read-only.
 pub async fn logs(
     State(state): State<AppState>,
     UrlPath(id): UrlPath<String>,
     Query(q): Query<LinesQuery>,
 ) -> ApiResult<Json<Value>> {
     let p = get_project(&state.db, &id)?.ok_or_else(|| ApiError::not_found("project not found"))?;
-    let dir = std::path::Path::new(&p.dir).join("storage/logs");
-    let mut files: Vec<String> = std::fs::read_dir(&dir)
-        .map(|rd| {
-            rd.flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n.ends_with(".log"))
-                .collect()
-        })
-        .unwrap_or_default();
-    files.sort();
-    files.reverse();
+    let sources = log_sources(&p);
+    let n = q.lines.unwrap_or(200).clamp(1, 2000);
     let pick = q
         .file
-        .filter(|f| files.contains(f))
-        .or_else(|| files.first().cloned());
-    let text = pick
         .as_ref()
-        .map(|f| {
-            crate::jobs::read_log_tail(
-                &dir.join(f),
-                (q.lines.unwrap_or(200).min(2000) * 300) as u64,
-            )
+        .and_then(|f| sources.iter().find(|s| &s.0 == f))
+        .or_else(|| sources.first());
+    let filter = q.q.as_deref().map(str::to_lowercase).filter(|f| !f.is_empty());
+    let text = pick
+        .map(|(sid, _, path)| {
+            let budget = if filter.is_some() || sid == "nginx-error" { 4_000_000 } else { (n * 400) as u64 };
+            let raw = crate::jobs::read_log_tail(path, budget);
+            let lines: Vec<&str> = raw
+                .lines()
+                .filter(|l| sid != "nginx-error" || l.contains(&format!("server: {},", p.site_id)))
+                .filter(|l| filter.as_ref().is_none_or(|f| l.to_lowercase().contains(f)))
+                .collect();
+            lines[lines.len().saturating_sub(n)..].join("\n")
         })
         .unwrap_or_default();
-    let lines: Vec<&str> = text.lines().collect();
-    let n = q.lines.unwrap_or(200).min(2000);
-    let tail = lines[lines.len().saturating_sub(n)..].join("\n");
-    Ok(Json(json!({"files": files, "file": pick, "text": tail})))
+    Ok(Json(json!({
+        "sources": sources.iter().map(|s| json!({"id": s.0, "label": s.1})).collect::<Vec<_>>(),
+        "files": sources.iter().map(|s| s.0.clone()).collect::<Vec<_>>(),
+        "file": pick.map(|s| s.0.clone()),
+        "text": text,
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct FreshQuery {
+    fresh: Option<bool>,
+}
+
+/// Health, workers, schedule, errors and response times for the project page.
+pub async fn overview(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Query(q): Query<FreshQuery>,
+) -> ApiResult<Json<Value>> {
+    let p = get_project(&state.db, &id)?.ok_or_else(|| ApiError::not_found("project not found"))?;
+    Ok(Json(
+        crate::monitor::project::overview(&state, &p, q.fresh.unwrap_or(false)).await,
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct RevealBody {
+    key: String,
+}
+
+/// One secret `.env` value, on purpose (sudo, audited). Never logged.
+pub async fn env_reveal(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Json(b): Json<RevealBody>,
+) -> Response {
+    let info = AuditInfo::action("project.env_reveal", format!("{id}: {}", b.key));
+    let res = (|| {
+        let p =
+            get_project(&state.db, &id)?.ok_or_else(|| ApiError::not_found("project not found"))?;
+        let path = std::path::Path::new(&p.shared_dir()).join(".env");
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let v = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .filter_map(|l| l.split_once('='))
+            .find(|(k, _)| k.trim() == b.key)
+            .map(|(_, v)| {
+                let v = v.trim();
+                v.strip_prefix('"')
+                    .and_then(|x| x.strip_suffix('"'))
+                    .map(|x| x.replace("\\\"", "\""))
+                    .unwrap_or_else(|| v.to_string())
+            })
+            .ok_or_else(|| ApiError::not_found("no such variable"))?;
+        Ok(Json(json!({"key": b.key, "value": v})).into_response())
+    })();
+    wrap(res, info)
+}
+
+#[derive(Deserialize)]
+pub struct RestartBody {
+    /// worker name; all workers when absent
+    name: Option<String>,
+}
+
+pub async fn workers_restart(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+    Json(b): Json<RestartBody>,
+) -> Response {
+    let info = AuditInfo::action(
+        "project.workers_restart",
+        format!("{id}: {}", b.name.as_deref().unwrap_or("all")),
+    );
+    let res = async {
+        let p =
+            get_project(&state.db, &id)?.ok_or_else(|| ApiError::not_found("project not found"))?;
+        let procs = crate::monitor::project::supervisor_status(&p.id).await;
+        let targets: Vec<String> = match &b.name {
+            None => vec![format!("nexacloud-{}:*", sup_name(&p.id))],
+            Some(n) => {
+                let base = format!("nexacloud-{}", sup_name(&p.id));
+                let prog = if n == "default" && procs.iter().any(|s| s.program == base) {
+                    base
+                } else {
+                    format!("{base}-{n}")
+                };
+                procs
+                    .iter()
+                    .filter(|s| s.program == prog)
+                    .map(|s| s.name.clone())
+                    .collect()
+            }
+        };
+        if targets.is_empty() {
+            return Err(ApiError::not_found("no such worker"));
+        }
+        let o = crate::util::cmd::Cmd::new("supervisorctl")
+            .arg("restart")
+            .args(&targets)
+            .timeout(Duration::from_secs(120))
+            .run()
+            .await;
+        if !o.ok {
+            return Err(ApiError::internal(o.error_summary("supervisorctl restart")));
+        }
+        crate::monitor::project::invalidate(&p.id);
+        Ok(Json(json!({"restarted": targets})).into_response())
+    }
+    .await;
+    wrap(res, info)
 }
 
 const ARTISAN_ALLOW: &[&str] = &[
@@ -448,7 +633,7 @@ pub async fn env_get(
     UrlPath(id): UrlPath<String>,
 ) -> ApiResult<Json<Value>> {
     let p = get_project(&state.db, &id)?.ok_or_else(|| ApiError::not_found("project not found"))?;
-    let path = std::path::Path::new(&p.dir).join(".env");
+    let path = std::path::Path::new(&p.shared_dir()).join(".env");
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let vars: Vec<Value> = text
         .lines()
@@ -473,7 +658,7 @@ pub async fn status(
     let worker =
         std::path::Path::new(&format!("/etc/supervisor/conf.d/nexacloud-{id}.conf")).exists();
     let sched = std::path::Path::new(&format!("/etc/cron.d/{}", cron_name(&id))).exists();
-    let maintenance = std::path::Path::new(&p.dir)
+    let maintenance = std::path::Path::new(&p.app_dir())
         .join("storage/framework/down")
         .exists();
     let workers = if worker {
@@ -495,4 +680,44 @@ pub fn sup_name(id: &str) -> String {
 }
 pub fn cron_name(id: &str) -> String {
     format!("nexacloud-{}", id.replace('.', "-"))
+}
+
+/// Release folders of a project (newest first).
+pub async fn releases(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+) -> ApiResult<Json<Value>> {
+    let p = get_project(&state.db, &id)?.ok_or_else(|| ApiError::not_found("project not found"))?;
+    Ok(Json(json!({
+        "strategy": p.strategy,
+        "releases": if p.strategy == "releases" { super::releases::list(&p) } else { Vec::new() },
+    })))
+}
+
+/// Make an older release live again (a deploy with trigger "rollback" that
+/// only switches the `current` link and checks the site).
+pub async fn release_activate(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    UrlPath((id, name)): UrlPath<(String, String)>,
+) -> Response {
+    let mut info = AuditInfo::action("project.release_activate", format!("{id}: {name}"));
+    let res = (|| {
+        let p = get_project(&state.db, &id)?.ok_or_else(|| ApiError::not_found("project not found"))?;
+        let r = super::releases::list(&p)
+            .into_iter()
+            .find(|r| r.name == name)
+            .ok_or_else(|| ApiError::not_found("no such release"))?;
+        if r.current {
+            return Err(ApiError::conflict("that release is already live"));
+        }
+        if r.meta.commit.len() < 7 {
+            return Err(ApiError::conflict("this release has no commit recorded"));
+        }
+        let job = submit(&state, &p, "rollback", Some(r.meta.commit.clone()), Some(client_ip(&addr)))
+            .map_err(|e| ApiError::conflict(format!("{e:#}")))?;
+        info.job_id = Some(job.clone());
+        Ok(Json(json!({"job_id": job})).into_response())
+    })();
+    wrap(res, info)
 }

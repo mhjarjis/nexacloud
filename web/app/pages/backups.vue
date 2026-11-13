@@ -26,6 +26,12 @@ const S3_PRESETS = [
 ]
 const s3 = reactive({ provider: 'Synology', endpoint: S3_PRESETS[0]!.endpoint, region: 'eu-002', bucket: '', access_key: '', secret_key: '', path: 'vps' })
 const local = reactive({ path: '/var/backups/offsite' })
+const encrypt = ref(true)
+const encPass = ref('')
+function genPass() {
+  const a = new Uint8Array(18); crypto.getRandomValues(a)
+  encPass.value = btoa(String.fromCharCode(...a)).replace(/[+/=]/g, '').slice(0, 24)
+}
 const pubKey = ref<string | null>(null)
 watch(dKind, async (k) => {
   dName.value = k === 'sftp' ? 'Synology NAS' : k === 's3' ? 'Cloud storage' : 'Second disk'
@@ -39,7 +45,11 @@ function preset(id: string) {
 }
 async function addDest() {
   err.value = null
-  const config = dKind.value === 'sftp' ? { ...sftp } : dKind.value === 's3' ? { ...s3 } : { ...local }
+  const config: Record<string, unknown> = dKind.value === 'sftp' ? { ...sftp } : dKind.value === 's3' ? { ...s3 } : { ...local }
+  if (dKind.value !== 'local' && encrypt.value) {
+    if (encPass.value.length < 12) { err.value = 'Use an encryption password of at least 12 characters (or press Generate).'; return }
+    config.encrypt_password = encPass.value
+  }
   try {
     await api.post('/api/backup/destinations', { name: dName.value, kind: dKind.value, config })
     addingDest.value = false
@@ -110,6 +120,25 @@ async function runPlan(p: BackupPlan) {
 }
 const destName = (id: string | null) => (id ? dests.data.value?.find((d) => d.id === id)?.name ?? 'deleted destination' : 'This server only')
 const planName = (id: string) => plans.data.value?.find((p) => p.id === id)?.name ?? '—'
+
+// ---------------------------------------------------------------- staging
+const staging = reactive<Record<string, { files: string; database: string; domain: string } | undefined>>({})
+const stagingMsg = reactive<Record<string, string>>({})
+function openStaging(r: BackupRun) {
+  if (staging[r.id]) { staging[r.id] = undefined; return }
+  const files = r.items.find((i) => i.kind === 'files')?.source ?? ''
+  const base = files.split('/').filter(Boolean).pop() ?? 'site'
+  staging[r.id] = { files, database: r.items.find((i) => i.kind === 'database')?.source ?? '', domain: `staging.${base.includes('.') ? base : base + '.example.com'}` }
+}
+async function startStaging(r: BackupRun) {
+  const f = staging[r.id]
+  if (!f) return
+  err.value = null
+  try {
+    jobs[`staging-${r.id}`] = (await api.post<{ job_id: string }>(`/api/backup/runs/${r.id}/staging`, { files: f.files, database: f.database || null, domain: f.domain })).job_id
+    stagingMsg[r.id] = `Building ${f.domain}… the live site is not touched.`
+  } catch (e) { if (!(e instanceof SudoCancelled)) err.value = errorMessage(e) }
+}
 
 // ---------------------------------------------------------------- restore
 const restoreMsg = reactive<Record<string, string>>({})
@@ -218,7 +247,8 @@ const lastOk = computed(() => runs.data.value?.find((r) => r.status === 'ok'))
     <div v-else class="table-wrap"><table>
       <thead><tr><th>When</th><th>Plan</th><th>Status</th><th>Size</th><th>Contents</th><th>Stored</th></tr></thead>
       <tbody>
-        <tr v-for="r in runs.data.value" :key="r.id">
+        <template v-for="r in runs.data.value" :key="r.id">
+        <tr>
           <td class="small">{{ formatDateTime(r.started_at) }}<div class="muted">{{ formatRelative(r.started_at) }}</div></td>
           <td class="small">{{ planName(r.plan_id) }}</td>
           <td><StatusPill :tone="r.status === 'ok' ? 'ok' : r.status === 'running' ? 'info' : 'bad'" :label="r.status === 'ok' ? 'OK' : r.status" /><div v-if="r.error" class="small" style="color: var(--bad); white-space: normal; max-width: 260px">{{ r.error }}</div></td>
@@ -232,8 +262,26 @@ const lastOk = computed(() => runs.data.value?.find((r) => r.status === 'ok'))
               <JobLog v-if="jobs[`restore-${r.id}-${it.source}`]" :job-id="jobs[`restore-${r.id}-${it.source}`]!" status="running" @finished="finished('restore')" />
             </div>
           </td>
-          <td class="small" style="white-space: normal">{{ r.remote_path ? 'Server + off-site' : 'This server' }}</td>
+          <td class="small" style="white-space: normal">{{ r.remote_path ? 'Server + off-site' : 'This server' }}
+            <div v-if="r.status === 'ok' && r.items.some((i) => i.kind === 'files')" style="margin-top: 6px"><button type="button" class="btn btn-s" @click="openStaging(r)">Restore to staging…</button></div>
+          </td>
         </tr>
+        <tr v-if="staging[r.id]">
+          <td colspan="6" style="white-space: normal">
+            <div class="stack stg" style="gap: 10px">
+              <strong>Restore a full copy of the site to staging</strong>
+              <p class="small text-2">Files go to a new folder, the database into a new copy with its own user, and the copy's .env is pointed at them (debug off, mail to the log, no queue workers). It gets its own Linux user and nginx site. Your live site and database are not touched.</p>
+              <div class="fgrid">
+                <label class="field"><span>Folder</span><select v-model="staging[r.id]!.files" class="in mono"><option v-for="i in r.items.filter((x) => x.kind === 'files')" :key="i.source" :value="i.source">{{ i.source }}</option></select></label>
+                <label class="field"><span>Database</span><select v-model="staging[r.id]!.database" class="in mono"><option value="">(none)</option><option v-for="i in r.items.filter((x) => x.kind === 'database')" :key="i.source" :value="i.source">{{ i.source }}</option></select></label>
+                <label class="field"><span>Staging domain</span><input v-model="staging[r.id]!.domain" class="in mono" type="text"></label>
+              </div>
+              <div class="row wrap" style="gap: 8px"><button type="button" class="btn btn-p btn-s" @click="startStaging(r)">Restore to staging</button><span v-if="stagingMsg[r.id]" class="small" style="color: var(--ok)">{{ stagingMsg[r.id] }}</span></div>
+              <JobLog v-if="jobs[`staging-${r.id}`]" :job-id="jobs[`staging-${r.id}`]!" status="running" @finished="finished('restore')" />
+            </div>
+          </td>
+        </tr>
+        </template>
       </tbody>
     </table></div>
   </section>
@@ -243,7 +291,7 @@ const lastOk = computed(() => runs.data.value?.find((r) => r.status === 'ok'))
     <div class="row" style="justify-content: space-between"><h2 id="dest-h">Destinations</h2><button type="button" class="btn btn-s" @click="addingDest = !addingDest"><AppIcon name="plus" :size="14" :stroke="2" /> Add destination</button></div>
     <div class="dest-grid">
       <article v-for="d in dests.data.value ?? []" :key="d.id" class="card dest">
-        <div class="row" style="justify-content: space-between"><strong>{{ d.name }}</strong><span class="tag">{{ d.kind === 'sftp' ? 'SFTP' : d.kind === 's3' ? 'S3' : 'Folder' }}</span></div>
+        <div class="row" style="justify-content: space-between"><strong>{{ d.name }}</strong><span class="row" style="gap: 6px"><StatusPill v-if="d.config.encrypted" tone="ok" label="Encrypted" /><span class="tag">{{ d.kind === 'sftp' ? 'SFTP' : d.kind === 's3' ? 'S3' : 'Folder' }}</span></span></div>
         <span class="small muted mono">{{ d.kind === 'sftp' ? `${d.config.user}@${d.config.host}:${d.config.path}` : d.kind === 's3' ? `${d.config.bucket}/${d.config.path}` : d.config.path }}</span>
         <div class="row" style="gap: 6px">
           <button type="button" class="btn btn-s" @click="testDest(d)">Test connection</button>
@@ -293,6 +341,16 @@ const lastOk = computed(() => runs.data.value?.find((r) => r.status === 'ok'))
         <label class="field"><span>Folder (e.g. a mounted second disk)</span><input v-model="local.path" class="in mono" type="text"></label>
       </template>
 
+      <fieldset v-if="dKind !== 'local'" class="enc">
+        <legend><label class="row" style="gap: 8px"><input v-model="encrypt" type="checkbox"> <strong>Encrypt backups before they leave this server</strong></label></legend>
+        <template v-if="encrypt">
+          <p class="small text-2">Files and file names are encrypted with this password (rclone crypt). The NAS or cloud provider only ever sees scrambled data. <strong>Save this password somewhere safe</strong> (a password manager): without it, the off-site copies cannot be restored on another server.</p>
+          <div class="row wrap" style="gap: 8px">
+            <input v-model="encPass" class="in mono" type="text" autocomplete="off" placeholder="at least 12 characters" style="flex: 1; min-width: 220px" aria-label="Encryption password">
+            <button type="button" class="btn btn-s" @click="genPass">Generate</button>
+          </div>
+        </template>
+      </fieldset>
       <div class="row" style="gap: 8px"><button type="button" class="btn btn-p" @click="addDest">Save destination</button><span class="small muted">Then click “Test connection”.</span></div>
     </div>
   </section>
@@ -338,4 +396,6 @@ input[type=checkbox] { accent-color: var(--accent); width: 16px; height: 16px; v
 .disk-row { display: flex; align-items: center; gap: 12px; }
 .bar { flex: 1; height: 8px; border-radius: 99px; background: #1F2731; overflow: hidden; }
 .bar span { display: block; height: 100%; background: var(--accent); }
+.enc { border: 1px solid var(--card-line); border-radius: 10px; padding: 10px 14px 14px; margin: 0; display: flex; flex-direction: column; gap: 10px; }
+.stg { padding: 12px; background: #0F1318; border: 1px solid #222A34; border-radius: 10px; }
 </style>

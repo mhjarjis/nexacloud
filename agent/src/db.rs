@@ -150,6 +150,32 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX deploys_project ON deploys (project_id, started_at);
     "#,
+    // v4 — monitoring, alerts, release folders, deploy options.
+    r#"
+    CREATE TABLE monitor_samples (
+        site_id TEXT NOT NULL,
+        ts      INTEGER NOT NULL,
+        code    INTEGER NOT NULL,
+        ms      INTEGER NOT NULL
+    );
+    CREATE INDEX monitor_samples_site ON monitor_samples (site_id, ts);
+    CREATE TABLE notifications (
+        id      TEXT PRIMARY KEY,
+        at      TEXT NOT NULL,
+        level   TEXT NOT NULL,
+        key     TEXT NOT NULL,
+        title   TEXT NOT NULL,
+        body    TEXT NOT NULL,
+        sent    TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX notifications_at ON notifications (at);
+    ALTER TABLE projects ADD COLUMN strategy TEXT NOT NULL DEFAULT 'in_place';
+    ALTER TABLE projects ADD COLUMN keep_releases INTEGER NOT NULL DEFAULT 5;
+    ALTER TABLE projects ADD COLUMN run_tests INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE projects ADD COLUMN notify INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE deploys ADD COLUMN steps TEXT NOT NULL DEFAULT '[]';
+    ALTER TABLE deploys ADD COLUMN release TEXT;
+    "#,
 ];
 
 /// Latest schema version this binary knows.

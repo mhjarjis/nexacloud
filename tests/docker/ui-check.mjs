@@ -81,7 +81,12 @@ try {
     ['/advisor', '11-advisor', ['Advisor', 'Tuned for']],
     ['/backups', '12-backups', ['Backup plans', 'Nightly', 'Destinations', 'Synology (test)', 'Restore points']],
     ['/projects', '13-deployments', ['Deployments', 'app.test.local', '/srv/git/app.git']],
-    ['/projects/app.test.local', '14-project', ['Deploy now', 'Rolled back', 'Live']],
+    ['/projects/app.test.local', '14-project', ['Deploy now', 'Visit site', 'HTTP check', 'Response time · 24 h', 'PHP project settings', 'Latest errors']],
+    ['/projects/app.test.local?tab=deploys', '14b-project-deploys', ['Recent runs', 'Releases on disk', 'Switch release']],
+    ['/projects/app.test.local?tab=env', '14c-project-env', ['.env', 'Add variable']],
+    ['/projects/app.test.local?tab=logs', '14d-project-logs', ['Live tail', 'Download']],
+    ['/monitoring', '17-monitoring', ['Monitoring', 'shop.test.local', 'Where to send alerts', 'Recent alerts']],
+    ['/apps/new', '18-new-app', ['What are you deploying?', 'Laravel', 'Plain PHP']],
     ['/db/mysql/shop_prod', '15-db-browser', ['orders', 'SQL']],
     ['/db/mysql/shop_prod?t=orders', '16-db-rows', ['orders', '11.50', 'Insert row']],
   ]

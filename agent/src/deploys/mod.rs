@@ -14,12 +14,13 @@
 //! - Triggers: manual, GitHub webhook (`POST /hooks/github/<id>`, HMAC-SHA256),
 //!   or polling (`git ls-remote` every 60 s) when auto-deploy is on.
 
+pub mod releases;
 pub mod routes;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +49,46 @@ pub struct Project {
     pub created_at: String,
     pub last_deploy_at: Option<String>,
     pub last_commit: Option<String>,
+    /// in_place | releases (zero-downtime: releases/<n> + current symlink)
+    #[serde(default = "in_place")]
+    pub strategy: String,
+    #[serde(default = "five")]
+    pub keep_releases: u32,
+    /// Run `php artisan test` (Laravel) before going live.
+    #[serde(default)]
+    pub run_tests: bool,
+    /// Send a notification when a deploy fails.
+    #[serde(default = "yes")]
+    pub notify: bool,
+}
+
+fn in_place() -> String {
+    "in_place".into()
+}
+fn five() -> u32 {
+    5
+}
+fn yes() -> bool {
+    true
+}
+
+impl Project {
+    /// The directory the live code is in: `dir/current` with release folders.
+    pub fn app_dir(&self) -> String {
+        if self.strategy == "releases" {
+            format!("{}/current", self.dir)
+        } else {
+            self.dir.clone()
+        }
+    }
+    /// Where .env and storage/ live (`dir/shared` with release folders).
+    pub fn shared_dir(&self) -> String {
+        if self.strategy == "releases" {
+            format!("{}/shared", self.dir)
+        } else {
+            self.dir.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +107,22 @@ pub struct Deploy {
     pub started_at: String,
     pub finished_at: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub steps: Vec<Step>,
+    /// Release folder name (release strategy).
+    #[serde(default)]
+    pub release: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Step {
+    pub name: String,
+    pub cmd: String,
+    /// ok | failed | skipped | running
+    pub status: String,
+    pub secs: Option<f64>,
+    #[serde(default)]
+    pub result: String,
 }
 
 // ------------------------------------------------------------------ validation
@@ -130,7 +187,7 @@ fn now() -> String {
     crate::util::fmt_ts(Utc::now())
 }
 
-const P_COLS: &str = "id, site_id, kind, dir, repo, branch, run_as, script, migrate, auto_deploy, webhook_secret, created_at, last_deploy_at, last_commit";
+const P_COLS: &str = "id, site_id, kind, dir, repo, branch, run_as, script, migrate, auto_deploy, webhook_secret, created_at, last_deploy_at, last_commit, strategy, keep_releases, run_tests, notify";
 
 fn p_row(r: &rusqlite::Row) -> rusqlite::Result<Project> {
     Ok(Project {
@@ -148,15 +205,31 @@ fn p_row(r: &rusqlite::Row) -> rusqlite::Result<Project> {
         created_at: r.get(11)?,
         last_deploy_at: r.get(12)?,
         last_commit: r.get(13)?,
+        strategy: r.get(14)?,
+        keep_releases: r.get::<_, i64>(15)?.clamp(1, 50) as u32,
+        run_tests: r.get::<_, i64>(16)? != 0,
+        notify: r.get::<_, i64>(17)? != 0,
     })
 }
 
 pub fn list_projects(db: &Db) -> Result<Vec<Project>> {
     let c = db.conn();
     let mut st = c.prepare(&format!("SELECT {P_COLS} FROM projects ORDER BY id"))?;
-    let v = st
+    let mut v = st
         .query_map([], p_row)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    for p in v.iter_mut() {
+        // The disk is the truth: a `current` symlink means release folders
+        // (also after converting), an `nc_*` owner means an isolated site.
+        if p.strategy != "releases" && Path::new(&format!("{}/current", p.dir)).is_symlink() {
+            p.strategy = "releases".into();
+        }
+        if let Some(n) = owner_of(&p.dir).and_then(|(uid, _)| crate::util::user_name(uid)) {
+            if n.starts_with("nc_") && n != p.run_as {
+                p.run_as = n;
+            }
+        }
+    }
     Ok(v)
 }
 
@@ -166,12 +239,13 @@ pub fn get_project(db: &Db, id: &str) -> Result<Option<Project>> {
 
 pub fn save_project(db: &Db, p: &Project) -> Result<()> {
     db.conn().execute(
-        &format!("INSERT INTO projects ({P_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+        &format!("INSERT INTO projects ({P_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
           ON CONFLICT(id) DO UPDATE SET repo=?5, branch=?6, run_as=?7, script=?8, migrate=?9, auto_deploy=?10,
-            last_deploy_at=?13, last_commit=?14"),
+            last_deploy_at=?13, last_commit=?14, strategy=?15, keep_releases=?16, run_tests=?17, notify=?18"),
         rusqlite::params![
             p.id, p.site_id, p.kind, p.dir, p.repo, p.branch, p.run_as, p.script, p.migrate as i64,
-            p.auto_deploy as i64, p.webhook_secret, p.created_at, p.last_deploy_at, p.last_commit
+            p.auto_deploy as i64, p.webhook_secret, p.created_at, p.last_deploy_at, p.last_commit,
+            p.strategy, p.keep_releases as i64, p.run_tests as i64, p.notify as i64
         ],
     )?;
     Ok(())
@@ -184,7 +258,7 @@ pub fn delete_project(db: &Db, id: &str) -> Result<bool> {
         > 0)
 }
 
-const D_COLS: &str = "id, project_id, job_id, status, trigger, commit_sha, message, author, previous_commit, started_at, finished_at, error";
+const D_COLS: &str = "id, project_id, job_id, status, trigger, commit_sha, message, author, previous_commit, started_at, finished_at, error, steps, release";
 
 fn d_row(r: &rusqlite::Row) -> rusqlite::Result<Deploy> {
     Ok(Deploy {
@@ -200,6 +274,8 @@ fn d_row(r: &rusqlite::Row) -> rusqlite::Result<Deploy> {
         started_at: r.get(9)?,
         finished_at: r.get(10)?,
         error: r.get(11)?,
+        steps: serde_json::from_str(&r.get::<_, String>(12)?).unwrap_or_default(),
+        release: r.get(13)?,
     })
 }
 
@@ -229,9 +305,9 @@ pub fn list_deploys(db: &Db, project: Option<&str>, limit: usize) -> Result<Vec<
 fn save_deploy(db: &Db, d: &Deploy) -> Result<()> {
     db.conn().execute(
         &format!(
-            "INSERT INTO deploys ({D_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+            "INSERT INTO deploys ({D_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
           ON CONFLICT(id) DO UPDATE SET job_id=?3, status=?4, commit_sha=?6, message=?7, author=?8,
-            previous_commit=?9, finished_at=?11, error=?12"
+            previous_commit=?9, finished_at=?11, error=?12, steps=?13, release=?14"
         ),
         rusqlite::params![
             d.id,
@@ -245,7 +321,9 @@ fn save_deploy(db: &Db, d: &Deploy) -> Result<()> {
             d.previous_commit,
             d.started_at,
             d.finished_at,
-            d.error
+            d.error,
+            serde_json::to_string(&d.steps).unwrap_or_else(|_| "[]".into()),
+            d.release
         ],
     )?;
     Ok(())
@@ -458,6 +536,8 @@ pub fn submit(
         started_at: now(),
         finished_at: None,
         error: None,
+        steps: Vec::new(),
+        release: None,
     };
     save_deploy(&state.db, &d)?;
     let spec = JobSpec::new("deploy", &format!("Deploy {} ({})", project.id, trigger))
@@ -484,6 +564,26 @@ pub fn submit(
             }
         }
         let _ = save_deploy(&st.db, &d2);
+        crate::monitor::project::invalidate(&p.id);
+        if d2.status != "ok" && p.notify {
+            crate::monitor::notify::send(
+                &st,
+                crate::monitor::notify::Event::DeployFailed,
+                &format!("deploy_failed:{}", p.id),
+                "critical",
+                &format!(
+                    "Deploy of {} {}",
+                    p.id,
+                    if d2.status == "rolled_back" { "was rolled back" } else { "failed" }
+                ),
+                &format!(
+                    "{}{}",
+                    d2.commit.as_deref().map(|c| format!("Commit {} — ", &c[..c.len().min(8)])).unwrap_or_default(),
+                    d2.error.clone().unwrap_or_default()
+                ),
+                None,
+            );
+        }
         if d2.status == "rolled_back" {
             return Err(anyhow!("the site failed its health check after deploying, so the previous commit was restored"));
         }
@@ -509,13 +609,14 @@ impl Drop for TempKey {
     }
 }
 
-/// Run a shell snippet as the project user in its dir, streaming to the job log.
-async fn as_user(
+/// Run a shell snippet as the project user in `cwd`, streaming to the job log.
+pub async fn as_user_in(
     p: &Project,
     job: &JobCtx,
     env: &[(String, String)],
     script: &str,
     timeout: Duration,
+    cwd: &str,
 ) -> Result<()> {
     let mut c = Cmd::new("systemd-run").args([
         "--quiet",
@@ -526,11 +627,11 @@ async fn as_user(
         &format!("--gid={}", p.run_as),
         "-p",
         "MemoryMax=2G",
-        &format!("--working-directory={}", p.dir),
+        &format!("--working-directory={cwd}"),
         "-E",
         &format!("HOME={}", p.dir),
         "-E",
-        "COMPOSER_HOME=/tmp/nexacloud-composer",
+        &format!("COMPOSER_HOME=/tmp/nexacloud-composer-{}", p.run_as),
         "-E",
         &format!(
             "PATH={}/usr/local/bin:/usr/bin:/bin",
@@ -560,8 +661,22 @@ async fn as_user(
     Ok(())
 }
 
-async fn head_info(p: &Project, env: &[(String, String)]) -> Option<(String, String, String)> {
-    let mut c = crate::util::git_as_owner(Path::new(&p.dir)).args([
+/// [`as_user_in`] in the live app directory.
+pub async fn as_user(
+    p: &Project,
+    job: &JobCtx,
+    env: &[(String, String)],
+    script: &str,
+    timeout: Duration,
+) -> Result<()> {
+    as_user_in(p, job, env, script, timeout, &p.app_dir()).await
+}
+
+async fn head_info_at(
+    dir: &str,
+    env: &[(String, String)],
+) -> Option<(String, String, String)> {
+    let mut c = crate::util::git_as_owner(Path::new(dir)).args([
         "log",
         "-1",
         "--format=%H%x1f%s%x1f%an",
@@ -570,6 +685,9 @@ async fn head_info(p: &Project, env: &[(String, String)]) -> Option<(String, Str
         c = c.env(k, v);
     }
     let o = c.timeout(Duration::from_secs(20)).run().await;
+    if !o.ok {
+        return None;
+    }
     let mut it = o.stdout.trim().split('\u{1f}');
     Some((
         it.next()?.to_string(),
@@ -629,26 +747,46 @@ async fn reload_fpm(p: &Project, job: &JobCtx) {
             if o.ok { "ok" } else { "failed" }
         ));
     }
+    // FrankenPHP keeps code in memory too.
+    if let Ok(m) = crate::plans::sites::load_model(
+        &crate::changes::ChangeEnv::system(PathBuf::from("/tmp")),
+        &p.site_id,
+    ) {
+        if m.runtime == crate::plans::sites::Runtime::Frankenphp {
+            let unit = crate::plans::runtime::unit_name(&p.site_id);
+            let o = Cmd::new("systemctl")
+                .args(["restart", &unit])
+                .timeout(Duration::from_secs(60))
+                .run()
+                .await;
+            job.log(&format!(
+                "Restarted {unit}: {}",
+                if o.ok { "ok" } else { "failed" }
+            ));
+        }
+    }
 }
 
-async fn pre_migrate_backup(state: &AppState, p: &Project, job: &JobCtx) {
-    let env = std::fs::read_to_string(Path::new(&p.dir).join(".env")).unwrap_or_default();
-    let get = |k: &str| {
-        env.lines().find_map(|l| {
-            let (a, b) = l.split_once('=')?;
-            (a.trim() == k).then(|| b.trim().trim_matches('"').to_string())
-        })
-    };
-    let (Some(conn), Some(name)) = (get("DB_CONNECTION"), get("DB_DATABASE")) else {
-        return;
+fn env_value(p: &Project, key: &str) -> Option<String> {
+    let env = std::fs::read_to_string(Path::new(&p.shared_dir()).join(".env")).unwrap_or_default();
+    env.lines().find_map(|l| {
+        let (a, b) = l.split_once('=')?;
+        (a.trim() == key).then(|| b.trim().trim_matches('"').to_string())
+    })
+}
+
+async fn pre_migrate_backup(state: &AppState, p: &Project, job: &JobCtx) -> Result<String> {
+    let (Some(conn), Some(name)) = (env_value(p, "DB_CONNECTION"), env_value(p, "DB_DATABASE"))
+    else {
+        return Ok("no database in .env".into());
     };
     let engine = match conn.as_str() {
         "mysql" | "mariadb" => crate::routes::databases::Engine::Mysql,
         "pgsql" => crate::routes::databases::Engine::Postgres,
-        _ => return,
+        _ => return Ok(format!("{conn}: not backed up")),
     };
     if !crate::util::is_valid_db_name(&name) {
-        return;
+        return Ok("database name not supported".into());
     }
     let dir = state.config.backup_dir.join("deploys").join(&p.id);
     for d in [
@@ -659,26 +797,88 @@ async fn pre_migrate_backup(state: &AppState, p: &Project, job: &JobCtx) {
         let _ = crate::util::create_private_dir(d);
     }
     job.log(&format!("Backing up database {name} before migrating"));
-    match crate::routes::databases::dump_into(job, engine, &name, &dir).await {
-        Ok(f) => job.log(&format!("  saved {}", f.display())),
-        Err(e) => job.log(&format!("  backup skipped: {e:#}")),
+    let f = crate::routes::databases::dump_into(job, engine, &name, &dir).await?;
+    job.log(&format!("  saved {}", f.display()));
+    prune_deploy_dumps(&dir, 7);
+    Ok(format!("{name} saved"))
+}
+
+/// Keep the newest `keep` pre-migrate dumps of a project.
+fn prune_deploy_dumps(dir: &Path, keep: usize) {
+    let mut v: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    let n = v.len().saturating_sub(keep);
+    for (_, f) in v.into_iter().take(n) {
+        let _ = std::fs::remove_file(f);
     }
 }
 
-/// Returns Ok(true) when the deploy was rolled back after a failed probe.
-async fn run(
+// ------------------------------------------------------------------ steps
+
+fn step_begin(state: &AppState, d: &mut Deploy, name: &str, cmd: &str) -> (usize, std::time::Instant) {
+    d.steps.push(Step {
+        name: name.into(),
+        cmd: cmd.into(),
+        status: "running".into(),
+        secs: None,
+        result: String::new(),
+    });
+    let _ = save_deploy(&state.db, d);
+    (d.steps.len() - 1, std::time::Instant::now())
+}
+
+fn step_end(
     state: &AppState,
-    job: &JobCtx,
-    p: &Project,
     d: &mut Deploy,
-    commit: Option<&str>,
-) -> Result<bool> {
-    if owner_of(&p.dir).is_none() {
-        bail!("project directory {} is missing", p.dir);
+    (i, t0): (usize, std::time::Instant),
+    ok: bool,
+    result: &str,
+) {
+    if let Some(s) = d.steps.get_mut(i) {
+        s.status = if ok { "ok" } else { "failed" }.into();
+        s.secs = Some((t0.elapsed().as_secs_f64() * 10.0).round() / 10.0);
+        s.result = result.into();
     }
-    // Deploy key → private temp copy readable by the site user.
+    let _ = save_deploy(&state.db, d);
+}
+
+fn step_skip(state: &AppState, d: &mut Deploy, name: &str, cmd: &str, why: &str) {
+    d.steps.push(Step {
+        name: name.into(),
+        cmd: cmd.into(),
+        status: "skipped".into(),
+        secs: None,
+        result: why.into(),
+    });
+    let _ = save_deploy(&state.db, d);
+}
+
+/// First non-comment lines of the deploy script, for the step list.
+fn script_summary(s: &str) -> String {
+    let lines: Vec<&str> = s
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("if ") && *l != "fi")
+        .collect();
+    let mut out = lines.iter().take(3).cloned().collect::<Vec<_>>().join(" · ");
+    if lines.len() > 3 {
+        out.push_str(&format!(" · +{}", lines.len() - 3));
+    }
+    crate::util::cmd::truncate(&out, 160)
+}
+
+const TEST_SCRIPT: &str = "composer install --no-interaction --prefer-dist --quiet\nphp artisan test\n";
+
+/// Deploy key → private temp copy readable by the site user.
+async fn deploy_env(state: &AppState, p: &Project, d: &Deploy) -> Result<(Vec<(String, String)>, TempKey)> {
     let mut env: Vec<(String, String)> = vec![("GIT_TERMINAL_PROMPT".into(), "0".into())];
-    let mut _guard = TempKey(None);
+    let mut guard = TempKey(None);
     if needs_key(&p.repo) {
         let key = key_path(state, &p.id);
         if !key.exists() {
@@ -686,7 +886,7 @@ async fn run(
         }
         let tmp = PathBuf::from(format!("/run/nexacloud-deploy-{}", d.id));
         std::fs::create_dir_all(&tmp)?;
-        _guard = TempKey(Some(tmp.clone()));
+        guard = TempKey(Some(tmp.clone()));
         let kh = known_hosts_path(state);
         let _ = std::fs::copy(&kh, tmp.join("known_hosts"));
         std::fs::copy(&key, tmp.join("key"))?;
@@ -710,101 +910,166 @@ async fn run(
             ),
         ));
     }
-    let before = head_info(p, &[]).await.map(|h| h.0);
-    d.previous_commit = before.clone();
+    Ok((env, guard))
+}
 
-    // 1) fetch + reset (as the site user)
-    let target = commit
-        .map(String::from)
-        .unwrap_or_else(|| format!("origin/{}", p.branch));
+const GIT_SYNC: &str = "[ -d .git ] || git init -q -b \"$NC_BRANCH\"\ngit remote get-url origin >/dev/null 2>&1 || git remote add origin \"$NC_REPO\"\n[ \"$(git remote get-url origin)\" = \"$NC_REPO\" ] || git remote set-url origin \"$NC_REPO\"\ngit fetch --prune origin \"$NC_BRANCH\"\ngit checkout -q -f -B \"$NC_BRANCH\" \"$NC_TARGET\"\ngit reset -q --hard \"$NC_TARGET\"\n";
+
+fn git_env(p: &Project, env: &[(String, String)], target: &str) -> Vec<(String, String)> {
+    let mut g = env.to_vec();
+    g.push(("NC_REPO".into(), p.repo.clone()));
+    g.push(("NC_BRANCH".into(), p.branch.clone()));
+    g.push(("NC_TARGET".into(), target.to_string()));
+    g
+}
+
+/// Returns Ok(true) when the deploy was rolled back after a failed probe.
+async fn run(
+    state: &AppState,
+    job: &JobCtx,
+    p: &Project,
+    d: &mut Deploy,
+    commit: Option<&str>,
+) -> Result<bool> {
+    if owner_of(&p.dir).is_none() {
+        bail!("project directory {} is missing", p.dir);
+    }
     if commit.is_some_and(|c| !c.bytes().all(|b| b.is_ascii_hexdigit()) || c.len() < 7) {
         bail!("invalid commit");
     }
-    job.log(&format!("Fetching {} ({})", p.repo, p.branch));
-    let git = "[ -d .git ] || git init -q -b \"$NC_BRANCH\"\ngit remote get-url origin >/dev/null 2>&1 || git remote add origin \"$NC_REPO\"\n[ \"$(git remote get-url origin)\" = \"$NC_REPO\" ] || git remote set-url origin \"$NC_REPO\"\ngit fetch --prune origin \"$NC_BRANCH\"\ngit checkout -q -f -B \"$NC_BRANCH\" \"$NC_TARGET\"\ngit reset -q --hard \"$NC_TARGET\"\n";
-    let mut genv = env.clone();
-    genv.push(("NC_REPO".into(), p.repo.clone()));
-    genv.push(("NC_BRANCH".into(), p.branch.clone()));
-    genv.push(("NC_TARGET".into(), target.clone()));
-    as_user(p, job, &genv, git, Duration::from_secs(600))
-        .await
-        .context("git fetch/reset failed")?;
-    if let Some(g) = &_guard.0 {
+    let (env, guard) = deploy_env(state, p, d).await?;
+    let res = if p.strategy == "releases" {
+        releases::run(state, job, p, d, commit, &env).await
+    } else {
+        run_in_place(state, job, p, d, commit, &env).await
+    };
+    if let Some(g) = &guard.0 {
         let _ = std::fs::copy(g.join("known_hosts"), known_hosts_path(state));
     }
-    if let Some((sha, msg, author)) = head_info(p, &env).await {
-        job.log(&format!(
-            "Now at {} — {msg} ({author})",
-            &sha[..sha.len().min(10)]
-        ));
+    if res.as_ref().is_ok_and(|rb| !rb) {
+        after_success(state, job, p, d).await;
+    }
+    res
+}
+
+/// Bookkeeping after a deploy went live.
+async fn after_success(state: &AppState, job: &JobCtx, p: &Project, d: &Deploy) {
+    // Targeted update: settings edited during the deploy are kept.
+    let _ = state.db.conn().execute(
+        "UPDATE projects SET last_commit = ?2, last_deploy_at = ?3 WHERE id = ?1",
+        rusqlite::params![p.id, d.commit, now()],
+    );
+    if d.trigger == "rollback" && p.auto_deploy {
+        // Otherwise the poller would redeploy the newer (bad) commit within a minute.
+        let _ = state
+            .db
+            .conn()
+            .execute("UPDATE projects SET auto_deploy = 0 WHERE id = ?1", [&p.id]);
+        job.log("Auto-deploy paused because you rolled back. Turn it on again after pushing a fix.");
+    }
+    crate::apps::after_first_deploy(state, job, p).await;
+}
+
+async fn run_in_place(
+    state: &AppState,
+    job: &JobCtx,
+    p: &Project,
+    d: &mut Deploy,
+    commit: Option<&str>,
+    env: &[(String, String)],
+) -> Result<bool> {
+    let before = head_info_at(&p.dir, &[]).await.map(|h| h.0);
+    d.previous_commit = before.clone();
+    let target = commit
+        .map(String::from)
+        .unwrap_or_else(|| format!("origin/{}", p.branch));
+
+    // 1) fetch + reset (as the site user)
+    let s = step_begin(state, d, "Fetch code", &format!("git fetch && reset --hard {}", short(&target)));
+    job.log(&format!("Fetching {} ({})", p.repo, p.branch));
+    if let Err(e) = as_user_in(p, job, &git_env(p, env, &target), GIT_SYNC, Duration::from_secs(600), &p.dir).await {
+        step_end(state, d, s, false, "Failed");
+        return Err(e.context("git fetch/reset failed"));
+    }
+    if let Some((sha, msg, author)) = head_info_at(&p.dir, env).await {
+        job.log(&format!("Now at {} — {msg} ({author})", short(&sha)));
         d.commit = Some(sha);
         d.message = Some(msg);
         d.author = Some(author);
     }
-    let _ = save_deploy(&state.db, d);
+    let res = d.commit.as_deref().map(short).unwrap_or("Done").to_string();
+    step_end(state, d, s, true, &res);
 
-    // 2) pre-migrate backup + script
-    if p.migrate && p.kind == "laravel" {
-        pre_migrate_backup(state, p, job).await;
+    // 2) tests, backup, script
+    let mut script_res: Result<()> = Ok(());
+    if p.run_tests && p.kind == "laravel" {
+        let s = step_begin(state, d, "Run tests", "composer install && php artisan test");
+        let r = as_user_in(p, job, env, TEST_SCRIPT, DEPLOY_TIMEOUT, &p.dir).await;
+        step_end(state, d, s, r.is_ok(), if r.is_ok() { "Passed" } else { "Failed" });
+        script_res = r.map_err(|e| anyhow!("tests failed ({e:#})"));
     }
-    job.log("Running deploy script");
-    let script_res = as_user(p, job, &env, &p.script, DEPLOY_TIMEOUT).await;
+    if script_res.is_ok() {
+        if p.migrate && p.kind == "laravel" && p.script.contains("migrate") {
+            let s = step_begin(state, d, "Back up database", "dump before migrate");
+            match pre_migrate_backup(state, p, job).await {
+                Ok(r) => step_end(state, d, s, true, &r),
+                Err(e) => {
+                    job.log(&format!("  backup failed: {e:#}"));
+                    step_end(state, d, s, false, "Skipped (failed)");
+                }
+            }
+        }
+        job.log("Running deploy script");
+        let s = step_begin(state, d, "Run deploy script", &script_summary(&p.script));
+        script_res = as_user_in(p, job, env, &p.script, DEPLOY_TIMEOUT, &p.dir).await;
+        step_end(state, d, s, script_res.is_ok(), if script_res.is_ok() { "Done" } else { "Failed" });
+    }
+    let s = step_begin(state, d, "Reload & health check", &format!("php-fpm reload · GET {}/", p.site_id));
     reload_fpm(p, job).await;
 
     // 3) health check → automatic code rollback on failure
-    let healthy = probe(&p.site_id).await;
+    let healthy = if script_res.is_ok() { probe(&p.site_id).await } else { None };
     match (&script_res, healthy) {
         (Ok(()), Some(code)) => {
+            step_end(state, d, s, true, &format!("HTTP {code}"));
             job.log(&format!("Health check: HTTP {code} — deploy is live"));
-            // Targeted update: settings edited during the deploy are kept.
-            state.db.conn().execute(
-                "UPDATE projects SET last_commit = ?2, last_deploy_at = ?3 WHERE id = ?1",
-                rusqlite::params![p.id, d.commit, now()],
-            )?;
-            if d.trigger == "rollback" && p.auto_deploy {
-                // Otherwise the poller would redeploy the newer (bad) commit within a minute.
-                state
-                    .db
-                    .conn()
-                    .execute("UPDATE projects SET auto_deploy = 0 WHERE id = ?1", [&p.id])?;
-                job.log("Auto-deploy paused because you rolled back. Turn it on again after pushing a fix.");
-            }
             Ok(false)
         }
         _ => {
+            step_end(state, d, s, false, if script_res.is_ok() { "5xx" } else { "Skipped" });
             let why = match &script_res {
-                Err(e) => format!("deploy script failed ({e:#})"),
+                Err(e) => format!("{e:#}"),
                 Ok(()) => "the site returns errors (5xx) after deploying".into(),
             };
+            let why = if why.starts_with("tests failed") { why } else if script_res.is_err() { format!("deploy script failed ({why})") } else { why };
             let Some(prev) = before.filter(|b| Some(b) != d.commit.as_ref()) else {
                 bail!("{why}; nothing to roll back to");
             };
-            job.log(&format!(
-                "{why} — rolling back to {}",
-                &prev[..prev.len().min(10)]
-            ));
-            let mut renv = env.clone();
+            job.log(&format!("{why} — rolling back to {}", short(&prev)));
+            let mut renv = env.to_vec();
             renv.push(("NC_PREV".into(), prev.clone()));
-            as_user(
+            as_user_in(p, job, &renv, "git reset --hard \"$NC_PREV\"", Duration::from_secs(120), &p.dir).await?;
+            let _ = as_user_in(
                 p,
                 job,
-                &renv,
-                "git reset --hard \"$NC_PREV\"",
-                Duration::from_secs(120),
-            )
-            .await?;
-            let _ = as_user(
-                p,
-                job,
-                &env,
+                env,
                 &p.script.replace("php artisan migrate --force\n", ""),
                 DEPLOY_TIMEOUT,
+                &p.dir,
             )
             .await;
             reload_fpm(p, job).await;
             d.error = Some(why);
             Ok(true)
         }
+    }
+}
+
+pub fn short(s: &str) -> &str {
+    if s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        &s[..8]
+    } else {
+        s
     }
 }
 
@@ -944,6 +1209,10 @@ mod tests {
             created_at: "".into(),
             last_deploy_at: None,
             last_commit: None,
+            strategy: "in_place".into(),
+            keep_releases: 5,
+            run_tests: false,
+            notify: true,
         };
         let y = actions_yaml(&p);
         assert!(y.contains("branches: [main]"));

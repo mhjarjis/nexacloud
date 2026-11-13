@@ -1,6 +1,6 @@
 [package]
 name = "nexacloud"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "NexaCloud agent: JSON API + web UI server for managing a Laravel/PHP VPS"
 publish = false

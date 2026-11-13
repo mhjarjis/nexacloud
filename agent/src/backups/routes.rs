@@ -303,3 +303,22 @@ pub async fn restore_run(
 pub async fn disk(State(state): State<AppState>) -> Json<Vec<DiskUsage>> {
     Json(disk_usage(&state.config.backup_dir).await)
 }
+
+/// `POST /api/backup/runs/{id}/staging` — restore a site into a staging copy.
+pub async fn staging_run(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    UrlPath(id): UrlPath<String>,
+    Json(b): Json<super::staging::StagingBody>,
+) -> Response {
+    let mut info = AuditInfo::action("backup.staging", format!("{id}:{} → {}", b.files, b.domain));
+    let res = (|| {
+        let r = get_run(&state.db, &id)?.ok_or_else(|| ApiError::not_found("backup run not found"))?;
+        super::staging::validate(&state, &r, &b).map_err(ApiError::bad_request)?;
+        let job = super::staging::submit(&state, &r, b, Some(client_ip(&addr)))
+            .map_err(|e| ApiError::conflict(format!("{e:#}")))?;
+        info.job_id = Some(job.clone());
+        Ok(Json(json!({"job_id": job})).into_response())
+    })();
+    wrap(res, info)
+}

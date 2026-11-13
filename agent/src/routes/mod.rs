@@ -59,6 +59,7 @@ pub fn router(state: AppState) -> Router {
             put(bk::update_plan).delete(bk::delete_plan_route),
         )
         .route("/backup/runs/{id}/restore", post(bk::restore_run))
+        .route("/backup/runs/{id}/staging", post(bk::staging_run))
         .route(
             "/dbm/{engine}/{db}/query/write",
             post(crate::dbm::query_write),
@@ -76,7 +77,13 @@ pub fn router(state: AppState) -> Router {
         .route("/projects/{id}", put(dp::update).delete(dp::remove))
         .route("/projects/{id}/deploy", post(dp::deploy))
         .route("/projects/{id}/artisan", post(dp::artisan))
-        .route("/firewall/confirm", post(crate::plans::firewall_confirm));
+        .route("/firewall/confirm", post(crate::plans::firewall_confirm))
+        .route("/projects/{id}/env/reveal", post(dp::env_reveal))
+        .route("/projects/{id}/workers/restart", post(dp::workers_restart))
+        .route("/notify/settings", put(crate::monitor::routes::settings_put))
+        .route("/notify/test", post(crate::monitor::routes::test))
+        .route("/apps", post(crate::apps::create))
+        .route("/projects/{id}/releases/{name}/activate", post(dp::release_activate));
     if state.test_hooks {
         tracing::warn!("NEXACLOUD_TEST_HOOKS=1: test-only endpoints are enabled");
         dangerous = dangerous
@@ -142,6 +149,13 @@ pub fn router(state: AppState) -> Router {
         .route("/projects/{id}/logs", get(dp::logs))
         .route("/projects/{id}/env", get(dp::env_get))
         .route("/projects/{id}/status", get(dp::status))
+        .route("/projects/{id}/overview", get(dp::overview))
+        .route("/projects/{id}/releases", get(dp::releases))
+        .route("/apps/defaults", get(crate::apps::defaults))
+        .route("/monitor", get(crate::monitor::routes::list))
+        .route("/monitor/{site}", get(crate::monitor::routes::site))
+        .route("/notifications", get(crate::monitor::routes::notifications))
+        .route("/notify/settings", get(crate::monitor::routes::settings_get))
         .route("/deploys", get(dp::all_deploys))
         .route("/firewall/guard", get(crate::plans::firewall_guard))
         .route("/security", get(security::get))
@@ -234,6 +248,38 @@ struct Overview {
     hostname: String,
     alerts: Vec<Alert>,
     counts: Counts,
+}
+
+/// The dashboard's warnings, computed now.
+pub async fn current_alerts() -> Vec<alerts::Alert> {
+    let (svc, sec, site_list, disks) = tokio::join!(
+        services::statuses(false),
+        security::info(),
+        sites::scan(false),
+        async {
+            tokio::task::spawn_blocking(system::disks)
+                .await
+                .unwrap_or_default()
+        },
+    );
+    let php_info = php::info(&site_list).await;
+    let ssl: Vec<SiteSsl> = site_list
+        .iter()
+        .map(|s| SiteSsl {
+            id: &s.id,
+            ssl_expires: s.ssl_expires.as_deref(),
+        })
+        .collect();
+    alerts::compute(&alerts::Inputs {
+        now: chrono::Utc::now(),
+        php: &php_info.versions,
+        ufw_installed: sec.ufw.installed,
+        ufw_active: sec.ufw.active,
+        fail2ban_installed: sec.fail2ban.installed,
+        services: &svc,
+        sites: &ssl,
+        disks: &disks,
+    })
 }
 
 async fn overview() -> Json<Overview> {

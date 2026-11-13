@@ -8,7 +8,7 @@ const api = useApi()
 
 const managed = computed(() => props.site.config_path.startsWith('/etc/nginx/conf.d/nexacloud-'))
 const model = ref<SiteModel | null>(null)
-const tab = ref<'' | 'php' | 'ssl' | 'settings' | 'nginx' | 'remove' | 'runtime' | 'adopt'>('')
+const tab = ref<'' | 'php' | 'ssl' | 'settings' | 'nginx' | 'remove' | 'runtime' | 'adopt' | 'isolate'>('')
 const acceptCustom = ref(false)
 
 async function loadModel() {
@@ -75,6 +75,10 @@ function done(s: string) {
       <button v-if="managed && model && (model.kind === 'laravel' || model.kind === 'php')" type="button" class="btn btn-s" :class="{ 'btn-on': tab === 'runtime' }" @click="tab = tab === 'runtime' ? '' : 'runtime'">
         <AppIcon name="services" :size="14" :stroke="2" /> Runtime: {{ model.runtime === 'frankenphp' ? 'FrankenPHP' : 'PHP-FPM' }}
       </button>
+      <button v-if="managed && model && model.php_version && !model.user && model.runtime !== 'frankenphp'" type="button" class="btn btn-s" :class="{ 'btn-on': tab === 'isolate' }" @click="tab = tab === 'isolate' ? '' : 'isolate'">
+        <AppIcon name="lock" :size="14" :stroke="2" /> Own user &amp; PHP pool
+      </button>
+      <span v-if="model?.user" class="tag mono" title="Isolated: own Linux user and PHP-FPM pool">user {{ model.user }}</span>
       <button v-if="managed" type="button" class="btn btn-s" :class="{ 'btn-on': tab === 'settings' }" @click="tab = tab === 'settings' ? '' : 'settings'">
         <AppIcon name="edit" :size="14" :stroke="2" /> Settings
       </button>
@@ -114,6 +118,17 @@ function done(s: string) {
         label="Preview"
         apply-label="Manage this site"
         success-text="This site is now managed by NexaCloud."
+        @done="done"
+      />
+    </div>
+
+    <div v-if="tab === 'isolate'" class="stack" style="gap: 10px">
+      <p class="small text-2">Runs this site as its own Linux user with its own PHP-FPM pool, and makes its .env readable by that user only. If another site on this server gets hacked, it can no longer read this site's files or database password. Deploys, queue workers and cron move to the new user. NexaCloud checks the site afterwards and undoes everything if it breaks.</p>
+      <PlanAction
+        :request="{ kind: 'site_isolate', params: { id: site.id } }"
+        label="Preview"
+        apply-label="Isolate this site"
+        success-text="This site now runs as its own user."
         @done="done"
       />
     </div>

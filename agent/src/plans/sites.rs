@@ -123,6 +123,55 @@ pub struct SiteModel {
     pub ssl_cert: Option<String>,
     #[serde(default)]
     pub ssl_key: Option<String>,
+    /// Isolated sites: own Linux user and PHP-FPM pool (socket in `fpm_socket`).
+    #[serde(default)]
+    pub user: Option<String>,
+}
+
+// ------------------------------------------------------------------ isolation
+
+/// Linux user for an isolated site: `nc_` + the domain (max 32 chars).
+pub fn site_user(id: &str) -> String {
+    let slug: String = id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+        .collect();
+    let u = format!("nc_{slug}");
+    if u.len() <= 32 {
+        return u;
+    }
+    let h = crate::util::sha256_hex(id.as_bytes());
+    format!("{}_{}", &u[..24], &h[..7])
+}
+
+pub fn pool_path(version: &str, user: &str) -> String {
+    format!("/etc/php/{version}/fpm/pool.d/{user}.conf")
+}
+
+pub fn pool_socket(version: &str, user: &str) -> String {
+    format!("/run/php/php{version}-fpm-{user}.sock")
+}
+
+/// A PHP-FPM pool running as the site's own user. nginx (www-data) talks to
+/// it over a socket only it can open.
+pub fn pool_conf(id: &str, version: &str, user: &str) -> String {
+    format!(
+        "; Managed by NexaCloud — isolated PHP-FPM pool for {id}\n[{user}]\nuser = {user}\ngroup = {user}\nlisten = {sock}\nlisten.owner = www-data\nlisten.group = www-data\nlisten.mode = 0660\npm = ondemand\npm.max_children = 10\npm.process_idle_timeout = 30s\npm.max_requests = 500\ncatch_workers_output = yes\nphp_admin_flag[log_errors] = on\n",
+        sock = pool_socket(version, user)
+    )
+}
+
+/// Commands that create the user (idempotent) and let nginx read its files.
+fn ensure_user(b: crate::changes::ChangePlanBuilder, user: &str, home: &str) -> crate::changes::ChangePlanBuilder {
+    b.pre_command([
+        "sh",
+        "-c",
+        "id -u \"$1\" >/dev/null 2>&1 || useradd --system --user-group --home-dir \"$2\" --no-create-home --shell /usr/sbin/nologin \"$1\"",
+        "useradd",
+        user,
+        home,
+    ])
+    .pre_command(["usermod", "-aG", user, "www-data"])
 }
 
 // ------------------------------------------------------------------ validation
@@ -468,6 +517,13 @@ pub struct CreateParams {
     pub redirect_code: Option<u16>,
     #[serde(default)]
     pub options: Option<SiteOptions>,
+    /// Own Linux user + PHP-FPM pool (PHP sites).
+    #[serde(default)]
+    pub isolate: bool,
+    /// Don't create the web root / placeholder page (release folders: the
+    /// first deploy creates `current`).
+    #[serde(default)]
+    pub no_placeholder: bool,
 }
 
 pub fn model_from_create(p: &CreateParams) -> SiteModel {
@@ -520,6 +576,7 @@ pub fn model_from_create(p: &CreateParams) -> SiteModel {
         fpm_socket: None,
         ssl_cert: None,
         ssl_key: None,
+        user: None,
     }
 }
 
@@ -537,7 +594,16 @@ fn taken_names(skip_id: Option<&str>) -> Vec<String> {
 }
 
 pub fn plan_create(env: &ChangeEnv, p: &CreateParams) -> Result<ChangePlan, String> {
-    let m = model_from_create(p);
+    let mut m = model_from_create(p);
+    if p.isolate {
+        if !m.kind.uses_php() {
+            return Err("isolation (own user + PHP pool) is for PHP sites".into());
+        }
+        let u = site_user(&m.id);
+        let v = m.php_version.clone().unwrap_or_default();
+        m.fpm_socket = Some(pool_socket(&v, &u));
+        m.user = Some(u);
+    }
     validate(&m)?;
     if host_exists(env, &conf_path(&m.id)) {
         return Err(format!("{} already exists", m.id));
@@ -564,18 +630,35 @@ pub fn plan_create(env: &ChangeEnv, p: &CreateParams) -> Result<ChangePlan, Stri
     .lock(&format!("site:{}", m.id))
     .create_parents()
     .pre_command(["install", "-d", "-m", "0755", ACME_ROOT]);
-    if let Some(root) = &m.root {
+    let owner = m.user.clone().unwrap_or_else(|| "www-data".into());
+    let (uid_gid, mode) = (m.user.is_none().then_some((33, 33)), if m.user.is_some() { "0750" } else { "0755" });
+    if let (Some(u), Some(pd)) = (&m.user, &m.project_dir) {
+        b = ensure_user(b, u, pd);
+        if !host_exists(env, pd) {
+            b = b.pre_command(["install", "-d", "-m", "0750", "-o", u, "-g", u, pd]);
+        }
+        let v = m.php_version.clone().unwrap_or_default();
+        b = b
+            .write_file(&pool_path(&v, u), pool_conf(&m.id, &v, u))
+            .command(["systemctl", "reload", &format!("php{v}-fpm")])
+            .on_revert(["systemctl", "reload", &format!("php{v}-fpm")]);
+    }
+    if p.no_placeholder {
+        if let Some(pd) = &m.project_dir {
+            if !host_exists(env, pd) && m.user.is_none() {
+                b = b.pre_command(["install", "-d", "-m", "0755", "-o", "www-data", "-g", "www-data", pd]);
+            }
+        }
+    } else if let Some(root) = &m.root {
         if !host_exists(env, root) {
             if let Some(pd) = &m.project_dir {
-                if !host_exists(env, pd) {
+                if !host_exists(env, pd) && m.user.is_none() {
                     b = b.pre_command([
                         "install", "-d", "-m", "0755", "-o", "www-data", "-g", "www-data", pd,
                     ]);
                 }
             }
-            b = b.pre_command([
-                "install", "-d", "-m", "0755", "-o", "www-data", "-g", "www-data", root,
-            ]);
+            b = b.pre_command(["install", "-d", "-m", mode, "-o", &owner, "-g", &owner, root]);
             let (file, content) = if m.kind.uses_php() {
                 (
                     format!("{root}/index.php"),
@@ -590,7 +673,10 @@ pub fn plan_create(env: &ChangeEnv, p: &CreateParams) -> Result<ChangePlan, Stri
                     ),
                 )
             };
-            b = b.write_file_with(&file, Content::Text(content), Some(0o644), Some((33, 33)));
+            b = b.write_file_with(&file, Content::Text(content), Some(0o644), uid_gid);
+            if let Some(u) = &m.user {
+                b = b.command(["chown", &format!("{u}:{u}"), &file]);
+            }
         }
     }
     b = b.write_file(&conf_path(&m.id), render(&m));
@@ -605,18 +691,123 @@ pub fn plan_create(env: &ChangeEnv, p: &CreateParams) -> Result<ChangePlan, Stri
 
 pub fn plan_delete(env: &ChangeEnv, id: &str) -> Result<ChangePlan, String> {
     let m = load_model(env, id)?;
-    let b = ChangePlan::builder(
+    let mut b = ChangePlan::builder(
         "site_delete",
         &format!("Remove site {id}"),
         &format!("site:{id}"),
     )
     .lock(&format!("site:{id}"))
-    .delete_file(&conf_path(id))
+    .delete_file(&conf_path(id));
+    // Things that only exist for this site: its PHP pool, queue workers,
+    // scheduler cron and FrankenPHP service.
+    if let (Some(u), Some(v)) = (&m.user, &m.php_version) {
+        if host_exists(env, &pool_path(v, u)) {
+            b = b
+                .delete_file(&pool_path(v, u))
+                .command(["systemctl", "reload", &format!("php{v}-fpm")])
+                .on_revert(["systemctl", "reload", &format!("php{v}-fpm")]);
+        }
+    }
+    let wconf = crate::monitor::project::worker_conf_path(id);
+    if host_exists(env, &wconf) {
+        b = b
+            .delete_file(&wconf)
+            .command(["supervisorctl", "reread"])
+            .command(["supervisorctl", "update"])
+            .on_revert(["supervisorctl", "update"]);
+    }
+    let cron = format!("/etc/cron.d/{}", crate::deploys::routes::cron_name(id));
+    if host_exists(env, &cron) {
+        b = b.delete_file(&cron);
+    }
+    if m.runtime == Runtime::Frankenphp {
+        let unit = crate::plans::runtime::unit_name(id);
+        b = b.command([
+            "sh",
+            "-c",
+            "systemctl disable --now \"$1\" 2>/dev/null; true",
+            "stop",
+            &unit,
+        ]);
+    }
+    let b = b
     .note(format!(
         "Removes the nginx config only. Files in {} and certificates stay on disk.",
         m.project_dir.as_deref().unwrap_or("the web root")
     ));
     nginx_apply(b).build(env).map_err(|e| format!("{e:#}"))
+}
+
+/// nginx test + reload, then the loopback probe.
+pub fn apply_and_probe(b: crate::changes::ChangePlanBuilder, m: &SiteModel) -> crate::changes::ChangePlanBuilder {
+    probe(nginx_apply(b), m)
+}
+
+/// Give an existing managed PHP site its own Linux user and PHP-FPM pool.
+pub fn plan_isolate(
+    env: &ChangeEnv,
+    id: &str,
+    project: Option<&crate::deploys::Project>,
+) -> Result<ChangePlan, String> {
+    use std::os::unix::fs::MetadataExt;
+    let old = load_model(env, id)?;
+    if !old.kind.uses_php() {
+        return Err("only PHP sites run in a PHP pool".into());
+    }
+    if old.user.is_some() {
+        return Err("this site already has its own user".into());
+    }
+    if old.runtime == Runtime::Frankenphp {
+        return Err("switch the site back to PHP-FPM first".into());
+    }
+    let pd = old
+        .project_dir
+        .clone()
+        .or_else(|| old.root.clone())
+        .ok_or("this site has no project folder")?;
+    if !["/var/www/", "/srv/", "/home/"].iter().any(|p| pd.starts_with(p)) || pd.matches('/').count() < 3 {
+        return Err(format!("{pd} must be a site folder under /var/www, /srv or /home"));
+    }
+    let v = old.php_version.clone().ok_or("this site has no PHP version")?;
+    let md = std::fs::metadata(env.host_path(&pd)).map_err(|e| format!("{pd}: {e}"))?;
+    let u = site_user(id);
+    let mut new = old.clone();
+    new.user = Some(u.clone());
+    new.fpm_socket = Some(pool_socket(&v, &u));
+    validate(&new)?;
+    let mut b = ChangePlan::builder(
+        "site_isolate",
+        &format!("Give {id} its own user and PHP pool"),
+        &format!("site:{id}"),
+    )
+    .lock(&format!("site:{id}"));
+    b = ensure_user(b, &u, &pd)
+        .pre_command_timeout(["chown", "-R", &format!("{u}:{u}"), &pd], 900)
+        .pre_command(["chmod", "0750", &pd])
+        .pre_command([
+            "sh",
+            "-c",
+            "for f in \"$1/.env\" \"$1/shared/.env\"; do if [ -f \"$f\" ] && [ ! -L \"$f\" ]; then chmod 0600 \"$f\"; fi; done; true",
+            "env-mode",
+            &pd,
+        ])
+        .write_file(&pool_path(&v, &u), pool_conf(id, &v, &u))
+        .write_file(&conf_path(id), render(&new))
+        .command(["systemctl", "reload", &format!("php{v}-fpm")])
+        .on_revert(["chown", "-R", &format!("{}:{}", md.uid(), md.gid()), &pd])
+        .on_revert(["chmod", &format!("{:o}", md.mode() & 0o7777), &pd])
+        .on_revert(["systemctl", "reload", &format!("php{v}-fpm")]);
+    if let Some(p) = project {
+        let mut p2 = p.clone();
+        p2.run_as = u.clone();
+        b = crate::plans::projects::follow_project(b, env, &p2);
+    }
+    probe(nginx_apply(b), &new)
+        .note(format!(
+            "Creates the Linux user {u}, gives it {pd} (other sites' PHP can no longer read it), makes .env readable by {u} only and runs the site in its own PHP {v} pool. Deploys, workers and cron run as {u} from now on. Undo from Activity."
+        ))
+        .build(env)
+        .map_err(|e| format!("{e:#}"))
 }
 
 fn plan_model_update(
@@ -683,6 +874,22 @@ pub fn plan_php_switch(env: &ChangeEnv, id: &str, version: &str) -> Result<Chang
         new.php_version = Some(version.to_string());
         if let Some(sock) = &old.fpm_socket {
             new.fpm_socket = Some(replace_php_sockets(sock, version).0);
+        }
+        if let (Some(u), Some(oldv)) = (&old.user, &old.php_version) {
+            // Isolated: move the pool to the new version. The new pool is up
+            // before nginx switches; the old one goes away after.
+            new.fpm_socket = Some(pool_socket(version, u));
+            validate(&new)?;
+            let b = ChangePlan::builder("site_php", &format!("Switch {id} to PHP {version}"), &format!("site:{id}"))
+                .lock(&format!("site:{id}"))
+                .write_file(&pool_path(version, u), pool_conf(id, version, u))
+                .delete_file(&pool_path(oldv, u))
+                .write_file(&conf_path(id), render(&new))
+                .command(["systemctl", "reload", &format!("php{version}-fpm")])
+                .on_revert(["systemctl", "reload", &format!("php{version}-fpm")])
+                .on_revert(["systemctl", "reload", &format!("php{oldv}-fpm")]);
+            let b = nginx_apply(b).command(["systemctl", "reload", &format!("php{oldv}-fpm")]);
+            return probe(b, &new).build(env).map_err(|e| format!("{e:#}"));
         }
         return plan_model_update(
             env,
@@ -893,6 +1100,8 @@ mod tests {
             redirect_to: None,
             redirect_code: None,
             options: None,
+            isolate: false,
+            no_placeholder: false,
         })
     }
 
@@ -1239,6 +1448,7 @@ pub fn plan_adopt(env: &ChangeEnv, p: &AdoptParams) -> Result<ChangePlan, String
         fpm_socket,
         ssl_cert: site.ssl_certificate.clone(),
         ssl_key,
+        user: None,
     };
     validate(&m)?;
     let mut b = ChangePlan::builder(
@@ -1297,4 +1507,36 @@ pub fn plan_adopt(env: &ChangeEnv, p: &AdoptParams) -> Result<ChangePlan, String
         format!("Custom rules that are NOT carried over: {}. Re-add them in /etc/nginx/nexacloud/{}.custom.conf. The original config stays on disk (disabled).", custom.join("; "), p.id)
     };
     b2.note(note).build(env).map_err(|e| format!("{e:#}"))
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+
+    #[test]
+    fn users_pools_and_sockets() {
+        assert_eq!(site_user("crm.example.com"), "nc_crm_example_com");
+        let long = site_user("a-very-long-subdomain-name.some-company.example.com");
+        assert!(long.len() <= 32 && long.starts_with("nc_"));
+        assert_eq!(pool_socket("8.3", "nc_a"), "/run/php/php8.3-fpm-nc_a.sock");
+        // the PHP switch rewrites versioned sockets
+        assert_eq!(replace_php_sockets(&pool_socket("8.3", "nc_a"), "8.4").0, pool_socket("8.4", "nc_a"));
+        let c = pool_conf("a.test", "8.3", "nc_a");
+        assert!(c.contains("[nc_a]") && c.contains("user = nc_a") && c.contains("listen.owner = www-data"));
+        let mut m = model_from_create(&CreateParams {
+            kind: SiteKind::Laravel,
+            domain: "a.test".into(),
+            aliases: vec![],
+            root: None,
+            php_version: Some("8.3".into()),
+            upstream: None,
+            redirect_to: None,
+            redirect_code: None,
+            options: None,
+            isolate: true,
+            no_placeholder: false,
+        });
+        m.fpm_socket = Some(pool_socket("8.3", "nc_a_test"));
+        assert!(render(&m).contains("fastcgi_pass unix:/run/php/php8.3-fpm-nc_a_test.sock;"));
+    }
 }

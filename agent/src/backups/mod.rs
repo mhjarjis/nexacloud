@@ -13,6 +13,7 @@
 //! public half you add to the NAS user, plus pinned host keys.
 
 pub mod routes;
+pub mod staging;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -190,7 +191,46 @@ pub fn validate_destination(kind: &str, c: &Value) -> Result<(), String> {
         }
         _ => return Err("destination type must be local, sftp or s3".into()),
     }
+    let pw = s("encrypt_password");
+    if !pw.is_empty() {
+        if kind == "local" {
+            return Err("encryption is for off-site destinations (SFTP / S3)".into());
+        }
+        if pw.chars().count() < 12 {
+            return Err("use an encryption password of at least 12 characters".into());
+        }
+    }
     Ok(())
+}
+
+/// Backups to this destination are encrypted (rclone crypt).
+pub fn encrypted(d: &Destination) -> bool {
+    d.kind != "local"
+        && d.config
+            .get("encrypt_password")
+            .and_then(Value::as_str)
+            .is_some_and(|p| !p.trim().is_empty())
+}
+
+/// Obscure the encryption password for rclone (`rclone obscure -`, via
+/// stdin so it never shows in the process list). Needs rclone installed.
+pub async fn prepare(d: &Destination) -> Result<Destination> {
+    let mut d = d.clone();
+    if !encrypted(&d) {
+        return Ok(d);
+    }
+    let pw = d.config["encrypt_password"].as_str().unwrap_or("").trim().to_string();
+    let o = Cmd::new("rclone")
+        .args(["obscure", "-"])
+        .stdin(format!("{pw}\n").into_bytes())
+        .timeout(Duration::from_secs(20))
+        .run()
+        .await;
+    if !o.ok || o.stdout.trim().is_empty() {
+        bail!("preparing encryption failed: {}", o.error_summary("rclone obscure"));
+    }
+    d.config["_obscured"] = Value::String(o.stdout.trim().to_string());
+    Ok(d)
 }
 
 /// Destination as shown to the browser: secrets replaced by a marker.
@@ -200,6 +240,13 @@ pub fn redacted(d: &Destination) -> Destination {
         if o.contains_key("secret_key") {
             o.insert("secret_key".into(), Value::String("••••••".into()));
         }
+        let enc = o
+            .get("encrypt_password")
+            .and_then(Value::as_str)
+            .is_some_and(|p| !p.trim().is_empty());
+        o.remove("encrypt_password");
+        o.remove("_obscured");
+        o.insert("encrypted".into(), Value::Bool(enc));
     }
     d
 }
@@ -613,11 +660,34 @@ fn rclone_env(d: &Destination) -> Vec<(String, String)> {
         }
         _ => {}
     }
+    if let Some(ob) = d.config.get("_obscured").and_then(Value::as_str) {
+        e.push(("RCLONE_CONFIG_NCCRYPT_TYPE".into(), "crypt".into()));
+        e.push(("RCLONE_CONFIG_NCCRYPT_REMOTE".into(), raw_root(d)));
+        e.push(("RCLONE_CONFIG_NCCRYPT_PASSWORD".into(), ob.to_string()));
+        e.push(("RCLONE_CONFIG_NCCRYPT_FILENAME_ENCRYPTION".into(), "standard".into()));
+    }
     e
 }
 
-/// `NCDEST:<base>` for remote destinations, or the local folder.
+/// `NCCRYPT:` (encrypted, after [`prepare`]), `NCDEST:<base>` for remote
+/// destinations, or the local folder.
 fn dest_root(d: &Destination) -> String {
+    if d.config.get("_obscured").is_some() {
+        return "NCCRYPT:".into();
+    }
+    raw_root(d)
+}
+
+/// `NCCRYPT:` + `a/b` → `NCCRYPT:a/b`; `/x` + `a` → `/x/a`.
+fn join_remote(root: &str, rel: &str) -> String {
+    if root.ends_with(':') {
+        format!("{root}{rel}")
+    } else {
+        format!("{root}/{rel}")
+    }
+}
+
+fn raw_root(d: &Destination) -> String {
     let s = |k: &str| {
         d.config
             .get(k)
@@ -759,10 +829,14 @@ pub async fn test_destination(d: &Destination, job: &JobCtx) -> Result<()> {
         ensure_ssh_key().await?;
         pin_host_key(d, job).await?;
     }
+    let d = &prepare(d).await?;
+    if encrypted(d) {
+        job.log("Encryption is on: files and names are encrypted before they leave this server.");
+    }
     let root = dest_root(d);
     let tmp = std::env::temp_dir().join(format!("nexacloud-test-{}", uuid::Uuid::new_v4()));
     std::fs::write(&tmp, b"NexaCloud connection test\n")?;
-    let target = format!("{root}/.nexacloud-test");
+    let target = join_remote(&root, ".nexacloud-test");
     for (what, args) in [
         ("mkdir", vec!["mkdir".to_string(), root.clone()]),
         (
@@ -868,6 +942,15 @@ pub fn submit_run(state: &AppState, plan: &Plan, actor: Option<String>) -> Resul
             Err(e) => {
                 r2.status = "failed".into();
                 r2.error = Some(format!("{e:#}"));
+                crate::monitor::notify::send(
+                    &st,
+                    crate::monitor::notify::Event::BackupFailed,
+                    &format!("backup_failed:{}", plan.id),
+                    "critical",
+                    &format!("Backup \"{}\" failed", plan.name),
+                    &format!("{e:#}"),
+                    None,
+                );
             }
         }
         let _ = save_run(&st.db, &r2);
@@ -965,11 +1048,13 @@ async fn execute_run(state: &AppState, job: &JobCtx, plan: &Plan, run: &mut Run)
     if let Some(did) = &plan.destination_id {
         let d = get_destination(&state.db, did)?
             .ok_or_else(|| anyhow!("destination {did} no longer exists"))?;
-        let target = format!(
-            "{}/{}/{}",
-            dest_root(&d),
-            slug(&plan.name, &plan.id),
-            run.stamp
+        if d.kind != "local" {
+            ensure_rclone(job).await?;
+        }
+        let d = prepare(&d).await?;
+        let target = join_remote(
+            &dest_root(&d),
+            &format!("{}/{}", slug(&plan.name, &plan.id), run.stamp),
         );
         if d.kind == "local" {
             std::fs::create_dir_all(&target)?;
@@ -982,7 +1067,12 @@ async fn execute_run(state: &AppState, job: &JobCtx, plan: &Plan, run: &mut Run)
             if d.kind == "sftp" {
                 pin_host_key(&d, job).await?;
             }
-            job.log(&format!("Uploading to {} ({})", d.name, d.kind));
+            job.log(&format!(
+                "Uploading to {} ({}{})",
+                d.name,
+                d.kind,
+                if encrypted(&d) { ", encrypted" } else { "" }
+            ));
             let o = rclone(
                 &d,
                 &[
@@ -1006,7 +1096,7 @@ async fn execute_run(state: &AppState, job: &JobCtx, plan: &Plan, run: &mut Run)
         job.log(&format!("Copied to {target}"));
         prune_remote(
             &d,
-            &format!("{}/{}", dest_root(&d), slug(&plan.name, &plan.id)),
+            &join_remote(&dest_root(&d), &slug(&plan.name, &plan.id)),
             plan,
             job,
         )
@@ -1151,6 +1241,57 @@ pub fn submit_restore(
     Ok((id, target))
 }
 
+/// The backup file of one item: the local copy when it still exists,
+/// otherwise downloaded (and decrypted) from the destination into a private
+/// temp folder (returned second; delete it when done).
+pub async fn fetch_item(
+    state: &AppState,
+    job: &JobCtx,
+    run: &Run,
+    item: &RunItem,
+) -> Result<(PathBuf, Option<PathBuf>)> {
+    if let Some(f) = run
+        .local_path
+        .as_ref()
+        .map(|p| Path::new(p).join(&item.file))
+        .filter(|p| p.exists())
+    {
+        return Ok((f, None));
+    }
+    let plan = get_plan(&state.db, &run.plan_id)?.ok_or_else(|| anyhow!("plan deleted"))?;
+    let d = get_destination(&state.db, plan.destination_id.as_deref().unwrap_or(""))?
+        .ok_or_else(|| anyhow!("the local copy was pruned and the destination is gone"))?;
+    if d.kind != "local" {
+        ensure_rclone(job).await?;
+    }
+    let d = prepare(&d).await?;
+    let remote = run
+        .remote_path
+        .clone()
+        .ok_or_else(|| anyhow!("no remote copy"))?;
+    let td = state
+        .config
+        .backup_dir
+        .join(format!(".restore-{}", uuid::Uuid::new_v4()));
+    create_private_dir(&td)?;
+    job.log(&format!("Downloading {} from {}", item.file, d.name));
+    let src = format!("{remote}/{}", item.file);
+    let ok = if d.kind == "local" {
+        std::fs::copy(&src, td.join(&item.file)).is_ok()
+    } else {
+        let o = rclone(&d, &["copyto", &src, &td.join(&item.file).to_string_lossy()])
+            .timeout(RUN_TIMEOUT)
+            .run_streaming(job.log.as_ref())
+            .await;
+        o.ok
+    };
+    if !ok {
+        let _ = std::fs::remove_dir_all(&td);
+        bail!("download of {} failed", item.file);
+    }
+    Ok((td.join(&item.file), Some(td)))
+}
+
 async fn restore(
     state: &AppState,
     job: &JobCtx,
@@ -1159,51 +1300,8 @@ async fn restore(
     engine: Engine,
     target: &str,
 ) -> Result<()> {
-    let mut file = run
-        .local_path
-        .as_ref()
-        .map(|p| Path::new(p).join(&item.file))
-        .filter(|p| p.exists());
-    let mut tmpdir = None;
-    if file.is_none() {
-        let plan = get_plan(&state.db, &run.plan_id)?.ok_or_else(|| anyhow!("plan deleted"))?;
-        let d = get_destination(&state.db, plan.destination_id.as_deref().unwrap_or(""))?
-            .ok_or_else(|| anyhow!("the local copy was pruned and the destination is gone"))?;
-        let remote = run
-            .remote_path
-            .clone()
-            .ok_or_else(|| anyhow!("no remote copy"))?;
-        let td = state
-            .config
-            .backup_dir
-            .join(format!(".restore-{}", uuid::Uuid::new_v4()));
-        create_private_dir(&td)?;
-        job.log(&format!("Downloading {} from {}", item.file, d.name));
-        let src = format!("{remote}/{}", item.file);
-        let o = if d.kind == "local" {
-            std::fs::copy(&src, td.join(&item.file))
-                .map(|_| ())
-                .map_err(|e| anyhow!("{e}"))?;
-            crate::util::cmd::CmdOutput {
-                ok: true,
-                ..Default::default()
-            }
-        } else {
-            rclone(
-                &d,
-                &["copyto", &src, &td.join(&item.file).to_string_lossy()],
-            )
-            .timeout(RUN_TIMEOUT)
-            .run_streaming(job.log.as_ref())
-            .await
-        };
-        if !o.ok {
-            bail!("download failed: {}", o.error_summary("rclone"));
-        }
-        file = Some(td.join(&item.file));
-        tmpdir = Some(td);
-    }
-    let file = file.unwrap();
+    let (file, tmpdir) = fetch_item(state, job, run, item).await?;
+
     let res = async {
         match engine {
             Engine::Mysql => {

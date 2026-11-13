@@ -9,6 +9,19 @@ One Rust binary (the agent) runs on your server and serves a Nuxt web panel over
 
 ## What it does
 
+- **New app in one step** — domain → Git repo → database + user → production `.env` (APP_KEY,
+  debug off) → HTTPS → first deploy; queue worker and scheduler start after the first good deploy.
+- **Per-site isolation** — each app can run as its own Linux user with its own PHP-FPM pool, so a
+  hacked site can't read another site's `.env` or files (new apps by default, one click for existing ones).
+- **Zero-downtime releases** — deploys build in `releases/<n>` with `.env` and `storage/` shared, go
+  live by an atomic symlink switch only after the build (and optionally `php artisan test`) passes,
+  switch back automatically if the site then returns errors; one-click "Activate" for older releases.
+- **Monitoring & alerts** — every site checked each minute (uptime, response time p50/p95 chart);
+  Telegram and email alerts when a site goes down / recovers, a deploy or backup fails, or the
+  server needs attention.
+- **Project page** — health cards (HTTP, SSL, queue backlog, scheduler, errors, log size), response
+  time, Artisan, queue workers table with per-worker restart, schedule from the app, grouped latest
+  errors, `.env` table with audited reveal, live-tail logs with filter, deploy steps per run.
 - **Dashboard** — CPU, memory, disk, uptime, attention list, advisor score, backup status, recent changes.
 - **Sites** — every nginx site (Laravel / plain PHP / static / proxy detected). **Create** sites,
   subdomains, redirects and proxies; **Let's Encrypt HTTPS**; per-site **PHP version switch**
@@ -27,7 +40,9 @@ One Rust binary (the agent) runs on your server and serves a Nuxt web panel over
   create database + user, reset passwords.
 - **Backups** — scheduled plans (databases + folders), off-site copies to **Synology** (SFTP —
   Tailscale-friendly — with a panel SSH key), S3-compatible storage (Synology C2, AWS, MinIO, B2) or
-  a local disk, 7 daily / 4 weekly / 3 monthly retention, restore into a copy (never over live data),
+  a local disk, **encrypted before upload** (rclone crypt — the NAS only sees scrambled data),
+  7 daily / 4 weekly / 3 monthly retention, restore a database into a copy (never over live data),
+  **restore a whole site to a staging copy** (files + database + `.env`, own user and domain),
   disk usage + cleanup.
 - **PHP & Services** — install PHP versions (ondrej PPA), extensions, php.ini settings, CLI default;
   one-click install of Redis, Supervisor, Fail2ban, UFW, Certbot, Composer, Node.js, rclone, ClamAV…
@@ -129,9 +144,6 @@ docs/      API.md — the contract between agent and web
 
 ## Roadmap (next)
 
-- Create sites and subdomains (Laravel / plain PHP / static / proxy), with Let's Encrypt SSL
-- Switch PHP version per site, install PHP versions
-- Git deploys from GitHub (webhook, zero-downtime releases, rollback)
-- Scheduled backups, restore into a copy, off-site copy (S3)
-- One-click firewall with safe defaults (SSH + HTTP + HTTPS + panel port)
-- Panel on its own domain with a real certificate
+- Test on the real VPS: install, then "Manage with NexaCloud" on one site at a time
+- Node.js / static build pipelines and per-site Node versions
+- Two-factor login for the panel

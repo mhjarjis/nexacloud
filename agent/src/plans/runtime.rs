@@ -21,7 +21,7 @@ const FRANKENPHP_URL: &str =
 const FRANKENPHP_SHA256: &str = "52d262be9b107a1a6f5f1d2945393dd838e89e4735c38a376b940e9fa9e1c881";
 pub const GUARD_UNIT: &str = "nexacloud-firewall-guard";
 
-fn unit_name(id: &str) -> String {
+pub fn unit_name(id: &str) -> String {
     format!("nexacloud-frankenphp-{}", id.replace('.', "-"))
 }
 
@@ -308,6 +308,8 @@ mod tests {
             redirect_to: None,
             redirect_code: None,
             options: None,
+            isolate: false,
+            no_placeholder: false,
         });
         let c = caddyfile(&m, 8101);
         assert!(c.contains("http://:8101 {"));

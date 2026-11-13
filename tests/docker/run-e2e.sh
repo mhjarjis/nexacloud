@@ -526,6 +526,152 @@ check "remove site → applied" test "$st" = applied
 gone=0; for _ in $(seq 1 10); do docker exec $NAME curl -s -H 'Host: blog.test.local' http://127.0.0.1/ | grep -q 'is ready' || { gone=1; break; }; sleep 1; done
 check "blog no longer served (files kept)" bash -c "[ $gone = 1 ] && docker exec $NAME test -f /var/www/blog.test.local/public/index.php"
 
+
+# ------------------------------------------------------------------ v0.4
+step "Monitoring and alerts (fake Telegram + SMTP inside the box)"
+# Check every 5 s and send Telegram to the fake API (test-only settings).
+in_box "mkdir -p /etc/systemd/system/nexacloud.service.d && printf '[Service]\nEnvironment=NEXACLOUD_MONITOR_INTERVAL=5\nEnvironment=NEXACLOUD_TELEGRAM_API=http://127.0.0.1:8099\n' > /etc/systemd/system/nexacloud.service.d/monitor.conf && systemctl daemon-reload && systemctl restart nexacloud"
+wait_health || fail "agent did not come back"
+login "$PASS"
+sudo_on "$PASS"
+docker exec -d "$NAME" python3 /fixtures/fakes.py
+sleep 12
+check "every site is probed (shop.test.local answers)" jqe "$(api monitor)" '[.[] | select(.site=="shop.test.local")][0].last_code == 200'
+check "per-site stats have 24 hourly buckets" jqe "$(api monitor/shop.test.local)" '(.buckets|length)==24 and .checks>=1 and .uptime>0'
+NS='{"telegram":{"enabled":true,"bot_token":"123:good","chat_id":"-100123"},"email":{"enabled":true,"smtp_host":"127.0.0.1","smtp_port":2525,"security":"none","user":"","password":"","from":"alerts@example.com","to":"ops@example.com"},"events":{"site_down":true,"deploy_failed":true,"backup_failed":true,"server":false}}'
+check "save alert channels" bash -c "curl -fsSk -b $JAR -H 'Origin: $U' -H 'Content-Type: application/json' -X PUT -d '$NS' $U/api/notify/settings >/dev/null"
+check "bot token is never sent back to the browser" jqe "$(api notify/settings)" '.telegram.bot_token=="" and .telegram.has_token==true'
+check "test message delivered to Telegram and email" jqe "$(post_json notify/test '{}')" 'length==2 and all(.[]; .ok)'
+check "fake Telegram got it (chat id + text)" in_box "grep -q 'chat=-100123 text=.Test notification' /tmp/fake-telegram.log"
+check "fake SMTP got it (subject)" in_box "grep -q 'Subject: \[NexaCloud\] Test notification' /tmp/fake-smtp.log"
+check "saving with an empty token keeps the old one" bash -c "curl -fsSk -b $JAR -H 'Origin: $U' -H 'Content-Type: application/json' -X PUT -d '$(printf '%s' "$NS" | sed 's/123:good//')' $U/api/notify/settings >/dev/null && curl -fsSk -b $JAR $U/api/notify/settings | jq -e '.telegram.has_token' >/dev/null"
+st="$(plan site_create '{"kind":"php","domain":"down.test.local","php_version":"8.3"}')"
+check "create down.test.local → applied" test "$st" = applied
+in_box "printf '<?php http_response_code(503); echo \"down\";' > /var/www/down.test.local/public/index.php"
+ok=0; for _ in $(seq 1 60); do api notifications | jq -e '.[] | select(.title=="down.test.local is down")' >/dev/null && { ok=1; break; }; sleep 1; done
+check "3 failed checks → 'site is down' alert" test "$ok" = 1
+check "…delivered to Telegram" bash -c "for i in \$(seq 1 10); do docker exec $NAME grep -q 'down.test.local is down' /tmp/fake-telegram.log && exit 0; sleep 1; done; exit 1"
+in_box "printf '<?php echo \"up\";' > /var/www/down.test.local/public/index.php"
+ok=0; for _ in $(seq 1 30); do api notifications | jq -e '.[] | select(.title=="down.test.local is back up")' >/dev/null && { ok=1; break; }; sleep 1; done
+check "recovery alert after the next good check" test "$ok" = 1
+
+step "New app wizard: real Laravel app, own user, MySQL, release folders"
+sudo_on "$PASS"
+in_box 'set -e
+git config --system --add safe.directory "*"
+rm -rf /srv/git/crm.git /tmp/crmsrc && git init -q --bare /srv/git/crm.git
+cp -a /opt/laravel-skel /tmp/crmsrc && cd /tmp/crmsrc && rm -rf .git .env database/database.sqlite
+sed -i "/^\/vendor/d" .gitignore
+printf "\nuse Illuminate\\\\Support\\\\Facades\\\\Schedule;\nSchedule::command(\"inspire\")->hourly();\n" >> routes/console.php
+printf "\nRoute::get(\"/version\", fn () => \"crm v1\");\n" >> routes/web.php
+git init -q -b main && git config user.email dev@example.com && git config user.name Dev
+git add -A && git commit -qm "crm v1" && git remote add origin /srv/git/crm.git && git push -q origin main
+chmod -R a+rX /srv/git/crm.git'
+crm_push() { in_box "set -e; cd /tmp/crmsrc && $2 && git commit -qam '$1' && git push -q origin main && chmod -R a+rX /srv/git/crm.git"; }
+crm_get() { in_box "curl -s -H 'Host: crm.test.local' http://127.0.0.1$1"; }
+last_deploy() { local s=""; for _ in $(seq 1 900); do s="$(api projects/crm.test.local/deploys | jq -r '.[0].status // empty')"; case "$s" in ok|failed|rolled_back) break ;; esac; sleep 1; done; echo "$s"; }
+check "wizard defaults list PHP 8.3 and MySQL" jqe "$(api apps/defaults)" '(.php_versions|index("8.3"))!=null and .mysql==true'
+check "wizard refuses a bad domain" test "$(post_code apps '{"kind":"laravel","domain":"nope","php_version":"8.3","repo":"/srv/git/crm.git"}')" = 400
+APP="$(post_json apps '{"kind":"laravel","domain":"crm.test.local","php_version":"8.3","repo":"/srv/git/crm.git","branch":"main","database":"mysql","isolate":true,"releases":true,"worker":true,"scheduler":true}')"
+st="$(wait_job2 "$(printf '%s' "$APP" | jq -r .job_id)")"
+[ "$st" = ok ] || api "jobs/$(printf '%s' "$APP" | jq -r .job_id)" | jq -r .log | tail -30
+check "wizard job (site, user, database, .env, project) → ok" test "$st" = ok
+st="$(last_deploy)"
+[ "$st" = ok ] || api "jobs/$(api projects/crm.test.local/deploys | jq -r '.[0].job_id')" | jq -r .log | tail -40
+check "first deploy of the real Laravel app → ok" test "$st" = ok
+check "site runs as its own user nc_crm_test_local (folder 750)" in_box "[ \"\$(stat -c '%U %a' /var/www/crm.test.local)\" = 'nc_crm_test_local 750' ]"
+check "own PHP-FPM pool, nginx uses its socket" in_box "test -f /etc/php/8.3/fpm/pool.d/nc_crm_test_local.conf && grep -q 'php8.3-fpm-nc_crm_test_local.sock' /etc/nginx/conf.d/nexacloud-crm.test.local.conf"
+check ".env is in shared/, mode 600, owned by the site user" in_box "[ \"\$(stat -c '%U %a' /var/www/crm.test.local/shared/.env)\" = 'nc_crm_test_local 600' ]"
+check "other sites' PHP user (www-data) cannot read the .env" in_box "! runuser -u www-data -- cat /var/www/crm.test.local/shared/.env >/dev/null 2>&1"
+check ".env has a real APP_KEY and the MySQL user" in_box "grep -Eq '^APP_KEY=\"?base64:' /var/www/crm.test.local/shared/.env && grep -q '^DB_DATABASE=crm_test_local' /var/www/crm.test.local/shared/.env"
+check "current -> releases/1, storage linked to shared/" in_box "[ \$(readlink /var/www/crm.test.local/current) = releases/1 ] && [ \$(readlink /var/www/crm.test.local/releases/1/storage) = ../../shared/storage ]"
+check "Laravel answers through the release (crm v1)" bash -c "[ \"\$(docker exec $NAME curl -s -H 'Host: crm.test.local' http://127.0.0.1/version)\" = 'crm v1' ]"
+check "migrations ran against MySQL (users table exists)" in_box "mysql -N -e 'SHOW TABLES' crm_test_local | grep -qx users"
+check "deploy steps recorded (fetch → link → backup → script → switch → health)" jqe "$(api projects/crm.test.local/deploys)" '[.[0].steps[].name] == ["Fetch code","Link shared files","Back up database","Run deploy script","Switch release","Reload & health check"] and all(.[0].steps[]; .status=="ok")'
+ok=0; for _ in $(seq 1 60); do in_box "supervisorctl status 'nexacloud-crm-test-local:*' | grep -q RUNNING" 2>/dev/null && { ok=1; break; }; sleep 1; done
+check "queue worker started after the first deploy (Supervisor, RUNNING)" test "$ok" = 1
+check "scheduler cron installed as the site user" in_box "grep -q 'nc_crm_test_local cd /var/www/crm.test.local/current' /etc/cron.d/nexacloud-crm-test-local"
+OV="$(api 'projects/crm.test.local/overview?fresh=true')"
+check "overview: Laravel version, MySQL database, schedule from the app" jqe "$OV" '(.facts.laravel|type)=="string" and .facts.db.database=="crm_test_local" and ([.facts.schedule[].command]|index("inspire"))!=null'
+check "overview: worker RUNNING with its queue size" jqe "$OV" '.workers[0].state=="RUNNING" and .workers[0].queue=="default" and (.workers[0].pending|type)=="number"'
+check "overview: scheduler on, monitor stats, errors block" jqe "$OV" '.scheduler.enabled==true and (.monitor.buckets|length)==24 and (.errors.items|type)=="array"'
+check "logs list storage/logs files and nginx errors" jqe "$(api projects/crm.test.local/logs)" '([.sources[].id]|index("nginx-error"))!=null'
+check "reveal one secret .env value (sudo)" jqe "$(post_json projects/crm.test.local/env/reveal '{"key":"DB_PASSWORD"}')" '(.value|length)>=20'
+check "env listing still hides it" jqe "$(api projects/crm.test.local/env)" '[.vars[] | select(.key=="DB_PASSWORD")][0].value==null'
+check "restart one worker" jqe "$(post_json projects/crm.test.local/workers/restart '{"name":"default"}')" '(.restarted|length)>=1'
+
+crm_push "crm v2" "sed -i 's/crm v1/crm v2/' routes/web.php"
+jid="$(post_json projects/crm.test.local/deploy '{}' | jq -r .job_id)"; st="$(wait_job2 "$jid")"
+check "deploy v2 → ok (releases/2)" test "$st" = ok
+check "v2 is live, current -> releases/2" bash -c "[ \"\$(docker exec $NAME curl -s -H 'Host: crm.test.local' http://127.0.0.1/version)\" = 'crm v2' ] && [ \"\$(docker exec $NAME readlink /var/www/crm.test.local/current)\" = releases/2 ]"
+crm_push "crm v3 broken" "sed -i \"s#^Route::get('/', function () {#Route::get('/', function () { abort(500);#\" routes/web.php"
+jid="$(post_json projects/crm.test.local/deploy '{}' | jq -r .job_id)"; st="$(wait_job2 "$jid")"
+check "broken v3 fails its health check" test "$st" = failed
+check "…current switched back to releases/2, releases/3 removed, v2 still served" bash -c "[ \"\$(docker exec $NAME readlink /var/www/crm.test.local/current)\" = releases/2 ] && ! docker exec $NAME test -e /var/www/crm.test.local/releases/3 && [ \"\$(docker exec $NAME curl -s -H 'Host: crm.test.local' http://127.0.0.1/version)\" = 'crm v2' ]"
+check "deploy recorded as rolled_back" jqe "$(api projects/crm.test.local/deploys)" '.[0].status=="rolled_back"'
+curl -fsSk -b "$JAR" -H "Origin: $U" -H 'Content-Type: application/json' -X PUT -d '{"run_tests":true}' "$U/api/projects/crm.test.local" >/dev/null
+jid="$(post_json projects/crm.test.local/deploy '{}' | jq -r .job_id)"; st="$(wait_job2 "$jid")"
+check "with 'stop if tests fail' on, the same commit fails" test "$st" = failed
+check "…at Run tests, Switch release skipped" jqe "$(api projects/crm.test.local/deploys)" '.[0].steps as $s | ($s | map(select(.name=="Run tests"))[0].status=="failed") and ($s | map(select(.name=="Switch release"))[0].status=="skipped")'
+check "…and nothing changed on the live site" bash -c "[ \"\$(docker exec $NAME readlink /var/www/crm.test.local/current)\" = releases/2 ]"
+curl -fsSk -b "$JAR" -H "Origin: $U" -H 'Content-Type: application/json' -X PUT -d '{"run_tests":false}' "$U/api/projects/crm.test.local" >/dev/null
+check "releases listed (2 current, 1 kept)" jqe "$(api projects/crm.test.local/releases)" '[.releases[].name]==["2","1"] and .releases[0].current==true and (.releases[1].commit|length)==40'
+jid="$(post_json projects/crm.test.local/releases/1/activate '{}' | jq -r .job_id)"; st="$(wait_job2 "$jid")"
+check "activate release 1 (switch only) → v1 live" bash -c "[ '$st' = ok ] && [ \"\$(docker exec $NAME curl -s -H 'Host: crm.test.local' http://127.0.0.1/version)\" = 'crm v1' ]"
+check "rollback pauses auto-deploy and shows a switch-only deploy" jqe "$(api projects/crm.test.local/deploys)" '.[0].trigger=="rollback" and ([.[0].steps[].name]==["Switch release","Reload & health check"])'
+jid="$(post_json projects/crm.test.local/releases/2/activate '{}' | jq -r .job_id)"; st="$(wait_job2 "$jid")"
+check "activate release 2 again → v2" bash -c "[ '$st' = ok ] && [ \"\$(docker exec $NAME curl -s -H 'Host: crm.test.local' http://127.0.0.1/version)\" = 'crm v2' ]"
+check "deploy failure alert was sent" jqe "$(api notifications)" '[.[] | select(.title=="Deploy of crm.test.local was rolled back")] | length >= 1'
+
+step "Existing site: switch to release folders, then give it its own user"
+sudo_on "$PASS"
+st="$(plan project_releases '{"id":"app.test.local"}')"
+check "convert app.test.local to release folders → applied ($st)" test "$st" = applied
+check "current -> releases/1, .env copied to shared/, still serves app v4" bash -c "[ \"\$(docker exec $NAME readlink /var/www/app.test.local/current)\" = releases/1 ] && docker exec $NAME test -f /var/www/app.test.local/shared/.env && docker exec $NAME curl -s -H 'Host: app.test.local' http://127.0.0.1/ | grep -qx 'app v4'"
+check "project now reports strategy releases" jqe "$(api projects/app.test.local)" '.strategy=="releases"'
+push_version v5 '<?php echo "app v5";'
+jid="$(post_json projects/app.test.local/deploy '{}' | jq -r .job_id)"; st="$(wait_job2 "$jid")"
+check "deploy v5 into releases/2 → ok" bash -c "[ '$st' = ok ] && [ \"\$(docker exec $NAME readlink /var/www/app.test.local/current)\" = releases/2 ] && docker exec $NAME curl -s -H 'Host: app.test.local' http://127.0.0.1/ | grep -qx 'app v5'"
+st="$(plan site_isolate '{"id":"app.test.local"}')"
+check "give app.test.local its own user + pool → applied ($st)" test "$st" = applied
+check "files owned by nc_app_test_local, nginx uses the new pool" in_box "[ \$(stat -c %U /var/www/app.test.local/releases/2/public/index.php) = nc_app_test_local ] && grep -q 'php8.3-fpm-nc_app_test_local.sock' /etc/nginx/conf.d/nexacloud-app.test.local.conf"
+check "site still answers after isolating (v5)" bash -c "docker exec $NAME curl -s -H 'Host: app.test.local' http://127.0.0.1/ | grep -qx 'app v5'"
+check "project follows the new user" jqe "$(api projects/app.test.local)" '.run_as=="nc_app_test_local"'
+push_version v6 '<?php echo "app v6 as ".posix_getpwuid(posix_geteuid())["name"];'
+jid="$(post_json projects/app.test.local/deploy '{}' | jq -r .job_id)"; st="$(wait_job2 "$jid")"
+check "deploy as the new user → v6 served by its own pool" bash -c "[ '$st' = ok ] && docker exec $NAME curl -s -H 'Host: app.test.local' http://127.0.0.1/ | grep -qx 'app v6 as nc_app_test_local'"
+
+step "Encrypted off-site backups and restore to staging"
+sudo_on "$PASS"
+ENC="$(post_json backup/destinations "{\"name\":\"NAS encrypted\",\"kind\":\"sftp\",\"config\":{\"host\":\"127.0.0.1\",\"port\":22,\"user\":\"nas\",\"path\":\"/home/nas/enc\",\"encrypt_password\":\"correct horse battery staple\"}}")"
+ENC_ID="$(printf '%s' "$ENC" | jq -r .id)"
+check "encryption password is never sent back" jqe "$ENC" '.config.encrypted==true and (.config.encrypt_password==null)'
+check "short encryption password refused" test "$(post_code backup/destinations '{"name":"x","kind":"sftp","config":{"host":"127.0.0.1","user":"nas","path":"/home/nas/x","encrypt_password":"short"}}')" = 400
+st="$(wait_job2 "$(post_json "backup/destinations/$ENC_ID/test" '{}' | jq -r .job_id)")"
+check "encrypted destination test → ok" test "$st" = ok
+EP="$(post_json backup/plans "{\"name\":\"crm full\",\"destination_id\":\"$ENC_ID\",\"databases\":[\"mysql/crm_test_local\"],\"paths\":[\"/var/www/crm.test.local\"],\"schedule\":\"daily 03:00\",\"keep_daily\":3,\"keep_weekly\":0,\"keep_monthly\":0,\"enabled\":false}")"
+EP_ID="$(printf '%s' "$EP" | jq -r .id)"
+jid="$(post_json "backup/plans/$EP_ID/run" '{}' | jq -r .job_id)"; st="$(wait_job2 "$jid")"
+[ "$st" = ok ] || api "jobs/$jid" | jq -r .log | tail -20
+check "encrypted backup run (MySQL + site folder) → ok" test "$st" = ok
+check "the NAS only has scrambled names (no .sql.gz / .tar.gz visible)" in_box "test -n \"\$(find /home/nas/enc -type f)\" && ! find /home/nas/enc -name '*.gz' | grep -q ."
+ERUN="$(api "backup/runs" | jq -r "[.[] | select(.plan_id==\"$EP_ID\")][0].id")"
+in_box "rm -rf /var/backups/nexacloud/runs/$EP_ID"
+SB="{\"files\":\"/var/www/crm.test.local\",\"database\":\"mysql/crm_test_local\",\"domain\":\"staging.crm.test.local\"}"
+jid="$(post_json "backup/runs/$ERUN/staging" "$SB" | jq -r .job_id)"; st="$(wait_job2 "$jid")"
+[ "$st" = ok ] || api "jobs/$jid" | jq -r .log | tail -30
+check "restore to staging from the encrypted NAS copy (local copy deleted) → ok" test "$st" = ok
+check "staging copy answers (crm v2) on its own domain" bash -c "[ \"\$(docker exec $NAME curl -s -H 'Host: staging.crm.test.local' http://127.0.0.1/version)\" = 'crm v2' ]"
+check "staging .env points at the copied database, mail to log" in_box "grep -q '^DB_DATABASE=crm_test_local_staging_' /var/www/staging.crm.test.local/shared/.env && grep -q '^MAIL_MAILER=log' /var/www/staging.crm.test.local/shared/.env && grep -q '^APP_ENV=staging' /var/www/staging.crm.test.local/shared/.env"
+check "staging database has the data (users table)" in_box "mysql -N -e 'SHOW DATABASES' | grep -q '^crm_test_local_staging_' && mysql -N -e \"SHOW TABLES FROM \$(mysql -N -e 'SHOW DATABASES' | grep '^crm_test_local_staging_')\" | grep -qx users"
+check "staging runs as its own user" in_box "[ \$(stat -c %U /var/www/staging.crm.test.local) = nc_staging_crm_test_local ]"
+check "live site untouched (crm v2)" bash -c "[ \"\$(docker exec $NAME curl -s -H 'Host: crm.test.local' http://127.0.0.1/version)\" = 'crm v2' ]"
+check "staging over an existing folder is refused" test "$(post_code "backup/runs/$ERUN/staging" "$SB")" = 400
+
+st="$(plan site_delete '{"id":"crm.test.local"}')"
+check "remove crm.test.local → applied" test "$st" = applied
+check "…its pool, worker and cron are cleaned up" in_box "[ ! -e /etc/php/8.3/fpm/pool.d/nc_crm_test_local.conf ] && [ ! -e /etc/supervisor/conf.d/nexacloud-crm-test-local.conf ] && [ ! -e /etc/cron.d/nexacloud-crm-test-local ]"
+
 # ------------------------------------------------------------------ throttle
 step "Login throttling"
 for _ in 1 2 3 4 5 6; do code -H "Origin: $U" -H 'Content-Type: application/json' -d '{"password":"bad"}' "$U/api/auth/login" >/dev/null; done

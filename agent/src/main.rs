@@ -1,6 +1,7 @@
 //! NexaCloud agent: manages a VPS hosting Laravel and plain-PHP sites.
 
 mod advisor;
+mod apps;
 mod alerts;
 mod audit;
 mod auth;
@@ -13,6 +14,7 @@ mod dbm;
 mod deploys;
 mod error;
 mod jobs;
+mod monitor;
 mod nginx;
 mod plans;
 mod routes;
@@ -186,6 +188,7 @@ async fn run(cfg: Config) -> Result<()> {
     routes::system::CpuSampler::spawn(state.clone());
     backups::spawn_scheduler(state.clone());
     deploys::spawn_poller(state.clone());
+    monitor::spawn(state.clone());
     let app = routes::router(state.clone()).into_make_service_with_connect_info::<SocketAddr>();
 
     let handle: axum_server::Handle<SocketAddr> = axum_server::Handle::new();
