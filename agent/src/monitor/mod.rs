@@ -174,6 +174,9 @@ fn prune(db: &Db) {
     let _ = db
         .conn()
         .execute("DELETE FROM monitor_samples WHERE ts < ?1", [cutoff]);
+    let _ = db
+        .conn()
+        .execute("DELETE FROM server_samples WHERE ts < ?1", [cutoff - 32 * 86400 + KEEP_SECS]);
     let _ = db.conn().execute(
         "DELETE FROM notifications WHERE at < ?1",
         [crate::util::fmt_ts(chrono::Utc::now() - chrono::Duration::days(30))],
@@ -201,6 +204,72 @@ async fn server_checks(state: &AppState) {
     }
 }
 
+// ------------------------------------------------------------------ server history
+
+/// (rx, tx) bytes of all non-loopback interfaces since boot.
+pub fn net_counters() -> (i64, i64) {
+    let t = std::fs::read_to_string("/proc/net/dev").unwrap_or_default();
+    let mut rx = 0i64;
+    let mut tx = 0i64;
+    for l in t.lines().skip(2) {
+        let Some((name, rest)) = l.split_once(':') else { continue };
+        let name = name.trim();
+        if name == "lo" || name.starts_with("docker") || name.starts_with("veth") || name.starts_with("br-") {
+            continue;
+        }
+        let f: Vec<i64> = rest.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        if f.len() >= 9 {
+            rx += f[0];
+            tx += f[8];
+        }
+    }
+    (rx, tx)
+}
+
+fn mem_percent() -> f64 {
+    let t = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let get = |k: &str| {
+        t.lines()
+            .find(|l| l.starts_with(k))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    let total = get("MemTotal:");
+    let avail = get("MemAvailable:");
+    if total > 0.0 { (total - avail) / total * 100.0 } else { 0.0 }
+}
+
+static LAST_SERVER_SAMPLE: LazyLock<Mutex<i64>> = LazyLock::new(Default::default);
+
+fn record_server(state: &AppState) {
+    let now = chrono::Utc::now().timestamp();
+    {
+        let mut last = LAST_SERVER_SAMPLE.lock().unwrap_or_else(|e| e.into_inner());
+        if now - *last < 55 {
+            return;
+        }
+        *last = now;
+    }
+    let cpu = state.cpu.get().0 as f64;
+    let (rx, tx) = net_counters();
+    let _ = state.db.conn().execute(
+        "INSERT INTO server_samples (ts, cpu, mem, rx, tx) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![now, cpu, mem_percent(), rx, tx],
+    );
+}
+
+/// Bytes transferred between samples, ignoring counter resets (reboots).
+pub fn traffic(samples: &[(i64, i64, i64)]) -> (i64, i64) {
+    let (mut rx, mut tx) = (0, 0);
+    for w in samples.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if b.1 >= a.1 { rx += b.1 - a.1 }
+        if b.2 >= a.2 { tx += b.2 - a.2 }
+    }
+    (rx, tx)
+}
+
 pub fn spawn(state: AppState) {
     tokio::spawn(async move {
         let every = interval_secs();
@@ -210,6 +279,7 @@ pub fn spawn(state: AppState) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
+            record_server(&state);
             probe_all(&state).await;
             if tick % hourly == 1 {
                 prune(&state.db);
@@ -330,6 +400,12 @@ pub fn stats(db: &Db, site: &str, hours: i64) -> Stats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn traffic_ignores_resets() {
+        let s = vec![(0, 100, 10), (60, 300, 20), (120, 50, 5), (180, 150, 25)];
+        assert_eq!(traffic(&s), (300, 30));
+    }
 
     #[test]
     fn stats_buckets_and_uptime() {

@@ -202,7 +202,7 @@ onMounted(() => { if (current.value) { loadRows(); loadStructure() } })
           <button type="button" class="btn btn-s" :disabled="page <= 1 || loading" @click="page--; loadRows()">Previous</button>
           <span class="small">Page {{ page }} / {{ pages }}</span>
           <button type="button" class="btn btn-s" :disabled="page >= pages || loading" @click="page++; loadRows()">Next</button>
-          <select v-model.number="per" class="in" style="width: auto" @change="page = 1; loadRows()"><option :value="25">25</option><option :value="50">50</option><option :value="100">100</option><option :value="250">250</option></select>
+          <SearchSelect v-model="per" :options="[25, 50, 100, 250].map((n) => ({ value: n, label: `${n} rows` }))" aria-label="Rows per page" style="width: 130px; min-width: 130px" @change="page = 1; loadRows()" />
           <span v-if="loading" class="spinner" aria-hidden="true" />
         </div>
       </template>
@@ -234,7 +234,7 @@ onMounted(() => { if (current.value) { loadRows(); loadStructure() } })
         </div>
         <div v-if="needConfirm" class="card edit-box row wrap" style="gap: 8px; border-color: var(--warn)">
           <span class="small" style="color: var(--warn)">Type <span class="mono">{{ db }}</span> to run this destructive statement:</span>
-          <input v-model="confirmText" class="in mono" type="text" style="max-width: 220px">
+          <input v-model="confirmText" class="in mono" type="text" placeholder="type to confirm" style="max-width: 220px">
           <button type="button" class="btn btn-s" :disabled="confirmText !== db" @click="run">Run anyway</button>
         </div>
         <p v-if="qerr" class="small" style="color: var(--bad); white-space: pre-wrap" role="alert">{{ qerr }}</p>

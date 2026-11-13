@@ -342,6 +342,29 @@ echo "shared/$2 ready — linked into every new release from the next deploy"
         .map_err(|e| format!("{e:#}"))
 }
 
+/// "Fix permissions": the PHP user owns the project, storage/ writable.
+pub fn plan_permissions(env: &ChangeEnv, p: &Project) -> Result<ChangePlan, String> {
+    let args = crate::deploys::permissions::script_args(p);
+    let web = &args[5];
+    let mut p2 = p.clone();
+    p2.run_as = web.clone();
+    let b = ChangePlan::builder("project_permissions", &format!("Fix file permissions of {}", p.id), &format!("site:{}", p.site_id))
+        .lock(&format!("site:{}", p.site_id))
+        .command_timeout(args.clone(), 900);
+    // Workers and cron follow the owner.
+    let b = follow_project(b, env, &p2);
+    b.verify_command([
+        "sh",
+        "-c",
+        "for i in 1 2 3 4 5 6; do code=$(curl -ks -o /dev/null -w '%{http_code}' --resolve \"$1:80:127.0.0.1\" --resolve \"$1:443:127.0.0.1\" -L \"http://$1/\"); if [ \"$code\" -gt 0 ] && [ \"$code\" -lt 500 ]; then echo \"HTTP $code\"; exit 0; fi; sleep 1; done; echo \"HTTP $code\"; exit 1",
+        "probe",
+        &p.site_id,
+    ])
+    .note(format!("Makes {web} (the user PHP runs as) the owner of {}, makes storage/, bootstrap/cache and upload folders writable, and sets .env to owner-only. Deploys, Artisan, workers and cron run as {web} from now on.", p.dir))
+    .build(env)
+    .map_err(|e| format!("{e:#}"))
+}
+
 pub fn cron_content(p: &Project) -> String {
     format!(
         "# Managed by NexaCloud — Laravel scheduler for {}\nSHELL=/bin/sh\n* * * * * {} cd {} && touch storage/framework/.nexacloud-schedule 2>/dev/null; {} artisan schedule:run >> storage/logs/nexacloud-schedule.log 2>&1\n",

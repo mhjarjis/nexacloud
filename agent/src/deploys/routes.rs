@@ -61,6 +61,8 @@ pub async fn get(
 #[derive(Deserialize)]
 pub struct CreateBody {
     site_id: String,
+    /// Empty: manage the site without Git (connect a repository later).
+    #[serde(default)]
     repo: String,
     #[serde(default = "main")]
     branch: String,
@@ -84,9 +86,9 @@ pub async fn create(State(state): State<AppState>, Json(b): Json<CreateBody>) ->
     let info = AuditInfo::action("project.create", b.site_id.clone());
     let res = async {
         if get_project(&state.db, &b.site_id)?.is_some() {
-            return Err(ApiError::conflict("this site is already connected to a repository"));
+            return Err(ApiError::conflict("this site is already a project"));
         }
-        if !valid_repo(&b.repo) {
+        if !b.repo.trim().is_empty() && !valid_repo(&b.repo) {
             return Err(ApiError::bad_request("repository must look like git@github.com:owner/repo.git, https://github.com/owner/repo.git or /srv/git/name.git"));
         }
         if !valid_branch(&b.branch) {
@@ -157,10 +159,17 @@ pub async fn create(State(state): State<AppState>, Json(b): Json<CreateBody>) ->
         if p.script.len() > 20_000 {
             return Err(ApiError::bad_request("deploy script too long"));
         }
-        if needs_key(&p.repo) {
+        if !p.repo.is_empty() && needs_key(&p.repo) {
             ensure_key(&state, &p.id).await.map_err(|e| ApiError::internal(format!("{e:#}")))?;
         }
         save_project(&state.db, &p)?;
+        // Make the files writable where Laravel/PHP needs it, right away.
+        {
+            let p2 = p.clone();
+            tokio::spawn(async move {
+                let _ = super::permissions::fix(&p2, None).await;
+            });
+        }
         let mut v = view(&state, &p);
         v["webhook_secret"] = json!(p.webhook_secret);
         Ok(Json(v).into_response())
@@ -188,11 +197,11 @@ pub async fn update(
     Json(b): Json<UpdateBody>,
 ) -> Response {
     let info = AuditInfo::action("project.update", id.clone());
-    let res = (|| {
+    let res = async {
         let mut p =
             get_project(&state.db, &id)?.ok_or_else(|| ApiError::not_found("project not found"))?;
         if let Some(r) = b.repo {
-            if !valid_repo(&r) {
+            if !r.is_empty() && !valid_repo(&r) {
                 return Err(ApiError::bad_request("invalid repository"));
             }
             p.repo = r;
@@ -233,9 +242,15 @@ pub async fn update(
             }
             p.keep_releases = k;
         }
+        if needs_key(&p.repo) {
+            ensure_key(&state, &p.id)
+                .await
+                .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+        }
         save_project(&state.db, &p)?;
         Ok(Json(view(&state, &p)).into_response())
-    })();
+    }
+    .await;
     wrap(res, info)
 }
 

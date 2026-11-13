@@ -2,6 +2,7 @@
 // "New site" wizard → plan `site_create` (preview → apply).
 import type { PhpInfo } from '~/types/api'
 
+const props = withDefaults(defineProps<{ initialDomain?: string; title?: string }>(), { initialDomain: '', title: 'New site' })
 const emit = defineEmits<{ done: []; close: [] }>()
 const php = useResource<PhpInfo>('/api/php')
 
@@ -14,7 +15,8 @@ const KINDS = [
 ] as const
 
 const kind = ref<string>('laravel')
-const domain = ref('')
+const domain = ref(props.initialDomain)
+watch(() => props.initialDomain, (v) => { domain.value = v })
 const aliases = ref('')
 const root = ref('')
 const phpVersion = ref('')
@@ -54,7 +56,7 @@ const planKey = computed(() => JSON.stringify(request.value))
   <section class="card stack" style="padding: 20px 22px; gap: 18px" aria-labelledby="newsite-h">
     <div class="row" style="justify-content: space-between; gap: 12px">
       <div class="stack" style="gap: 4px">
-        <h2 id="newsite-h">New site</h2>
+        <h2 id="newsite-h">{{ title }}</h2>
         <p class="small muted">Creates the nginx site, a web root with a placeholder page and checks it answers. Add HTTPS right after — the domain must point to this server.</p>
       </div>
       <button type="button" class="btn btn-s btn-ghost" @click="emit('close')">Close</button>
@@ -89,9 +91,7 @@ const planKey = computed(() => JSON.stringify(request.value))
       </label>
       <label v-if="usesPhp" class="field">
         <span>PHP version</span>
-        <select v-model="phpVersion" class="in">
-          <option v-for="v in installed" :key="v" :value="v">PHP {{ v }}</option>
-        </select>
+        <SearchSelect v-model="phpVersion" :options="installed.map((v) => ({ value: v, label: `PHP ${v}` }))" placeholder="Choose PHP version…" aria-label="PHP version" />
         <span v-if="!installed.length" class="small" style="color: var(--warn)">No PHP-FPM installed — install one on the PHP page.</span>
       </label>
       <label v-if="['laravel', 'php', 'static'].includes(kind)" class="field">
@@ -100,26 +100,21 @@ const planKey = computed(() => JSON.stringify(request.value))
       </label>
       <label v-if="kind === 'proxy'" class="field">
         <span>Forward to</span>
-        <input v-model="upstream" class="in mono" type="text" spellcheck="false">
+        <input v-model="upstream" class="in mono" type="text" placeholder="http://127.0.0.1:3000" spellcheck="false">
       </label>
       <template v-if="kind === 'redirect'">
         <label class="field">
           <span>Redirect to</span>
-          <input v-model="redirectTo" class="in mono" type="text" spellcheck="false">
+          <input v-model="redirectTo" class="in mono" type="text" placeholder="https://www.example.com" spellcheck="false">
         </label>
         <label class="field">
           <span>Type</span>
-          <select v-model.number="redirectCode" class="in">
-            <option :value="301">301 permanent</option>
-            <option :value="302">302 temporary</option>
-          </select>
+          <SearchSelect v-model="redirectCode" :options="[{ value: 301, label: '301 permanent' }, { value: 302, label: '302 temporary' }]" aria-label="Redirect type" />
         </label>
       </template>
       <label class="field">
         <span>Max upload size</span>
-        <select v-model="bodySize" class="in">
-          <option>16M</option><option>64M</option><option>128M</option><option>512M</option>
-        </select>
+        <SearchSelect v-model="bodySize" :options="['16M', '64M', '128M', '512M', '1G']" aria-label="Max upload size" />
       </label>
     </div>
 

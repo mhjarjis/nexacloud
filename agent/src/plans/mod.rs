@@ -53,6 +53,7 @@ pub enum PlanRequest {
     SiteRoot { id: String, root: String },
     ProjectEnvRaw(projects::EnvRawParams),
     ProjectShared { id: String, name: String },
+    ProjectPermissions { id: String },
     ProjectReleases { id: String },
 }
 
@@ -82,6 +83,7 @@ impl PlanRequest {
             PlanRequest::SiteRoot { .. } => "site_root",
             PlanRequest::ProjectEnvRaw(_) => "project_env",
             PlanRequest::ProjectShared { .. } => "project_shared",
+            PlanRequest::ProjectPermissions { .. } => "project_permissions",
             PlanRequest::ProjectReleases { .. } => "project_releases",
         }
     }
@@ -109,6 +111,7 @@ pub async fn build(state: &AppState, req: &PlanRequest) -> Result<ChangePlan, St
             sites::plan_isolate(env, id, p.as_ref())
         }
         PlanRequest::SiteRoot { id, root } => sites::plan_root(env, id, root),
+        PlanRequest::ProjectPermissions { id } => projects::plan_permissions(env, &project(id)?),
         PlanRequest::ProjectShared { id, name } => projects::plan_shared(env, &project(id)?, name),
         PlanRequest::ProjectEnvRaw(p) => projects::plan_env_raw(env, &project(&p.id)?, p),
         PlanRequest::ProjectReleases { id } => projects::plan_releases(env, &project(id)?),
@@ -155,6 +158,12 @@ fn disk_cleanup(env: &ChangeEnv, action: &str) -> Result<ChangePlan, String> {
         )
         .lock("apt")
         .command_timeout(["apt-get", "autoremove", "-y", "-q"], 900),
+        "dev-caches" => ChangePlan::builder("disk_cleanup", "Clear Composer and npm download caches", "disk")
+            .command([
+                "sh",
+                "-c",
+                "rm -rf /tmp/nexacloud-composer-* /root/.cache/composer /root/.npm/_cacache; for d in /var/www/*/.npm/_cacache /var/www/*/.cache/composer; do rm -rf \"$d\"; done; true",
+            ]),
         _ => return Err("unknown cleanup action".into()),
     };
     b.note("This cannot be rolled back (it only deletes caches and unused files).")

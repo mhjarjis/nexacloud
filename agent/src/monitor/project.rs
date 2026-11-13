@@ -579,7 +579,9 @@ pub async fn overview(state: &AppState, p: &Project, fresh: bool) -> Value {
         .iter()
         .find(|d| Path::new(&app).join(d).is_dir())
         .map(|d| d.to_string());
+    let permissions = crate::deploys::permissions::check(p).await;
     json!({
+        "permissions": {"ok": permissions.is_empty(), "problems": permissions, "web_user": crate::deploys::permissions::web_user(p)},
         "composer": {"lock": composer_pkgs.is_some(), "packages": composer_pkgs, "on_deploy": p.script.contains("composer install")},
         "shared": shared,
         "uploads_dir": uploads_dir,

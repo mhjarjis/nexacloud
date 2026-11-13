@@ -2,13 +2,13 @@
 // Per-site actions shown in the expanded Sites row.
 import type { PhpInfo, Site, SiteModel } from '~/types/api'
 
-const props = defineProps<{ site: Site; php: PhpInfo | null }>()
+const props = defineProps<{ site: Site; php: PhpInfo | null; initialTab?: string }>()
 const emit = defineEmits<{ changed: [] }>()
 const api = useApi()
 
 const managed = computed(() => props.site.config_path.startsWith('/etc/nginx/conf.d/nexacloud-'))
 const model = ref<SiteModel | null>(null)
-const tab = ref<'' | 'php' | 'ssl' | 'settings' | 'nginx' | 'remove' | 'runtime' | 'adopt' | 'isolate'>('')
+const tab = ref<'' | 'php' | 'ssl' | 'settings' | 'nginx' | 'remove' | 'runtime' | 'adopt' | 'isolate'>((props.initialTab as '') ?? '')
 const acceptCustom = ref(false)
 
 async function loadModel() {
@@ -94,9 +94,7 @@ function done(s: string) {
       <p class="small muted">Now on PHP {{ site.php_version }}. NexaCloud switches the site's PHP-FPM socket, checks nginx and the site, and rolls back if anything fails.</p>
       <label class="row wrap" style="gap: 10px">
         <span class="small">Switch to</span>
-        <select v-model="phpTarget" class="in" style="width: auto">
-          <option v-for="v in installed" :key="v" :value="v" :disabled="v === site.php_version">PHP {{ v }}</option>
-        </select>
+        <SearchSelect v-model="phpTarget" :options="installed.map((v) => ({ value: v, label: `PHP ${v}`, disabled: v === site.php_version, hint: v === site.php_version ? 'current' : undefined }))" placeholder="Choose PHP version…" aria-label="Switch to PHP version" style="width: 220px" />
       </label>
       <PlanAction
         :key="`php-${phpTarget}`"
@@ -166,7 +164,7 @@ function done(s: string) {
     <div v-if="tab === 'settings' && model" class="stack" style="gap: 10px">
       <label class="stack" style="gap: 6px">
         <span class="small">Extra domains (space separated)</span>
-        <input v-model="aliasText" class="in mono" type="text" spellcheck="false">
+        <input v-model="aliasText" class="in mono" type="text" placeholder="www.example.com shop.example.com" spellcheck="false">
       </label>
       <div class="toggles">
         <label class="tog"><input v-model="opts.security_headers" type="checkbox"> Security headers <span class="muted small">X-Frame-Options, nosniff, Referrer-Policy</span></label>
@@ -174,9 +172,7 @@ function done(s: string) {
         <label class="tog"><input v-model="opts.cache_static" type="checkbox"> Cache static files 30 days</label>
         <label class="tog"><input v-model="opts.block_hidden" type="checkbox"> Block hidden files (.env, .git)</label>
         <label class="tog">Max upload
-          <select v-model="opts.client_max_body_size" class="in" style="width: auto; min-height: 36px">
-            <option>16M</option><option>64M</option><option>128M</option><option>512M</option><option>1G</option>
-          </select>
+          <SearchSelect v-model="opts.client_max_body_size" :options="['16M', '64M', '128M', '512M', '1G']" aria-label="Max upload size" style="width: 140px" />
         </label>
       </div>
       <PlanAction

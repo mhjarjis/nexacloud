@@ -4,17 +4,30 @@ import type { IconName } from '~/utils/icons'
 
 const NAV: { to: string; label: string; icon: IconName }[] = [
   { to: '/', label: 'Dashboard', icon: 'dashboard' },
-  { to: '/sites', label: 'Sites', icon: 'sites' },
-  { to: '/projects', label: 'Projects', icon: 'git' },
-  { to: '/php', label: 'PHP', icon: 'php' },
-  { to: '/services', label: 'Services', icon: 'services' },
+  { to: '/projects', label: 'Projects', icon: 'projects' },
+  { to: '/domains', label: 'Domains & SSL', icon: 'globe' },
+  { to: '/deployments', label: 'Deployments', icon: 'git' },
+  { to: '/php', label: 'PHP & Services', icon: 'runtimes' },
   { to: '/databases', label: 'Databases', icon: 'databases' },
-  { to: '/backups', label: 'Backups', icon: 'backup' },
+  { to: '/backups', label: 'Backups & Storage', icon: 'backup' },
+  { to: '/install', label: 'Install & Import', icon: 'terminal' },
+]
+const MORE: { to: string; label: string; icon: IconName }[] = [
   { to: '/monitoring', label: 'Monitoring', icon: 'pulse' },
   { to: '/advisor', label: 'Advisor', icon: 'advisor' },
   { to: '/security', label: 'Security', icon: 'security' },
   { to: '/activity', label: 'Activity', icon: 'activity' },
 ]
+const route = useRoute()
+function isActive(to: string) {
+  if (to === '/') return route.path === '/'
+  if (to === '/php') return route.path.startsWith('/php') || route.path.startsWith('/services')
+  if (to === '/domains') return route.path.startsWith('/domains') || route.path.startsWith('/sites')
+  if (to === '/projects') return route.path.startsWith('/projects') || route.path.startsWith('/apps')
+  return route.path.startsWith(to)
+}
+const monitor = useResource<{ last_code: number | null }[]>('/api/monitor', { interval: 60_000 })
+const downCount = computed(() => (monitor.data.value ?? []).filter((m) => m.last_code !== null && (m.last_code === 0 || m.last_code >= 500)).length)
 
 const api = useApi()
 const authed = useAuthState()
@@ -61,7 +74,7 @@ async function signOut() {
           <span class="chip-text">
             <template v-if="system.data.value">
               <span class="chip-name">{{ system.data.value.hostname }}</span>
-              <span class="chip-meta">{{ system.data.value.os }}</span>
+              <span class="chip-meta">{{ system.data.value.os.replace(/\.\d+ LTS$/, '') }} · {{ system.data.value.cpu_count }} vCPU · {{ Math.round(system.data.value.memory.total / 1024 ** 3) }} GB</span>
             </template>
             <template v-else-if="system.loading.value">
               <span class="skel" style="height: 14px; width: 70%" />
@@ -72,12 +85,19 @@ async function signOut() {
               <span class="chip-meta">Details unavailable</span>
             </template>
           </span>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#A3AEBD" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M8 9l4-4 4 4M8 15l4 4 4-4" /></svg>
         </div>
       </div>
 
       <nav class="nav" aria-label="Main">
-        <NuxtLink v-for="item in NAV" :key="item.to" :to="item.to" class="nav-item">
+        <NuxtLink v-for="item in NAV" :key="item.to" :to="item.to" class="nav-item" :aria-current="isActive(item.to) ? 'page' : undefined">
           <AppIcon :name="item.icon" />
+          <span class="nav-label">{{ item.label }}</span>
+          <span v-if="item.to === '/projects' && downCount" class="nav-badge" :title="`${downCount} down`">{{ downCount }}</span>
+        </NuxtLink>
+        <span class="nav-sep" aria-hidden="true">More</span>
+        <NuxtLink v-for="item in MORE" :key="item.to" :to="item.to" class="nav-item nav-more" :aria-current="isActive(item.to) ? 'page' : undefined">
+          <AppIcon :name="item.icon" :size="16" />
           <span class="nav-label">{{ item.label }}</span>
         </NuxtLink>
       </nav>

@@ -176,6 +176,17 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE deploys ADD COLUMN steps TEXT NOT NULL DEFAULT '[]';
     ALTER TABLE deploys ADD COLUMN release TEXT;
     "#,
+    // v5 — server history for the dashboard sparklines.
+    r#"
+    CREATE TABLE server_samples (
+        ts  INTEGER NOT NULL,
+        cpu REAL NOT NULL,
+        mem REAL NOT NULL,
+        rx  INTEGER NOT NULL,
+        tx  INTEGER NOT NULL
+    );
+    CREATE INDEX server_samples_ts ON server_samples (ts);
+    "#,
 ];
 
 /// Latest schema version this binary knows.

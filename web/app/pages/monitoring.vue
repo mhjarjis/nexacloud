@@ -104,11 +104,11 @@ function noteTone(l: string) { return l === 'critical' ? 'bad' : l === 'warning'
         <legend><label class="row" style="gap: 10px"><input v-model="form.email.enabled" type="checkbox"> <strong>Email (SMTP)</strong></label></legend>
         <div class="fgrid">
           <label class="field"><span>SMTP server</span><input v-model="form.email.smtp_host" class="in mono" type="text" placeholder="smtp.mailgun.org"></label>
-          <label class="field"><span>Port</span><input v-model.number="form.email.smtp_port" class="in mono" type="number" min="1" max="65535"></label>
+          <label class="field"><span>Port</span><input v-model.number="form.email.smtp_port" class="in mono" type="number" min="1" max="65535" placeholder="587"></label>
           <label class="field"><span>Security</span>
-            <select v-model="form.email.security" class="in"><option value="starttls">STARTTLS (587)</option><option value="tls">TLS (465)</option><option value="none">None (local relay only)</option></select>
+            <SearchSelect v-model="form.email.security" :options="[{ value: 'starttls', label: 'STARTTLS (587)' }, { value: 'tls', label: 'TLS (465)' }, { value: 'none', label: 'None (local relay only)' }]" aria-label="Security" />
           </label>
-          <label class="field"><span>Username</span><input v-model="form.email.user" class="in mono" type="text" autocomplete="off"></label>
+          <label class="field"><span>Username</span><input v-model="form.email.user" class="in mono" type="text" autocomplete="off" placeholder="postmaster@mg.example.com"></label>
           <label class="field"><span>Password</span><input v-model="form.email.password" class="in mono" type="password" autocomplete="new-password" :placeholder="form.email.has_password ? 'saved — leave empty to keep' : ''"></label>
           <label class="field"><span>From</span><input v-model="form.email.from" class="in mono" type="email" placeholder="alerts@example.com"></label>
           <label class="field"><span>To</span><input v-model="form.email.to" class="in mono" type="email" placeholder="you@example.com"></label>

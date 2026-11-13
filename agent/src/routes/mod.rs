@@ -1,6 +1,7 @@
 pub mod backups;
 pub mod changes;
 pub mod databases;
+pub mod domains;
 pub mod jobs;
 pub mod php;
 pub mod security;
@@ -134,6 +135,7 @@ pub fn router(state: AppState) -> Router {
         .route("/backup/runs", get(bk::runs))
         .route("/disk", get(bk::disk))
         .route("/dbm/{engine}/users", get(crate::dbm::users))
+        .route("/dbm/{engine}/stats", get(crate::dbm::stats))
         .route("/dbm/{engine}/{db}/tables", get(crate::dbm::tables))
         .route(
             "/dbm/{engine}/{db}/tables/{table}/structure",
@@ -153,6 +155,9 @@ pub fn router(state: AppState) -> Router {
         .route("/projects/{id}/overview", get(dp::overview))
         .route("/projects/{id}/releases", get(dp::releases))
         .route("/apps/defaults", get(crate::apps::defaults))
+        .route("/domains", get(domains::domains))
+        .route("/system/history", get(crate::monitor::routes::server_history))
+        .route("/workspace", get(domains::workspace))
         .route("/monitor", get(crate::monitor::routes::list))
         .route("/monitor/{site}", get(crate::monitor::routes::site))
         .route("/notifications", get(crate::monitor::routes::notifications))

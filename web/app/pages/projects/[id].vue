@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import type { PhpInfo } from '~/types/api'
+import type { PhpInfo, Site } from '~/types/api'
+import type { IconName } from '~/utils/icons'
 
 const route = useRoute()
 const api = useApi()
@@ -27,6 +28,7 @@ interface Overview {
   monitor: { checks: number; uptime: number | null; last_code: number | null; last_ms: number | null; last_at: number | null; failures_1h: number; checks_1h: number; buckets: Bucket[]; recent: Bucket[]; interval_secs: number }
   app_dir: string
   composer: { lock: boolean; packages: number | null; on_deploy: boolean }
+  permissions?: { ok: boolean; problems: string[]; web_user: string }
   shared: string[]
   uploads_dir: string | null
 }
@@ -36,16 +38,47 @@ const p = useResource<ProjectDetail>(`/api/projects/${enc.value}`, { interval: 1
 const ov = useResource<Overview>(`/api/projects/${enc.value}/overview`, { interval: 15_000 })
 const php = useResource<PhpInfo>('/api/php')
 const status = useResource<{ artisan: string[] }>(`/api/projects/${enc.value}/status`)
+const sites = useResource<Site[]>('/api/sites')
+const site = computed(() => sites.data.value?.find((s) => s.id === p.data.value?.site_id) ?? null)
 
-type Tab = 'overview' | 'env' | 'logs' | 'deploys'
+// Any site can be opened as a project: create the project record (without
+// Git) the first time it's opened.
+const creating = ref(false)
+watch(() => p.error.value, async (e) => {
+  if (!e || creating.value || !/not found/i.test(e)) return
+  creating.value = true
+  try {
+    await api.post('/api/projects', { site_id: id.value })
+    await p.refresh()
+    ov.refresh(); status.refresh()
+  } catch (err) { if (!(err instanceof SudoCancelled)) createErr.value = errorMessage(err) } finally { creating.value = false }
+})
+const createErr = ref<string | null>(null)
+const hasGit = computed(() => !!p.data.value?.repo)
+const gitForm = reactive({ repo: '', branch: 'main' })
+const gitBusy = ref(false)
+async function connectGit() {
+  gitBusy.value = true
+  err.value = null
+  try {
+    await api.put(`/api/projects/${enc.value}`, { repo: gitForm.repo.trim(), branch: gitForm.branch.trim() || 'main' })
+    await p.refresh()
+    settingsLoaded.value = false
+  } catch (e) { fail(e) } finally { gitBusy.value = false }
+}
+const phpTarget = ref('')
+const phpOptions = computed(() => (php.data.value?.versions ?? []).filter((v) => v.fpm_installed).map((v) => ({ value: v.version, label: `PHP ${v.version}`, hint: v.version === ov.data.value?.site.php_version ? 'current' : (v.eol ? 'end of life' : undefined), disabled: v.version === ov.data.value?.site.php_version })))
+
+type Tab = 'overview' | 'env' | 'logs' | 'deploys' | 'settings'
 const qTab = String(route.query.tab ?? '')
-const tab = ref<Tab>(route.query.new || ['setup', 'pipeline', 'deploys'].includes(qTab) ? 'deploys' : (['env', 'logs'].includes(qTab) ? qTab as Tab : 'overview'))
+const tab = ref<Tab>(route.query.new || ['setup', 'pipeline', 'deploys'].includes(qTab) ? 'deploys' : (['env', 'logs', 'settings'].includes(qTab) ? qTab as Tab : 'overview'))
 const err = ref<string | null>(null)
 const deployJob = ref<string | null>(null)
 const isLaravel = computed(() => p.data.value?.kind === 'laravel')
 const tabs: [Tab, string][] = [
-  ['overview', 'Overview'], ['env', 'Environment'], ['logs', 'Logs'], ['deploys', 'Deployments'],
+  ['overview', 'Overview'], ['env', 'Environment'], ['logs', 'Logs'], ['deploys', 'Deployments'], ['settings', 'Settings'],
 ]
+const TAB_ICONS: Record<Tab, IconName> = { overview: 'dashboard', env: 'key', logs: 'list', deploys: 'git', settings: 'settings' }
 
 function fail(e: unknown) { if (!(e instanceof SudoCancelled)) err.value = errorMessage(e) }
 
@@ -503,22 +536,36 @@ async function disconnect() {
       </div>
     </div>
     <div class="row wrap" style="gap: 10px">
-      <a v-if="ov.data.value" class="btn" :href="ov.data.value.site.url" target="_blank" rel="noopener">Visit site</a>
+      <a v-if="ov.data.value" class="btn" :href="ov.data.value.site.url" target="_blank" rel="noopener"><AppIcon name="external" :size="14" /> Visit site</a>
       <button v-if="ov.data.value && (isLaravel || model)" type="button" class="btn" :class="{ 'btn-warn': maintenanceOn }" :disabled="maintBusy" :aria-pressed="maintenanceOn" @click="toggleMaintenance">
-        {{ maintBusy ? 'Switching…' : `Maintenance mode: ${maintenanceOn ? 'On' : 'Off'}` }}
+        <AppIcon name="wrench" :size="14" /> {{ maintBusy ? 'Switching…' : `Maintenance mode: ${maintenanceOn ? 'On' : 'Off'}` }}
       </button>
-      <button type="button" class="btn btn-p" :disabled="!p.data.value" @click="deploy()"><AppIcon name="play" :size="14" :stroke="2" /> Deploy now</button>
+      <button v-if="!p.data.value || hasGit" type="button" class="btn btn-p" :disabled="!p.data.value" @click="deploy()"><AppIcon name="play" :size="14" :stroke="2" /> Deploy now</button>
+      <button v-else type="button" class="btn btn-p" @click="tab = 'deploys'"><AppIcon name="git" :size="14" :stroke="2" /> Connect Git</button>
     </div>
   </header>
+  <p v-if="creating" class="note">Setting up {{ id }} as a project…</p>
+  <p v-if="createErr" class="small" style="color: var(--bad)" role="alert">{{ createErr }} — <NuxtLink to="/domains">see Domains &amp; SSL</NuxtLink></p>
   <p v-if="err" class="small" style="color: var(--bad)" role="alert">{{ err }} <button type="button" class="linkish" @click="err = null">Dismiss</button></p>
 
   <nav class="tabs" aria-label="Project sections">
-    <button v-for="t in tabs" :key="t[0]" type="button" :class="{ on: tab === t[0] }" :aria-pressed="tab === t[0]" @click="tab = t[0]">{{ t[1] }}</button>
+    <button v-for="t in tabs" :key="t[0]" type="button" :class="{ on: tab === t[0] }" :aria-pressed="tab === t[0]" @click="tab = t[0]"><AppIcon :name="TAB_ICONS[t[0]]" :size="15" /> {{ t[1] }}</button>
   </nav>
 
   <!-- ================================================================ overview -->
   <div v-if="tab === 'overview'" class="stack" style="gap: 20px">
     <JobLog v-if="artisanJob" :key="artisanJob" :job-id="artisanJob" status="running" @finished="onArtisanDone" />
+    <section v-if="ov.data.value?.permissions && !ov.data.value.permissions.ok" class="card perm" role="alert">
+      <div class="row wrap" style="gap: 12px; align-items: flex-start">
+        <AppIcon name="alert" :size="20" style="color: var(--warn); flex: none" />
+        <div class="grow stack" style="gap: 4px">
+          <strong>File permissions need fixing</strong>
+          <span v-for="pr in ov.data.value.permissions.problems" :key="pr" class="small text-2">{{ pr }}</span>
+          <span class="small muted">One click: {{ ov.data.value.permissions.web_user }} (the user PHP runs as) becomes the owner, storage/ and bootstrap/cache become writable. Every deploy keeps it that way.</span>
+        </div>
+        <PlanAction :request="{ kind: 'project_permissions', params: { id } }" label="Fix permissions" apply-label="Fix now" success-text="Permissions fixed." @done="ov.refresh()" />
+      </div>
+    </section>
 
     <section aria-label="Health checks" class="checks">
       <template v-if="ov.data.value">
@@ -581,14 +628,11 @@ async function disconnect() {
         </div>
         <form class="stack" style="gap: 6px" @submit.prevent="quickPlan({ kind: 'site_root', params: { id: p.data.value.site_id, root: webRoot } }).then((st) => { if (st !== 'applied') err = `Web root change ${st} — see Activity.`; loadModel() }).catch(fail)">
           <label class="field"><span>Web root</span>
-            <div class="row" style="gap: 8px"><input v-model="webRoot" class="in mono" type="text" :disabled="!model" spellcheck="false"><button type="submit" class="btn btn-s" :disabled="!model || webRoot === (model?.root ?? '')">Save</button></div>
+            <div class="row" style="gap: 8px"><input v-model="webRoot" class="in mono" type="text" placeholder="/var/www/site/public" :disabled="!model" spellcheck="false"><button type="submit" class="btn btn-s" :disabled="!model || webRoot === (model?.root ?? '')">Save</button></div>
           </label>
         </form>
         <label class="field"><span>Front controller</span>
-          <select class="in mono" :value="frontController ? 'on' : 'off'" :disabled="!model || setBusy" @change="saveFrontController(($event.target as HTMLSelectElement).value === 'on')">
-            <option value="on">index.php (route all requests)</option>
-            <option value="off">none (only real files)</option>
-          </select>
+          <SearchSelect :model-value="frontController ? 'on' : 'off'" :options="[{ value: 'on', label: 'index.php (route all requests)' }, { value: 'off', label: 'none (only real files)' }]" mono :disabled="!model || setBusy" aria-label="Front controller" @change="(v) => saveFrontController(v === 'on')" />
         </label>
         <label class="chk"><input type="checkbox" :checked="composerOnDeploy" :disabled="setBusy" @change="setComposer(($event.target as HTMLInputElement).checked)">Run composer install on deploy</label>
         <label class="chk"><input type="checkbox" :checked="p.data.value.strategy !== 'releases' || uploadsKept" :disabled="setBusy || p.data.value.strategy !== 'releases' || uploadsKept" @change="keepUploads">Keep uploads/ between releases</label>
@@ -611,9 +655,9 @@ async function disconnect() {
       </div>
       <div v-if="editingWorkers" class="stack wedit">
         <div v-for="(w, i) in workerRows" :key="i" class="wrow">
-          <label class="field"><span>Name</span><input v-model="w.name" class="in mono" type="text"></label>
-          <label class="field"><span>Queues (comma separated)</span><input v-model="w.queue" class="in mono" type="text"></label>
-          <label class="field"><span>Processes</span><input v-model.number="w.processes" class="in" type="number" min="1" max="8"></label>
+          <label class="field"><span>Name</span><input v-model="w.name" class="in mono" type="text" placeholder="default"></label>
+          <label class="field"><span>Queues (comma separated)</span><input v-model="w.queue" class="in mono" type="text" placeholder="default,mail"></label>
+          <label class="field"><span>Processes</span><input v-model.number="w.processes" class="in" type="number" min="1" max="8" placeholder="2"></label>
           <button type="button" class="btn btn-s" style="align-self: end" :aria-label="`Remove worker ${w.name}`" @click="workerRows.splice(i, 1)">Remove</button>
         </div>
         <div class="row wrap" style="gap: 8px">
@@ -703,7 +747,17 @@ async function disconnect() {
   </div>
 
   <!-- ================================================================ deploys -->
-  <template v-if="tab === 'deploys' && p.data.value">
+  <section v-if="tab === 'deploys' && p.data.value && !hasGit" class="card card-pad stack" style="gap: 14px; max-width: 760px">
+    <div class="row" style="gap: 10px"><AppIcon name="git" :size="20" /><h2>Connect a Git repository</h2></div>
+    <p class="small text-2">Deploy {{ id }} from GitHub with one click or on every push. NexaCloud fetches the code as {{ p.data.value.run_as }}, runs your build (composer, npm, migrations), checks the site and rolls back if it breaks.</p>
+    <div class="fgrid">
+      <label class="field"><span>Repository</span><input v-model="gitForm.repo" class="in mono" type="text" placeholder="git@github.com:owner/repo.git" spellcheck="false"></label>
+      <label class="field"><span>Branch</span><input v-model="gitForm.branch" class="in mono" type="text" placeholder="main"></label>
+    </div>
+    <p class="small muted">Private GitHub repos: use the git@github.com:… form, then add the deploy key shown next. Public repos (https://…) work right away.</p>
+    <div><button type="button" class="btn btn-p" :disabled="gitBusy || !gitForm.repo.trim()" @click="connectGit"><AppIcon name="link" :size="14" /> {{ gitBusy ? 'Connecting…' : 'Connect repository' }}</button></div>
+  </section>
+  <template v-if="tab === 'deploys' && p.data.value && hasGit">
     <section v-if="deployJob" class="card card-pad stack" style="gap: 8px">
       <strong>Deploying…</strong>
       <JobLog :key="deployJob" :job-id="deployJob" status="running" @finished="onDeployDone" />
@@ -773,7 +827,7 @@ async function disconnect() {
           <tr v-for="v in envData?.vars ?? []" :key="v.key" :class="{ changed: envEdits[v.key] !== undefined }">
             <td class="mono env-k">{{ v.key }}</td>
             <td class="mono env-v">
-              <input v-if="editingKey === v.key && envEdits[v.key] !== null" v-model="envEdits[v.key]" class="in mono" type="text" :aria-label="`Value of ${v.key}`" @keydown.enter="editingKey = null">
+              <input v-if="editingKey === v.key && envEdits[v.key] !== null" v-model="envEdits[v.key]" class="in mono" type="text" placeholder="value" :aria-label="`Value of ${v.key}`" @keydown.enter="editingKey = null">
               <span v-else-if="envEdits[v.key] === null" class="muted">removed</span>
               <span v-else-if="envEdits[v.key] !== undefined">{{ v.secret ? '•••••• (new value)' : envEdits[v.key] }}</span>
               <span v-else-if="v.secret">{{ revealed[v.key] ?? '••••••••••••' }}</span>
@@ -790,7 +844,7 @@ async function disconnect() {
           </tr>
           <tr v-for="k in newKeys" :key="'n' + k" class="changed">
             <td class="mono env-k">{{ k }} <span class="tag">new</span></td>
-            <td class="mono env-v"><input v-model="envEdits[k]" class="in mono" type="text" :aria-label="`Value of ${k}`"></td>
+            <td class="mono env-v"><input v-model="envEdits[k]" class="in mono" type="text" placeholder="value" :aria-label="`Value of ${k}`"></td>
             <td><div class="row" style="justify-content: flex-end"><button type="button" class="btn btn-s" @click="undoVar(k)">Undo</button></div></td>
           </tr>
         </tbody>
@@ -807,9 +861,7 @@ async function disconnect() {
   <!-- ================================================================ logs -->
   <section v-if="tab === 'logs'" class="card card-pad stack" aria-label="Logs" style="gap: 14px">
     <div class="row wrap" style="gap: 10px">
-      <select v-model="logFile" class="in" aria-label="Log source" style="width: auto" @change="loadLogs">
-        <option v-for="s in logs?.sources ?? []" :key="s.id" :value="s.id">{{ s.label }}</option>
-      </select>
+      <SearchSelect v-model="logFile" :options="(logs?.sources ?? []).map((s) => ({ value: s.id, label: s.label }))" placeholder="Log source" aria-label="Log source" style="width: 260px" @change="loadLogs" />
       <input v-model="logFilter" class="in" type="search" aria-label="Filter logs" placeholder="Filter: ERROR, user_id=…" style="flex: 1; min-width: 200px">
       <button type="button" class="btn btn-s" :class="{ 'btn-on': live }" :aria-pressed="live" @click="live = !live">
         <span class="dot" :class="{ on: live }" aria-hidden="true" /> {{ live ? 'Live tail on' : 'Live tail' }}
@@ -821,12 +873,12 @@ async function disconnect() {
   </section>
 
   <!-- ================================================================ pipeline -->
-  <div v-if="tab === 'deploys' && p.data.value" class="split">
+  <div v-if="tab === 'deploys' && p.data.value && hasGit" class="split">
   <section class="card card-pad stack pipe" aria-labelledby="pipe-h" style="gap: 14px">
     <h2 id="pipe-h">Pipeline · {{ id }}</h2>
     <div class="fgrid">
-      <label class="field"><span>Repository</span><input v-model="settings.repo" class="in mono" type="text"></label>
-      <label class="field"><span>Branch</span><input v-model="settings.branch" class="in mono" type="text"></label>
+      <label class="field"><span>Repository</span><input v-model="settings.repo" class="in mono" type="text" placeholder="git@github.com:owner/repo.git"></label>
+      <label class="field"><span>Branch</span><input v-model="settings.branch" class="in mono" type="text" placeholder="main"></label>
     </div>
     <div class="toggles">
       <label class="tog"><span class="grow"><strong>Deploy when I push</strong><span class="small muted">GitHub webhook, or a check every minute</span></span><input v-model="settings.auto_deploy" type="checkbox"></label>
@@ -876,6 +928,33 @@ async function disconnect() {
       <div class="kv"><span class="lbl">Secret</span><div class="code-row"><code class="mono">{{ p.data.value.webhook_secret }}</code><button type="button" class="btn btn-s" @click="copy(p.data.value.webhook_secret)">Copy</button></div></div>
     </section>
   </div>
+  </div>
+  <!-- ================================================================ settings -->
+  <div v-if="tab === 'settings' && p.data.value" class="stack" style="gap: 16px">
+    <div class="split">
+      <section class="card card-pad stack set-card" aria-labelledby="set-php">
+        <div class="row" style="gap: 10px"><AppIcon name="php" :size="18" /><h2 id="set-php">PHP version</h2></div>
+        <p class="small muted">Now on <strong>PHP {{ ov.data.value?.site.php_version ?? '—' }}</strong>. Switching checks nginx and the site and rolls back if anything fails. Need another version? Install it under <NuxtLink to="/php">PHP &amp; Services</NuxtLink>.</p>
+        <SearchSelect v-model="phpTarget" :options="phpOptions" placeholder="Choose a PHP version…" aria-label="New PHP version" />
+        <PlanAction :key="`php-${phpTarget}`" :request="{ kind: 'site_php', params: { id: p.data.value.site_id, version: phpTarget } }" label="Preview switch" :disabled="!phpTarget" :success-text="`Now on PHP ${phpTarget}.`" @done="(s) => { if (s === 'applied') { ov.refresh(); sites.refresh(); phpTarget = '' } }" />
+      </section>
+      <section class="card card-pad stack set-card" aria-labelledby="set-perm">
+        <div class="row" style="gap: 10px"><AppIcon name="user" :size="18" /><h2 id="set-perm">Files &amp; permissions</h2></div>
+        <dl class="facts">
+          <dt>Folder</dt><dd class="mono">{{ p.data.value.dir }}</dd>
+          <dt>PHP runs as</dt><dd class="mono">{{ ov.data.value?.permissions?.web_user ?? '—' }}</dd>
+          <dt>Deploys run as</dt><dd class="mono">{{ p.data.value.run_as }}</dd>
+          <dt>Status</dt><dd><StatusPill :tone="ov.data.value?.permissions?.ok === false ? 'warn' : 'ok'" :label="ov.data.value?.permissions?.ok === false ? 'Needs fixing' : 'OK'" /></dd>
+        </dl>
+        <p class="small muted">NexaCloud keeps the PHP user as the owner and storage/ + bootstrap/cache writable — automatically on every deploy.</p>
+        <PlanAction :request="{ kind: 'project_permissions', params: { id } }" label="Fix permissions now" apply-label="Fix now" success-text="Permissions fixed." @done="ov.refresh()" />
+      </section>
+    </div>
+    <section v-if="site" class="card card-pad stack" aria-labelledby="set-site">
+      <div class="row" style="gap: 10px"><AppIcon name="globe" :size="18" /><h2 id="set-site">Domains, HTTPS, runtime &amp; nginx</h2></div>
+      <p class="small muted">Domains: <span class="mono">{{ site.server_names.join(', ') }}</span> · HTTPS {{ site.ssl ? `on${site.ssl_expires ? ' until ' + formatDate(site.ssl_expires) : ''}` : 'off' }}</p>
+      <SiteManage :site="site" :php="php.data.value" @changed="() => { sites.refresh(); ov.refresh(); loadModel() }" />
+    </section>
   </div>
 </template>
 
@@ -954,4 +1033,7 @@ input[type=checkbox] { accent-color: var(--accent); width: 20px; height: 20px; }
 .chk input { width: 18px; height: 18px; accent-color: var(--accent); }
 .envtext { min-height: 360px; padding: 12px; line-height: 1.6; font-size: 13px; }
 .btn-warn { border-color: var(--warn); color: var(--warn); }
+.tabs button { display: inline-flex; align-items: center; gap: 7px; }
+.perm { padding: 14px 18px; border-color: #5A4A22; background: #17140C; }
+.set-card { flex: 1 1 380px; min-width: 0; gap: 12px; }
 </style>

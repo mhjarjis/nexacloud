@@ -53,6 +53,18 @@ pub struct NewApp {
     /// Extra .env values.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Folder (inside the code) the web server serves; default `public`.
+    #[serde(default)]
+    pub web_root: Option<String>,
+    /// Nightly backup of the new database.
+    #[serde(default)]
+    pub backup: bool,
+    /// Run `npm ci && npm run build` on deploy (when package.json has a build script).
+    #[serde(default = "yes")]
+    pub npm_build: bool,
+    /// Run `composer install` on deploy.
+    #[serde(default = "yes")]
+    pub composer: bool,
 }
 fn main() -> String {
     "main".into()
@@ -110,8 +122,14 @@ fn random_key() -> String {
 }
 
 fn validate(state: &AppState, a: &NewApp) -> Result<(), String> {
-    if !["laravel", "php"].contains(&a.kind.as_str()) {
-        return Err("type must be Laravel or plain PHP".into());
+    if !["laravel", "php", "static"].contains(&a.kind.as_str()) {
+        return Err("type must be Laravel, plain PHP or static".into());
+    }
+    if let Some(w) = &a.web_root {
+        let w = w.trim().trim_matches('/');
+        if w.contains("..") || !w.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_-.".contains(&b)) {
+            return Err("web root: a folder like public or public_html".into());
+        }
     }
     if !sites::valid_domain(&a.domain) {
         return Err("enter a domain like app.example.com".into());
@@ -173,17 +191,27 @@ pub async fn create(
 fn site_params(a: &NewApp) -> sites::CreateParams {
     let base = format!("/var/www/{}", a.domain);
     let app = if a.releases { format!("{base}/current") } else { base };
+    let web = a
+        .web_root
+        .as_deref()
+        .map(|w| w.trim().trim_matches('/').to_string())
+        .unwrap_or_else(|| if a.kind == "static" { String::new() } else { "public".into() });
+    let root = if web.is_empty() { app } else { format!("{app}/{web}") };
     sites::CreateParams {
-        kind: if a.kind == "laravel" { SiteKind::Laravel } else { SiteKind::Php },
+        kind: match a.kind.as_str() {
+            "laravel" => SiteKind::Laravel,
+            "static" => SiteKind::Static,
+            _ => SiteKind::Php,
+        },
         domain: a.domain.clone(),
         aliases: a.aliases.clone(),
-        root: Some(format!("{app}/public")),
-        php_version: Some(a.php_version.clone()),
+        root: Some(root),
+        php_version: (a.kind != "static").then(|| a.php_version.clone()),
         upstream: None,
         redirect_to: None,
         redirect_code: None,
         options: None,
-        isolate: a.isolate,
+        isolate: a.isolate && a.kind != "static",
         no_placeholder: a.releases,
     }
 }
@@ -226,6 +254,26 @@ async fn build(state: &AppState, job: &JobCtx, a: &NewApp) -> Result<()> {
             env.insert(k.into(), Some(v.to_string()));
         }
         job.log(&format!("   user {name} with a generated password (saved in .env)"));
+        if a.backup {
+            let plan = crate::backups::Plan {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: format!("{} nightly", a.domain),
+                destination_id: None,
+                databases: vec![format!("{}/{name}", a.database)],
+                paths: Vec::new(),
+                schedule: "daily 03:00".into(),
+                keep_daily: 7,
+                keep_weekly: 4,
+                keep_monthly: 3,
+                enabled: true,
+                last_run_at: None,
+                created_at: crate::util::fmt_ts(chrono::Utc::now()),
+            };
+            match crate::backups::upsert_plan(&state.db, &plan) {
+                Ok(()) => job.log("   nightly database backup at 03:00 (Backups & Storage)"),
+                Err(e) => job.log(&format!("   backup plan not created: {e:#}")),
+            }
+        }
     } else {
         job.log("== 2/6 Database: none");
         if a.kind == "laravel" {
@@ -251,7 +299,16 @@ async fn build(state: &AppState, job: &JobCtx, a: &NewApp) -> Result<()> {
         repo: a.repo.clone(),
         branch: a.branch.clone(),
         run_as: run_as.clone(),
-        script: deploys::default_script(&a.kind, true),
+        script: {
+            let mut s = deploys::default_script(&a.kind, true);
+            if !a.npm_build {
+                s = s.replace("if [ -f package.json ] && grep -q '\"build\"' package.json && command -v npm >/dev/null; then\n  npm ci --no-audit --no-fund && npm run build\nfi\n", "");
+            }
+            if !a.composer {
+                s = s.replace("if [ -f composer.json ] && command -v composer >/dev/null; then\n  composer install --no-dev --no-interaction --prefer-dist --optimize-autoloader\nfi\n", "");
+            }
+            s
+        },
         migrate: true,
         auto_deploy: a.auto_deploy,
         webhook_secret: secret,
@@ -370,7 +427,7 @@ pub async fn after_first_deploy(state: &AppState, job: &JobCtx, p: &Project) {
         let w = crate::plans::projects::WorkerParams {
             id: p.id.clone(),
             enabled: true,
-            processes: 1,
+            processes: 2,
             queue: "default".into(),
             workers: None,
         };

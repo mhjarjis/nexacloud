@@ -587,7 +587,7 @@ check ".env has a real APP_KEY and the MySQL user" in_box "grep -Eq '^APP_KEY=\"
 check "current -> releases/1, storage linked to shared/" in_box "[ \$(readlink /var/www/crm.test.local/current) = releases/1 ] && [ \$(readlink /var/www/crm.test.local/releases/1/storage) = ../../shared/storage ]"
 check "Laravel answers through the release (crm v1)" bash -c "[ \"\$(docker exec $NAME curl -s -H 'Host: crm.test.local' http://127.0.0.1/version)\" = 'crm v1' ]"
 check "migrations ran against MySQL (users table exists)" in_box "mysql -N -e 'SHOW TABLES' crm_test_local | grep -qx users"
-check "deploy steps recorded (fetch → link → backup → script → switch → health)" jqe "$(api projects/crm.test.local/deploys)" '[.[0].steps[].name] == ["Fetch code","Link shared files","Back up database","Run deploy script","Switch release","Reload & health check"] and all(.[0].steps[]; .status=="ok")'
+check "deploy steps recorded (fetch → link → backup → script → switch → health)" jqe "$(api projects/crm.test.local/deploys)" '[.[0].steps[].name] == ["Fix permissions","Fetch code","Link shared files","Back up database","Run deploy script","Switch release","Reload & health check"] and all(.[0].steps[]; .status=="ok")'
 ok=0; for _ in $(seq 1 60); do in_box "supervisorctl status 'nexacloud-crm-test-local:*' | grep -q RUNNING" 2>/dev/null && { ok=1; break; }; sleep 1; done
 check "queue worker started after the first deploy (Supervisor, RUNNING)" test "$ok" = 1
 check "scheduler cron installed as the site user" in_box "grep -q 'nc_crm_test_local cd /var/www/crm.test.local/current' /etc/cron.d/nexacloud-crm-test-local"
@@ -618,7 +618,7 @@ curl -fsSk -b "$JAR" -H "Origin: $U" -H 'Content-Type: application/json' -X PUT 
 check "releases listed (2 current, 1 kept)" jqe "$(api projects/crm.test.local/releases)" '[.releases[].name]==["2","1"] and .releases[0].current==true and (.releases[1].commit|length)==40'
 jid="$(post_json projects/crm.test.local/releases/1/activate '{}' | jq -r .job_id)"; st="$(wait_job2 "$jid")"
 check "activate release 1 (switch only) → v1 live" bash -c "[ '$st' = ok ] && [ \"\$(docker exec $NAME curl -s -H 'Host: crm.test.local' http://127.0.0.1/version)\" = 'crm v1' ]"
-check "rollback pauses auto-deploy and shows a switch-only deploy" jqe "$(api projects/crm.test.local/deploys)" '.[0].trigger=="rollback" and ([.[0].steps[].name]==["Switch release","Reload & health check"])'
+check "rollback pauses auto-deploy and shows a switch-only deploy" jqe "$(api projects/crm.test.local/deploys)" '.[0].trigger=="rollback" and ([.[0].steps[].name]==["Fix permissions","Switch release","Reload & health check"])'
 jid="$(post_json projects/crm.test.local/releases/2/activate '{}' | jq -r .job_id)"; st="$(wait_job2 "$jid")"
 check "activate release 2 again → v2" bash -c "[ '$st' = ok ] && [ \"\$(docker exec $NAME curl -s -H 'Host: crm.test.local' http://127.0.0.1/version)\" = 'crm v2' ]"
 check "deploy failure alert was sent" jqe "$(api notifications)" '[.[] | select(.title=="Deploy of crm.test.local was rolled back")] | length >= 1'
@@ -659,6 +659,23 @@ EXTRA_FLAG=on" '{id:"crm.test.local",content:$c}')")"
 check "save .env as text → applied" bash -c "[ '$st' = applied ] && docker exec $NAME grep -qx 'EXTRA_FLAG=on' /var/www/crm.test.local/shared/.env"
 check "a broken .env line is refused" test "$(post_code plans/preview '{"kind":"project_env_raw","params":{"id":"crm.test.local","content":"not a valid line"}}')" = 409
 check "overview reports composer, shared folders and schedule runs" jqe "$(api 'projects/crm.test.local/overview')" '(.composer.lock==true) and ((.shared|index(".env"))!=null) and (.scheduler.runs|type)=="array" and (.monitor.recent|length)==24'
+
+step "Every site is a project; permissions fixed automatically; domains, stats, history"
+sudo_on "$PASS"
+check "portal.test.local opened as a project without Git" jqe "$(post_json projects '{"site_id":"portal.test.local"}')" '.id=="portal.test.local" and .repo=="" and .needs_key==false'
+check "deploying a project without Git is refused (409)" test "$(post_code projects/portal.test.local/deploy '{}')" = 409
+check "connect Git later (PUT repo)" jqe "$(curl -fsSk -b $JAR -H "Origin: $U" -H 'Content-Type: application/json' -X PUT -d '{"repo":"/srv/git/app.git","branch":"main"}' $U/api/projects/portal.test.local)" '.repo=="/srv/git/app.git"'
+curl -fsSk -b "$JAR" -H "Origin: $U" -H 'Content-Type: application/json' -X PUT -d '{"repo":""}' "$U/api/projects/portal.test.local" >/dev/null
+in_box "chown -R root:root /var/www/crm.test.local/shared/storage/logs && chmod 0755 /var/www/crm.test.local/shared/storage/logs"
+check "overview reports the broken permissions" jqe "$(api 'projects/crm.test.local/overview')" '.permissions.ok==false and (.permissions.problems|length)>=1 and .permissions.web_user=="nc_crm_test_local"'
+st="$(plan project_permissions '{"id":"crm.test.local"}')"
+check "Fix permissions → applied" test "$st" = applied
+check "…storage/logs writable by the PHP user again" in_box "runuser -u nc_crm_test_local -- test -w /var/www/crm.test.local/shared/storage/logs"
+check "…overview is happy" jqe "$(api 'projects/crm.test.local/overview')" '.permissions.ok==true'
+check "workspace lists every site with monitoring" jqe "$(api workspace)" '([.[].id]|index("crm.test.local"))!=null and ([.[] | select(.id=="crm.test.local")][0].project.strategy=="releases") and (.[0].monitor|has("uptime"))'
+check "domains API: every hostname with DNS + SSL state" jqe "$(api domains)" '(.domains|length)>=5 and ([.domains[] | select(.domain=="shop.test.local")][0] | .ssl==true and (.dns.state|type)=="string")'
+check "database stats: connections, hit rate, used-by" jqe "$(api dbm/mysql/stats)" '(.connections|type)=="number" and (.used_by["crm_test_local"]=="crm.test.local") and .local_only==true'
+check "server history endpoint (CPU/memory/network)" jqe "$(api system/history)" '(.points|length)==48 and (.net|has("rx_24h"))'
 
 step "Encrypted off-site backups and restore to staging"
 sudo_on "$PASS"

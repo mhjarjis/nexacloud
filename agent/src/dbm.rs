@@ -1265,3 +1265,79 @@ mod tests {
         assert_eq!(a, Some(3));
     }
 }
+
+// ------------------------------------------------------------------ engine stats
+
+fn cell(t: &Table, r: usize, c: usize) -> Option<String> {
+    t.rows.get(r).and_then(|row| row.get(c)).cloned().flatten()
+}
+
+/// `GET /api/dbm/{engine}/stats` — connections, cache hit rate, table and
+/// user counts per database, slow queries and which project uses each DB.
+pub async fn stats(
+    axum::extract::State(state): axum::extract::State<crate::state::AppState>,
+    UrlPath(engine): UrlPath<String>,
+) -> ApiResult<Json<Value>> {
+    let t = QUERY_TIMEOUT;
+    let mut out = json!({});
+    if engine == "mysql" {
+        if let Ok(s) = mysql(None, "SELECT VARIABLE_NAME, VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME IN ('Threads_connected','Innodb_buffer_pool_read_requests','Innodb_buffer_pool_reads')", t).await {
+            let get = |k: &str| s.rows.iter().find(|r| r.first().cloned().flatten().as_deref() == Some(k)).and_then(|r| r.get(1).cloned().flatten()).and_then(|v| v.parse::<f64>().ok());
+            out["connections"] = json!(get("Threads_connected"));
+            if let (Some(req), Some(reads)) = (get("Innodb_buffer_pool_read_requests"), get("Innodb_buffer_pool_reads")) {
+                if req > 0.0 {
+                    out["hit_rate"] = json!(((req - reads) / req * 1000.0).round() / 10.0);
+                }
+            }
+        }
+        if let Ok(m) = mysql(None, "SELECT @@max_connections", t).await {
+            out["max_connections"] = json!(cell(&m, 0, 0).and_then(|v| v.parse::<u64>().ok()));
+        }
+        if let Ok(tb) = mysql(None, "SELECT table_schema, COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ('mysql','sys','performance_schema','information_schema') GROUP BY table_schema", t).await {
+            out["tables"] = json!(tb.rows.iter().filter_map(|r| Some((r.first()?.clone()?, r.get(1)?.clone()?.parse::<u64>().ok()?))).collect::<std::collections::BTreeMap<_, _>>());
+        }
+        if let Ok(us) = mysql(None, "SELECT Db, COUNT(DISTINCT User) FROM mysql.db GROUP BY Db", t).await {
+            out["users"] = json!(us.rows.iter().filter_map(|r| Some((r.first()?.clone()?, r.get(1)?.clone()?.parse::<u64>().ok()?))).collect::<std::collections::BTreeMap<_, _>>());
+        }
+        match mysql(None, "SELECT DIGEST_TEXT, SCHEMA_NAME, ROUND(AVG_TIMER_WAIT/1000000000000, 2), COUNT_STAR FROM performance_schema.events_statements_summary_by_digest WHERE SCHEMA_NAME IS NOT NULL AND SCHEMA_NAME NOT IN ('mysql','sys','performance_schema') AND AVG_TIMER_WAIT > 1000000000000 AND LAST_SEEN > NOW() - INTERVAL 1 DAY ORDER BY AVG_TIMER_WAIT DESC LIMIT 5", t).await {
+            Ok(sq) => out["slow"] = json!(sq.rows.iter().map(|r| json!({"sql": r.first().cloned().flatten(), "db": r.get(1).cloned().flatten(), "secs": r.get(2).cloned().flatten(), "count": r.get(3).cloned().flatten()})).collect::<Vec<_>>()),
+            Err(_) => out["slow_unavailable"] = json!("performance_schema is off"),
+        }
+    } else if engine == "postgres" {
+        if let Ok(s) = psql("postgres", "SELECT (SELECT count(*) FROM pg_stat_activity WHERE datname IS NOT NULL), current_setting('max_connections'), round(100.0 * sum(blks_hit) / nullif(sum(blks_hit) + sum(blks_read), 0), 1) FROM pg_stat_database", t).await {
+            out["connections"] = json!(cell(&s, 0, 0).and_then(|v| v.parse::<u64>().ok()));
+            out["max_connections"] = json!(cell(&s, 0, 1).and_then(|v| v.parse::<u64>().ok()));
+            out["hit_rate"] = json!(cell(&s, 0, 2).and_then(|v| v.parse::<f64>().ok()));
+        }
+        if let Ok(o) = psql("postgres", "SELECT d.datname, r.rolname FROM pg_database d JOIN pg_roles r ON r.oid = d.datdba WHERE NOT d.datistemplate", t).await {
+            out["owners"] = json!(o.rows.iter().filter_map(|r| Some((r.first()?.clone()?, r.get(1)?.clone()?))).collect::<std::collections::BTreeMap<_, _>>());
+        }
+        out["slow_unavailable"] = json!("enable pg_stat_statements to see slow queries");
+    } else {
+        return Err(ApiError::bad_request("engine must be mysql or postgres"));
+    }
+    // listening address (remote access)
+    let port = if engine == "mysql" { ":3306" } else { ":5432" };
+    let ss = crate::util::cmd::Cmd::new("ss").args(["-ltnH"]).run().await;
+    let addrs: Vec<String> = ss
+        .stdout
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(3).map(String::from))
+        .filter(|a| a.ends_with(port))
+        .collect();
+    out["listen"] = json!(addrs);
+    out["local_only"] = json!(!addrs.is_empty() && addrs.iter().all(|a| a.starts_with("127.") || a.starts_with("[::1]") || a.starts_with("localhost")));
+    // database → project (from each project's .env)
+    let mut used = serde_json::Map::new();
+    for p in crate::deploys::list_projects(&state.db).unwrap_or_default() {
+        let env = std::fs::read_to_string(format!("{}/.env", p.shared_dir())).unwrap_or_default();
+        let get = |k: &str| env.lines().find_map(|l| l.split_once('=').filter(|(a, _)| a.trim() == k).map(|(_, b)| b.trim().trim_matches('"').to_string()));
+        let conn = get("DB_CONNECTION").unwrap_or_default();
+        let matches = (engine == "mysql" && (conn == "mysql" || conn == "mariadb")) || (engine == "postgres" && conn == "pgsql");
+        if let (true, Some(db)) = (matches, get("DB_DATABASE")) {
+            used.insert(db, json!(p.id));
+        }
+    }
+    out["used_by"] = Value::Object(used);
+    Ok(Json(out))
+}

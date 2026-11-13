@@ -14,6 +14,7 @@
 //! - Triggers: manual, GitHub webhook (`POST /hooks/github/<id>`, HMAC-SHA256),
 //!   or polling (`git ls-remote` every 60 s) when auto-deploy is on.
 
+pub mod permissions;
 pub mod releases;
 pub mod routes;
 
@@ -225,7 +226,9 @@ pub fn list_projects(db: &Db) -> Result<Vec<Project>> {
             p.strategy = "releases".into();
         }
         if let Some(n) = owner_of(&p.dir).and_then(|(uid, _)| crate::util::user_name(uid)) {
-            if n.starts_with("nc_") && n != p.run_as {
+            // Deploys run as whoever owns the files (the PHP user after
+            // "Fix permissions", or the site's own nc_* user).
+            if n != "root" && n != p.run_as {
                 p.run_as = n;
             }
         }
@@ -410,7 +413,7 @@ fn known_hosts_path(state: &AppState) -> PathBuf {
 }
 
 pub fn needs_key(repo: &str) -> bool {
-    !repo.starts_with("/srv/git/") && !repo.starts_with("https://")
+    !repo.is_empty() && !repo.starts_with("/srv/git/") && !repo.starts_with("https://")
 }
 
 pub async fn ensure_key(state: &AppState, id: &str) -> Result<String> {
@@ -520,6 +523,9 @@ pub fn submit(
     commit: Option<String>,
     actor: Option<String>,
 ) -> Result<String> {
+    if project.repo.is_empty() {
+        bail!("connect a Git repository first (Deployments tab)");
+    }
     if in_flight(&state.db, &project.id) {
         bail!("a deploy of {} is already queued or running", project.id);
     }
@@ -937,6 +943,19 @@ async fn run(
     if commit.is_some_and(|c| !c.bytes().all(|b| b.is_ascii_hexdigit()) || c.len() < 7) {
         bail!("invalid commit");
     }
+    // Files owned by the PHP user, storage writable — then everything below
+    // runs as that user.
+    let s = step_begin(state, d, "Fix permissions", "owner = PHP user · storage/ and bootstrap/cache writable");
+    match permissions::fix(p, Some(job)).await {
+        Ok(()) => step_end(state, d, s, true, "Done"),
+        Err(e) => {
+            step_end(state, d, s, false, "Failed");
+            return Err(e);
+        }
+    }
+    let mut fixed = p.clone();
+    fixed.run_as = permissions::web_user(p);
+    let p = &fixed;
     let (env, guard) = deploy_env(state, p, d).await?;
     let res = if p.strategy == "releases" {
         releases::run(state, job, p, d, commit, &env).await
@@ -1084,7 +1103,7 @@ pub fn spawn_poller(state: AppState) {
             let Ok(projects) = list_projects(&state.db) else {
                 continue;
             };
-            for p in projects.into_iter().filter(|p| p.auto_deploy) {
+            for p in projects.into_iter().filter(|p| p.auto_deploy && !p.repo.is_empty()) {
                 if in_flight(&state.db, &p.id) {
                     continue;
                 }
