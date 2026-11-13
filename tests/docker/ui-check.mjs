@@ -132,7 +132,7 @@ try {
 
   console.log('\n▶ Security: one-click fix (Preview → Apply → Rollback)')
   await go('/security', 3000)
-  await ev(`[...document.querySelectorAll('button')].find(b=>b.textContent.trim()==='Preview')?.click(); return 1`)
+  await ev(`[...document.querySelectorAll('section[aria-labelledby="fix-nginx-h"] button')].find(b=>b.textContent.trim()==='Preview')?.click(); return 1`)
   let pv = ''
   for (let i = 0; i < 20; i++) { await sleep(500); pv = await ev(`return document.querySelector('.change-preview')?.innerText || ''`); if (pv) break }
   expect(/This will change 1 file and run 2 commands/.test(pv), 'preview: "This will change 1 file and run 2 commands"')

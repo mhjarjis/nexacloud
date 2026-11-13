@@ -501,7 +501,8 @@ fi
 sudo_on "$PASS"
 st="$(plan site_delete '{"id":"blog.test.local"}')"
 check "remove site → applied" test "$st" = applied
-check "blog no longer served (files kept)" bash -c "! docker exec $NAME curl -s -H 'Host: blog.test.local' http://127.0.0.1/ | grep -q 'is ready' && docker exec $NAME test -f /var/www/blog.test.local/public/index.php"
+gone=0; for _ in $(seq 1 10); do docker exec $NAME curl -s -H 'Host: blog.test.local' http://127.0.0.1/ | grep -q 'is ready' || { gone=1; break; }; sleep 1; done
+check "blog no longer served (files kept)" bash -c "[ $gone = 1 ] && docker exec $NAME test -f /var/www/blog.test.local/public/index.php"
 
 # ------------------------------------------------------------------ throttle
 step "Login throttling"

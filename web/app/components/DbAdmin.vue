@@ -10,12 +10,13 @@ const err = ref<string | null>(null)
 async function loadUsers() {
   try { users.value = await api.get<DbUser[]>(`/api/dbm/${props.engine}/users`) } catch (e) { err.value = errorMessage(e) }
 }
-watch(() => props.engine, () => { users.value = null; created.value = null; loadUsers() }, { immediate: true })
 
 const name = ref('')
 const withUser = ref(true)
 const busy = ref(false)
 const created = ref<{ database: string; user: string | null; password: string | null; env: string | null } | null>(null)
+// (watch placed after `created` is declared — immediate callbacks run synchronously)
+watch(() => props.engine, () => { users.value = null; created.value = null; loadUsers() }, { immediate: true })
 const okName = computed(() => /^[A-Za-z0-9_]{1,64}$/.test(name.value))
 async function create() {
   busy.value = true
