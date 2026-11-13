@@ -18,7 +18,7 @@
 set -euo pipefail
 
 REPO="${NEXACLOUD_REPO:-mhjarjis/nexacloud}"
-VERSION="latest"
+NC_VERSION="latest"
 TARBALL="${NEXACLOUD_TARBALL:-}"
 ASSET="nexacloud-x86_64-linux.tar.gz"
 PREFIX="/opt/nexacloud"
@@ -39,7 +39,7 @@ die()  { printf '%sxx%s  %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --version) VERSION="${2:?--version needs a value}"; shift 2 ;;
+    --version) NC_VERSION="${2:?--version needs a value}"; shift 2 ;;
     --uninstall) UNINSTALL=1; shift ;;
     --purge) PURGE=1; shift ;;
     -h|--help) sed -n '2,17p' "$0" 2>/dev/null || true; exit 0 ;;
@@ -72,11 +72,15 @@ fi
 arch="$(uname -m)"
 [ "$arch" = "x86_64" ] || die "only x86_64 is supported right now (found $arch)"
 if [ -r /etc/os-release ]; then
+  # read in a subshell: os-release defines VERSION, ID, NAME… which must not
+  # leak into this script's variables
   # shellcheck disable=SC1091
-  . /etc/os-release
-  case "${ID:-}" in
+  os_id="$(. /etc/os-release && printf '%s' "${ID:-}")"
+  # shellcheck disable=SC1091
+  os_name="$(. /etc/os-release && printf '%s' "${PRETTY_NAME:-unknown}")"
+  case "$os_id" in
     ubuntu|debian) ;;
-    *) warn "tested on Ubuntu/Debian; found ${PRETTY_NAME:-unknown}. Continuing." ;;
+    *) warn "tested on Ubuntu/Debian; found $os_name. Continuing." ;;
   esac
 fi
 for bin in curl tar sha256sum; do
@@ -97,12 +101,12 @@ if [ -n "$TARBALL" ]; then
     die "missing checksum file $TARBALL.sha256"
   fi
 else
-  if [ "$VERSION" = "latest" ]; then
+  if [ "$NC_VERSION" = "latest" ]; then
     base="https://github.com/$REPO/releases/latest/download"
   else
-    base="https://github.com/$REPO/releases/download/$VERSION"
+    base="https://github.com/$REPO/releases/download/$NC_VERSION"
   fi
-  say "Downloading NexaCloud ($VERSION) from github.com/$REPO"
+  say "Downloading NexaCloud ($NC_VERSION) from github.com/$REPO"
   curl -fsSL --retry 3 -o "$tmp/$ASSET" "$base/$ASSET" \
     || die "could not download $base/$ASSET — has a release been published yet?"
   curl -fsSL --retry 3 -o "$tmp/$ASSET.sha256" "$base/$ASSET.sha256" \
