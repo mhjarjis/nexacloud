@@ -37,7 +37,11 @@ impl CmdOutput {
             return format!("{program} timed out");
         }
         let msg = self.stderr.trim();
-        let msg = if msg.is_empty() { self.stdout.trim() } else { msg };
+        let msg = if msg.is_empty() {
+            self.stdout.trim()
+        } else {
+            msg
+        };
         let msg: String = msg.lines().take(3).collect::<Vec<_>>().join(" ");
         if msg.is_empty() {
             format!("{program} failed")
@@ -203,7 +207,9 @@ mod tests {
 
     #[tokio::test]
     async fn missing_binary_does_not_error() {
-        let out = Cmd::new("definitely-not-a-real-binary-nexacloud").run().await;
+        let out = Cmd::new("definitely-not-a-real-binary-nexacloud")
+            .run()
+            .await;
         assert!(out.missing);
         assert!(!out.ok);
     }

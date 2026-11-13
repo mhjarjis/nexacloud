@@ -194,7 +194,10 @@ fn origin_authority(origin: &str) -> Option<(String, &'static str)> {
     if rest.is_empty() || rest.contains('/') || rest.contains('@') {
         return None;
     }
-    Some((strip_default_port(&rest.to_ascii_lowercase(), scheme), scheme))
+    Some((
+        strip_default_port(&rest.to_ascii_lowercase(), scheme),
+        scheme,
+    ))
 }
 
 fn strip_default_port(authority: &str, scheme: &str) -> String {
@@ -218,7 +221,10 @@ pub fn origin_matches(origin: Option<&str>, host: Option<&str>) -> bool {
 }
 
 fn is_mutating(m: &Method) -> bool {
-    matches!(*m, Method::POST | Method::PUT | Method::PATCH | Method::DELETE)
+    matches!(
+        *m,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    )
 }
 
 /// CSRF defence: mutating requests must carry an Origin matching Host.
@@ -246,7 +252,11 @@ pub async fn origin_check(req: Request, next: Next) -> Response {
 #[derive(Clone)]
 pub struct SessionToken(pub String);
 
-pub async fn require_session(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
+pub async fn require_session(
+    State(state): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Response {
     match token_from_headers(req.headers()) {
         Some(t) if state.sessions.is_valid(&t) => {
             req.extensions_mut().insert(SessionToken(t));
@@ -405,14 +415,38 @@ mod tests {
 
     #[test]
     fn origin() {
-        assert!(origin_matches(Some("https://1.2.3.4:8443"), Some("1.2.3.4:8443")));
-        assert!(origin_matches(Some("http://127.0.0.1:8443"), Some("127.0.0.1:8443")));
-        assert!(origin_matches(Some("https://Panel.Example.com"), Some("panel.example.com")));
-        assert!(origin_matches(Some("https://panel.example.com:443"), Some("panel.example.com")));
-        assert!(origin_matches(Some("https://panel.example.com"), Some("panel.example.com:443")));
-        assert!(!origin_matches(Some("https://evil.com"), Some("panel.example.com")));
-        assert!(!origin_matches(Some("https://1.2.3.4:9999"), Some("1.2.3.4:8443")));
-        assert!(!origin_matches(Some("http://panel.example.com:443"), Some("panel.example.com")));
+        assert!(origin_matches(
+            Some("https://1.2.3.4:8443"),
+            Some("1.2.3.4:8443")
+        ));
+        assert!(origin_matches(
+            Some("http://127.0.0.1:8443"),
+            Some("127.0.0.1:8443")
+        ));
+        assert!(origin_matches(
+            Some("https://Panel.Example.com"),
+            Some("panel.example.com")
+        ));
+        assert!(origin_matches(
+            Some("https://panel.example.com:443"),
+            Some("panel.example.com")
+        ));
+        assert!(origin_matches(
+            Some("https://panel.example.com"),
+            Some("panel.example.com:443")
+        ));
+        assert!(!origin_matches(
+            Some("https://evil.com"),
+            Some("panel.example.com")
+        ));
+        assert!(!origin_matches(
+            Some("https://1.2.3.4:9999"),
+            Some("1.2.3.4:8443")
+        ));
+        assert!(!origin_matches(
+            Some("http://panel.example.com:443"),
+            Some("panel.example.com")
+        ));
         assert!(!origin_matches(Some("null"), Some("panel.example.com")));
         assert!(!origin_matches(None, Some("panel.example.com")));
         assert!(!origin_matches(Some("https://a.com"), None));

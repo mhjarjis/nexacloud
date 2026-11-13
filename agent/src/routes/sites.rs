@@ -222,16 +222,19 @@ async fn build_site(b: ServerBlock, with_git: bool) -> Site {
 }
 
 pub async fn scan(with_git: bool) -> Vec<Site> {
-    let blocks = tokio::task::spawn_blocking(|| {
-        read_blocks(Path::new(SITES_ENABLED), Path::new(CONF_D))
-    })
-    .await
-    .unwrap_or_default();
+    let blocks =
+        tokio::task::spawn_blocking(|| read_blocks(Path::new(SITES_ENABLED), Path::new(CONF_D)))
+            .await
+            .unwrap_or_default();
     let futs = blocks
         .into_iter()
         .map(|b| build_site(b, with_git))
         .collect();
-    let mut sites: Vec<Site> = crate::util::join_all(futs).await.into_iter().flatten().collect();
+    let mut sites: Vec<Site> = crate::util::join_all(futs)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
     sites.sort_by(|a, b| a.id.cmp(&b.id));
     sites
 }
@@ -246,7 +249,10 @@ mod tests {
 
     #[test]
     fn remotes_are_redacted() {
-        assert_eq!(redact_remote("git@github.com:org/shop.git"), "git@github.com:org/shop.git");
+        assert_eq!(
+            redact_remote("git@github.com:org/shop.git"),
+            "git@github.com:org/shop.git"
+        );
         assert_eq!(
             redact_remote("https://user:ghp_secret@github.com/org/shop.git"),
             "https://github.com/org/shop.git"
@@ -255,8 +261,14 @@ mod tests {
             redact_remote("https://oauth2token@gitlab.com/org/shop.git"),
             "https://gitlab.com/org/shop.git"
         );
-        assert_eq!(redact_remote("ssh://git@host:22/repo.git"), "ssh://git@host:22/repo.git");
-        assert_eq!(redact_remote("https://github.com/org/shop.git"), "https://github.com/org/shop.git");
+        assert_eq!(
+            redact_remote("ssh://git@host:22/repo.git"),
+            "ssh://git@host:22/repo.git"
+        );
+        assert_eq!(
+            redact_remote("https://github.com/org/shop.git"),
+            "https://github.com/org/shop.git"
+        );
     }
 
     #[test]
@@ -275,7 +287,11 @@ mod tests {
         .unwrap();
         std::os::unix::fs::symlink(avail.join("a"), enabled.join("a")).unwrap();
         std::os::unix::fs::symlink(avail.join("missing"), enabled.join("broken")).unwrap();
-        std::fs::write(confd.join("b.conf"), "server { server_name b.test; proxy_pass http://x; }").unwrap();
+        std::fs::write(
+            confd.join("b.conf"),
+            "server { server_name b.test; proxy_pass http://x; }",
+        )
+        .unwrap();
         std::fs::write(confd.join("ignored.txt"), "server { server_name c.test; }").unwrap();
         let blocks = read_blocks(&enabled, &confd);
         let ids: Vec<&str> = blocks.iter().map(|b| b.id()).collect();

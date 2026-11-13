@@ -142,12 +142,17 @@ cat > "$UNIT" <<EOF
 Description=NexaCloud server panel agent
 After=network-online.target
 Wants=network-online.target
+# allow quick restarts (upgrade, reset-password) without tripping systemd's
+# default 5-starts-in-10s limit; crashes still back off via RestartSec
+StartLimitIntervalSec=60
+StartLimitBurst=20
 
 [Service]
 ExecStart=$PREFIX/bin/nexacloud serve --config $CONF
 Restart=on-failure
 RestartSec=3
 Environment=RUST_LOG=info
+Environment=HOME=/root
 
 [Install]
 WantedBy=multi-user.target

@@ -98,6 +98,8 @@ export interface EngineInfo {
   available: boolean
   version: string | null
   databases: DatabaseEntry[]
+  /** Why an installed engine can't be reached; null when it's simply not installed. */
+  error?: string | null
 }
 
 export type Engine = 'mysql' | 'postgres'

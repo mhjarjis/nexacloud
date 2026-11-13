@@ -147,6 +147,25 @@ check "nginx still active after restart" in_box "systemctl is-active --quiet ngi
 check "restart of unknown unit refused (400)" test "$(code -b "$JAR" -H "Origin: $U" -X POST "$U/api/services/ssh/restart")" = 400
 check "logout" post auth/logout
 
+# ------------------------------------------------------------------ mysql root password
+step "MySQL root protected by a password"
+login() { curl -fsSk -c "$JAR" -H "Origin: $U" -H 'Content-Type: application/json' -d "{\"password\":\"$1\"}" "$U/api/auth/login" >/dev/null; }
+login "$PASS"
+in_box "mysql -e \"ALTER USER 'root'@'localhost' IDENTIFIED WITH caching_sha2_password BY 'Root-Pass-123'\""
+dbs="$(api databases)"
+check "panel reports MySQL unreachable (not 'not installed')" jqe "$dbs" '.mysql.available==false and (.mysql.error|test("my.cnf"))'
+in_box "printf '[client]\nuser=root\npassword=Root-Pass-123\n' > /root/.my.cnf && chmod 600 /root/.my.cnf"
+check "with /root/.my.cnf MySQL is listed again" jqe "$(api databases)" '.mysql.available==true and (.mysql.databases|length)==2'
+
+# ------------------------------------------------------------------ reset password
+step "Reset password (no manual restart)"
+NEWPASS="$(in_box 'nexacloud reset-password 2>/dev/null' | sed -n 's/^NEXACLOUD_ADMIN_PASSWORD=//p')"
+for _ in $(seq 1 30); do curl -fsk "$U/api/health" >/dev/null 2>&1 && break; sleep 1; done
+check "old session signed out" test "$(code -b "$JAR" "$U/api/auth/me")" = 401
+check "old password refused" test "$(code -H "Origin: $U" -H 'Content-Type: application/json' -d "{\"password\":\"$PASS\"}" "$U/api/auth/login")" = 401
+check "new password works immediately" login "$NEWPASS"
+PASS="$NEWPASS"
+
 # ------------------------------------------------------------------ throttle
 step "Login throttling"
 for _ in 1 2 3 4 5 6; do code -H "Origin: $U" -H 'Content-Type: application/json' -d '{"password":"bad"}' "$U/api/auth/login" >/dev/null; done
@@ -159,8 +178,9 @@ check "re-run keeps existing password" grep -q 'Password:  unchanged' <<<"$up"
 check "agent healthy after upgrade" curl -fsk "$U/api/health"
 check "reset-password prints a new password" bash -c "docker exec $NAME nexacloud reset-password | grep -q '^NEXACLOUD_ADMIN_PASSWORD='"
 if [ "${KEEP:-0}" = "1" ]; then
-  NEWPASS="$(in_box 'nexacloud reset-password' | sed -n 's/^NEXACLOUD_ADMIN_PASSWORD=//p')"
-  in_box "systemctl restart nexacloud"
+  NEWPASS="$(in_box 'nexacloud reset-password 2>/dev/null' | sed -n 's/^NEXACLOUD_ADMIN_PASSWORD=//p')"
+  for _ in $(seq 1 30); do curl -fsk "$U/api/health" >/dev/null 2>&1 && break; sleep 1; done
+  check "agent healthy after the last reset" curl -fsk "$U/api/health"
   printf '\n\033[1mAll %d checks passed.\033[0m Container kept running:\n  %s   password: %s\n' "$PASSES" "$U" "$NEWPASS"
   exit 0
 fi

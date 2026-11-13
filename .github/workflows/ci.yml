@@ -52,9 +52,13 @@ jobs:
           retention-days: 7
 
   install-test:
-    name: Install on a fresh Ubuntu 24.04
+    name: Install on a fresh ${{ matrix.os }}
     needs: build
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 

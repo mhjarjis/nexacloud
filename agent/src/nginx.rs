@@ -251,7 +251,10 @@ fn first_arg(d: Option<&Directive>) -> Option<String> {
 fn server_block(d: &Directive, path: &Path) -> Option<ServerBlock> {
     let body = d.block.as_ref()?;
     let mut names = Vec::new();
-    for x in body.iter().filter(|x| x.name == "server_name" && x.block.is_none()) {
+    for x in body
+        .iter()
+        .filter(|x| x.name == "server_name" && x.block.is_none())
+    {
         for n in &x.args {
             let n = n.trim();
             if !n.is_empty() && n != "_" && !names.iter().any(|e| e == n) {
@@ -263,16 +266,13 @@ fn server_block(d: &Directive, path: &Path) -> Option<ServerBlock> {
         return None;
     }
     // root: server level, else `location /`, else first anywhere.
-    let root = first_arg(
-        body.iter()
-            .find(|x| x.name == "root" && x.block.is_none()),
-    )
-    .or_else(|| {
-        body.iter()
-            .filter(|x| x.name == "location" && x.args.last().map(String::as_str) == Some("/"))
-            .find_map(|loc| first_arg(find_first(loc.block.as_deref().unwrap_or(&[]), "root")))
-    })
-    .or_else(|| first_arg(find_first(body, "root")));
+    let root = first_arg(body.iter().find(|x| x.name == "root" && x.block.is_none()))
+        .or_else(|| {
+            body.iter()
+                .filter(|x| x.name == "location" && x.args.last().map(String::as_str) == Some("/"))
+                .find_map(|loc| first_arg(find_first(loc.block.as_deref().unwrap_or(&[]), "root")))
+        })
+        .or_else(|| first_arg(find_first(body, "root")));
     let listen_ssl = body
         .iter()
         .filter(|x| x.name == "listen")
@@ -419,7 +419,12 @@ pub fn php_version_from_socket(s: &str) -> Option<String> {
 
 /// `laravel` if `<root>/../artisan` exists; `php` if fastcgi_pass present;
 /// `proxy` if proxy_pass; `static` if root and no php; else `unknown`.
-pub fn site_kind(has_root: bool, artisan_exists: bool, has_fastcgi: bool, has_proxy: bool) -> &'static str {
+pub fn site_kind(
+    has_root: bool,
+    artisan_exists: bool,
+    has_fastcgi: bool,
+    has_proxy: bool,
+) -> &'static str {
     if has_root && artisan_exists {
         "laravel"
     } else if has_fastcgi {
@@ -534,16 +539,25 @@ server {
         assert_eq!(sites.len(), 1);
         let s = &sites[0];
         assert_eq!(s.id(), "shop.example.com");
-        assert_eq!(s.server_names, vec!["shop.example.com", "www.shop.example.com"]);
+        assert_eq!(
+            s.server_names,
+            vec!["shop.example.com", "www.shop.example.com"]
+        );
         assert_eq!(s.root.as_deref(), Some("/var/www/shop/public"));
-        assert_eq!(s.fastcgi_pass.as_deref(), Some("unix:/var/run/php/php8.3-fpm.sock"));
+        assert_eq!(
+            s.fastcgi_pass.as_deref(),
+            Some("unix:/var/run/php/php8.3-fpm.sock")
+        );
         assert_eq!(
             s.ssl_certificate.as_deref(),
             Some("/etc/letsencrypt/live/shop.example.com/fullchain.pem")
         );
         assert!(s.ssl());
         assert!(s.proxy_pass.is_none());
-        assert_eq!(php_version_from_socket(s.fastcgi_pass.as_ref().unwrap()).as_deref(), Some("8.3"));
+        assert_eq!(
+            php_version_from_socket(s.fastcgi_pass.as_ref().unwrap()).as_deref(),
+            Some("8.3")
+        );
     }
 
     #[test]
@@ -580,7 +594,16 @@ server {
 
     #[test]
     fn garbage_never_panics() {
-        for src in ["}}}{{{", "server {", "server", ";;;", "\"unterminated", "a ${b", "\\", "server { server_name a; } }"] {
+        for src in [
+            "}}}{{{",
+            "server {",
+            "server",
+            ";;;",
+            "\"unterminated",
+            "a ${b",
+            "\\",
+            "server { server_name a; } }",
+        ] {
             let _ = merge_blocks(server_blocks(src, &p()));
         }
     }
@@ -588,7 +611,10 @@ server {
     #[test]
     fn multiple_sites_in_one_file_and_cross_file_merge() {
         let mut blocks = server_blocks(PLAIN_PHP, &p());
-        blocks.extend(server_blocks(PROXY, Path::new("/etc/nginx/conf.d/app.conf")));
+        blocks.extend(server_blocks(
+            PROXY,
+            Path::new("/etc/nginx/conf.d/app.conf"),
+        ));
         // A separate redirect for the proxy site in another file.
         blocks.extend(server_blocks(
             "server { listen 80; server_name app.example.net; return 301 https://$host$request_uri; }",
@@ -631,9 +657,15 @@ server { listen 80; server_name parked.com; return 404; }
 
     #[test]
     fn php_socket_versions() {
-        assert_eq!(php_version_from_socket("unix:/run/php/php7.4-fpm.sock").as_deref(), Some("7.4"));
+        assert_eq!(
+            php_version_from_socket("unix:/run/php/php7.4-fpm.sock").as_deref(),
+            Some("7.4")
+        );
         assert_eq!(php_version_from_socket("unix:/run/php/php-fpm.sock"), None);
         assert_eq!(php_version_from_socket("127.0.0.1:9000"), None);
-        assert_eq!(php_version_from_socket("unix:/var/run/php8.2-fpm-shop.sock").as_deref(), Some("8.2"));
+        assert_eq!(
+            php_version_from_socket("unix:/var/run/php8.2-fpm-shop.sock").as_deref(),
+            Some("8.2")
+        );
     }
 }

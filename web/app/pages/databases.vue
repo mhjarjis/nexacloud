@@ -173,8 +173,14 @@ function progressClass(job: Job | null): string {
     />
     <div v-else-if="current && !current.available" class="card empty">
       <AppIcon name="databases" :size="28" class="muted" />
-      <strong>{{ engineLabel }} isn't installed or available</strong>
-      <span>NexaCloud couldn't reach a local {{ engineLabel }} server{{ engine === 'mysql' ? ' as root over the unix socket' : ' as the postgres user' }}.</span>
+      <template v-if="current.error">
+        <strong>{{ engineLabel }} is installed but NexaCloud can't connect</strong>
+        <span>{{ current.error }}</span>
+      </template>
+      <template v-else>
+        <strong>{{ engineLabel }} isn't installed</strong>
+        <span>No local {{ engineLabel }} server was found on this machine.</span>
+      </template>
     </div>
     <template v-else-if="current">
       <section aria-label="Engine stats" class="grid-cards" style="grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px">

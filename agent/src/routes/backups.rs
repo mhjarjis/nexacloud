@@ -160,7 +160,10 @@ pub async fn download(
     let len = file.metadata().await.map(|m| m.len()).ok();
     let mut resp = Body::from_stream(ReaderStream::new(file)).into_response();
     let h = resp.headers_mut();
-    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/gzip"));
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/gzip"),
+    );
     if let Ok(v) = HeaderValue::from_str(&format!(
         "attachment; filename=\"{}\"",
         safe_filename(&path)
@@ -190,20 +193,39 @@ mod tests {
         std::fs::create_dir_all(base.join("mysql/shop")).unwrap();
         std::fs::write(base.join("mysql/shop/shop-20261113-030000.sql.gz"), b"x").unwrap();
         std::fs::write(root.join("secret.txt"), b"s").unwrap();
-        std::os::unix::fs::symlink(root.join("secret.txt"), base.join("mysql/shop/link.sql.gz")).unwrap();
+        std::os::unix::fs::symlink(root.join("secret.txt"), base.join("mysql/shop/link.sql.gz"))
+            .unwrap();
 
         assert!(resolve_inside(&base, "mysql/shop/shop-20261113-030000.sql.gz").is_ok());
-        assert_eq!(resolve_inside(&base, "../secret.txt"), Err(PathError::Invalid));
-        assert_eq!(resolve_inside(&base, "mysql/../../secret.txt"), Err(PathError::Invalid));
-        assert_eq!(resolve_inside(&base, "/etc/passwd"), Err(PathError::Invalid));
-        assert_eq!(resolve_inside(&base, "./mysql/shop/shop-20261113-030000.sql.gz"), Err(PathError::Invalid));
+        assert_eq!(
+            resolve_inside(&base, "../secret.txt"),
+            Err(PathError::Invalid)
+        );
+        assert_eq!(
+            resolve_inside(&base, "mysql/../../secret.txt"),
+            Err(PathError::Invalid)
+        );
+        assert_eq!(
+            resolve_inside(&base, "/etc/passwd"),
+            Err(PathError::Invalid)
+        );
+        assert_eq!(
+            resolve_inside(&base, "./mysql/shop/shop-20261113-030000.sql.gz"),
+            Err(PathError::Invalid)
+        );
         assert_eq!(resolve_inside(&base, ""), Err(PathError::Invalid));
         assert_eq!(resolve_inside(&base, "a\0b"), Err(PathError::Invalid));
         // Symlink escaping the backup dir.
-        assert_eq!(resolve_inside(&base, "mysql/shop/link.sql.gz"), Err(PathError::Invalid));
+        assert_eq!(
+            resolve_inside(&base, "mysql/shop/link.sql.gz"),
+            Err(PathError::Invalid)
+        );
         // Directory, not a file.
         assert_eq!(resolve_inside(&base, "mysql/shop"), Err(PathError::Invalid));
-        assert_eq!(resolve_inside(&base, "mysql/shop/missing.sql.gz"), Err(PathError::NotFound));
+        assert_eq!(
+            resolve_inside(&base, "mysql/shop/missing.sql.gz"),
+            Err(PathError::NotFound)
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -214,7 +236,11 @@ mod tests {
         std::fs::create_dir_all(base.join("postgres/app")).unwrap();
         std::fs::write(base.join("mysql/shop/shop-20261112-030000.sql.gz"), b"aa").unwrap();
         std::fs::write(base.join("postgres/app/app-20261113-030000.sql.gz"), b"b").unwrap();
-        std::fs::write(base.join("mysql/shop/.shop-20261113-040000.sql.gz.partial"), b"").unwrap();
+        std::fs::write(
+            base.join("mysql/shop/.shop-20261113-040000.sql.gz.partial"),
+            b"",
+        )
+        .unwrap();
         std::fs::write(base.join("mysql/shop/notes.txt"), b"").unwrap();
         let v = scan(&base);
         assert_eq!(v.len(), 2);

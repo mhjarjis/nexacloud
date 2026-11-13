@@ -95,7 +95,10 @@ pub fn apt_unattended_setting(content: &str) -> Option<bool> {
                 .chars()
                 .filter(|c| !c.is_whitespace() && *c != '"' && *c != ';')
                 .collect();
-            val = Some(matches!(v.as_str(), "1" | "true" | "yes") || v.parse::<u32>().map(|n| n > 0).unwrap_or(false));
+            val = Some(
+                matches!(v.as_str(), "1" | "true" | "yes")
+                    || v.parse::<u32>().map(|n| n > 0).unwrap_or(false),
+            );
         }
     }
     val
@@ -152,7 +155,12 @@ pub fn sshd_config_password_auth(
         }
         let mut parts = t.splitn(2, |c: char| c.is_whitespace() || c == '=');
         let key = parts.next().unwrap_or("").to_ascii_lowercase();
-        let val = parts.next().unwrap_or("").trim().trim_start_matches('=').trim();
+        let val = parts
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_start_matches('=')
+            .trim();
         match key.as_str() {
             "match" => return None,
             "passwordauthentication" => {
@@ -269,7 +277,8 @@ async fn ssh_password_auth() -> Option<bool> {
 }
 
 pub async fn info() -> SecurityInfo {
-    let (ufw, f2b, ssh) = tokio::join!(ufw(), services::unit_state("fail2ban"), ssh_password_auth());
+    let (ufw, f2b, ssh) =
+        tokio::join!(ufw(), services::unit_state("fail2ban"), ssh_password_auth());
     let unattended = tokio::task::spawn_blocking(unattended_upgrades)
         .await
         .unwrap_or(false);
@@ -299,7 +308,11 @@ mod tests {
         assert!(active);
         assert_eq!(
             rules,
-            vec!["22/tcp ALLOW Anywhere", "8443/tcp ALLOW Anywhere", "22/tcp (v6) ALLOW Anywhere (v6)"]
+            vec![
+                "22/tcp ALLOW Anywhere",
+                "8443/tcp ALLOW Anywhere",
+                "22/tcp (v6) ALLOW Anywhere (v6)"
+            ]
         );
         let (active, rules) = parse_ufw_status("Status: inactive\n");
         assert!(!active);
@@ -310,14 +323,23 @@ mod tests {
     fn apt_parsing() {
         let s = "APT::Periodic::Update-Package-Lists \"1\";\nAPT::Periodic::Unattended-Upgrade \"1\";\n";
         assert_eq!(apt_unattended_setting(s), Some(true));
-        assert_eq!(apt_unattended_setting("APT::Periodic::Unattended-Upgrade \"0\";"), Some(false));
-        assert_eq!(apt_unattended_setting("// APT::Periodic::Unattended-Upgrade \"1\";"), None);
+        assert_eq!(
+            apt_unattended_setting("APT::Periodic::Unattended-Upgrade \"0\";"),
+            Some(false)
+        );
+        assert_eq!(
+            apt_unattended_setting("// APT::Periodic::Unattended-Upgrade \"1\";"),
+            None
+        );
         assert_eq!(apt_unattended_setting(""), None);
     }
 
     #[test]
     fn sshd_t_parsing() {
-        assert_eq!(parse_sshd_t("port 22\npasswordauthentication yes\n"), Some(true));
+        assert_eq!(
+            parse_sshd_t("port 22\npasswordauthentication yes\n"),
+            Some(true)
+        );
         assert_eq!(parse_sshd_t("passwordauthentication no\n"), Some(false));
         assert_eq!(parse_sshd_t("port 22\n"), None);
     }
@@ -326,12 +348,21 @@ mod tests {
     fn sshd_config_first_match_wins_with_includes() {
         let main = "Include /etc/ssh/sshd_config.d/*.conf\n#PasswordAuthentication yes\nPasswordAuthentication yes\n";
         let mut no_includes = |_: &str| Vec::new();
-        assert_eq!(sshd_config_password_auth(main, &mut no_includes, 0), Some(true));
+        assert_eq!(
+            sshd_config_password_auth(main, &mut no_includes, 0),
+            Some(true)
+        );
         let mut cloud_init = |_: &str| vec!["PasswordAuthentication no\n".to_string()];
-        assert_eq!(sshd_config_password_auth(main, &mut cloud_init, 0), Some(false));
+        assert_eq!(
+            sshd_config_password_auth(main, &mut cloud_init, 0),
+            Some(false)
+        );
         let m = "Match User bob\n  PasswordAuthentication yes\n";
         assert_eq!(sshd_config_password_auth(m, &mut no_includes, 0), None);
-        assert_eq!(sshd_config_password_auth("passwordauthentication=no", &mut no_includes, 0), Some(false));
+        assert_eq!(
+            sshd_config_password_auth("passwordauthentication=no", &mut no_includes, 0),
+            Some(false)
+        );
     }
 
     #[test]

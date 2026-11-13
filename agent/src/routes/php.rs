@@ -27,7 +27,11 @@ pub const SUPPORT_TABLE: [(&str, &str); 7] = [
 /// `"8.3"` → `(8, 3)`; only `^\d+\.\d+$`.
 pub fn parse_version(s: &str) -> Option<(u32, u32)> {
     let (a, b) = s.split_once('.')?;
-    if a.is_empty() || b.is_empty() || !a.bytes().all(|c| c.is_ascii_digit()) || !b.bytes().all(|c| c.is_ascii_digit()) {
+    if a.is_empty()
+        || b.is_empty()
+        || !a.bytes().all(|c| c.is_ascii_digit())
+        || !b.bytes().all(|c| c.is_ascii_digit())
+    {
         return None;
     }
     Some((a.parse().ok()?, b.parse().ok()?))

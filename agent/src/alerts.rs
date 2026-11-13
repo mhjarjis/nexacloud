@@ -197,7 +197,11 @@ mod tests {
             label: unit.to_uppercase(),
             installed,
             active,
-            state: if active { "active".into() } else { "failed".into() },
+            state: if active {
+                "active".into()
+            } else {
+                "failed".into()
+            },
             version: None,
         }
     }
@@ -208,7 +212,12 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    fn healthy<'a>(php: &'a [PhpVersion], services: &'a [ServiceStatus], sites: &'a [SiteSsl<'a>], disks: &'a [DiskInfo]) -> Inputs<'a> {
+    fn healthy<'a>(
+        php: &'a [PhpVersion],
+        services: &'a [ServiceStatus],
+        sites: &'a [SiteSsl<'a>],
+        disks: &'a [DiskInfo],
+    ) -> Inputs<'a> {
         Inputs {
             now: now(),
             php,
@@ -225,14 +234,26 @@ mod tests {
     fn healthy_server_has_no_alerts() {
         let p = [php("8.3", &["shop"]), php("8.1", &[])];
         let s = [svc("nginx", true, true), svc("mariadb", false, false)];
-        let sites = [SiteSsl { id: "shop", ssl_expires: Some("2027-01-12T10:00:00Z") }];
-        let d = [DiskInfo { mount: "/".into(), total: 100, used: 85 }];
+        let sites = [SiteSsl {
+            id: "shop",
+            ssl_expires: Some("2027-01-12T10:00:00Z"),
+        }];
+        let d = [DiskInfo {
+            mount: "/".into(),
+            total: 100,
+            used: 85,
+        }];
         assert!(compute(&healthy(&p, &s, &sites, &d)).is_empty());
     }
 
     #[test]
     fn php_rules() {
-        let p = [php("8.1", &["a.com", "b.com"]), php("8.2", &["c.com"]), php("7.4", &["d.com"]), php("8.3", &["e.com"])];
+        let p = [
+            php("8.1", &["a.com", "b.com"]),
+            php("8.2", &["c.com"]),
+            php("7.4", &["d.com"]),
+            php("8.3", &["e.com"]),
+        ];
         let a = compute(&healthy(&p, &[], &[], &[]));
         assert_eq!(a.len(), 3);
         assert_eq!(a[0].level, Level::Critical);
@@ -251,7 +272,10 @@ mod tests {
         i.fail2ban_installed = false;
         let a = compute(&i);
         assert_eq!(a.len(), 2);
-        assert_eq!((a[0].level, a[0].link.as_str()), (Level::Critical, "/security"));
+        assert_eq!(
+            (a[0].level, a[0].link.as_str()),
+            (Level::Critical, "/security")
+        );
         assert!(a[0].title.contains("not installed"));
         assert_eq!((a[1].level, a[1].link.as_str()), (Level::Info, "/security"));
         i.ufw_installed = true;
@@ -262,7 +286,11 @@ mod tests {
 
     #[test]
     fn services_down() {
-        let s = [svc("nginx", true, false), svc("mysql", false, false), svc("cron", true, true)];
+        let s = [
+            svc("nginx", true, false),
+            svc("mysql", false, false),
+            svc("cron", true, true),
+        ];
         let a = compute(&healthy(&[], &s, &[], &[]));
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].level, Level::Critical);
@@ -273,10 +301,22 @@ mod tests {
     #[test]
     fn ssl_rules() {
         let sites = [
-            SiteSsl { id: "old.com", ssl_expires: Some("2026-11-01T00:00:00Z") },
-            SiteSsl { id: "soon.com", ssl_expires: Some("2026-11-20T00:00:00Z") },
-            SiteSsl { id: "fine.com", ssl_expires: Some("2026-12-30T00:00:00Z") },
-            SiteSsl { id: "none.com", ssl_expires: None },
+            SiteSsl {
+                id: "old.com",
+                ssl_expires: Some("2026-11-01T00:00:00Z"),
+            },
+            SiteSsl {
+                id: "soon.com",
+                ssl_expires: Some("2026-11-20T00:00:00Z"),
+            },
+            SiteSsl {
+                id: "fine.com",
+                ssl_expires: Some("2026-12-30T00:00:00Z"),
+            },
+            SiteSsl {
+                id: "none.com",
+                ssl_expires: None,
+            },
         ];
         let a = compute(&healthy(&[], &[], &sites, &[]));
         assert_eq!(a.len(), 2);
@@ -290,8 +330,16 @@ mod tests {
     #[test]
     fn disk_rule() {
         let d = [
-            DiskInfo { mount: "/".into(), total: 1000, used: 900 },
-            DiskInfo { mount: "/data".into(), total: 1000, used: 850 },
+            DiskInfo {
+                mount: "/".into(),
+                total: 1000,
+                used: 900,
+            },
+            DiskInfo {
+                mount: "/data".into(),
+                total: 1000,
+                used: 850,
+            },
         ];
         let a = compute(&healthy(&[], &[], &[], &d));
         assert_eq!(a.len(), 1);
@@ -304,7 +352,11 @@ mod tests {
     fn sorted_by_severity() {
         let mut i = healthy(&[], &[], &[], &[]);
         i.fail2ban_installed = false;
-        let d = [DiskInfo { mount: "/".into(), total: 100, used: 99 }];
+        let d = [DiskInfo {
+            mount: "/".into(),
+            total: 100,
+            used: 99,
+        }];
         i.disks = &d;
         i.ufw_active = false;
         let levels: Vec<Level> = compute(&i).iter().map(|a| a.level).collect();

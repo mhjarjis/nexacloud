@@ -62,7 +62,10 @@ impl Config {
         cfg.tls_cert = cfg.tls_cert.as_ref().map(|p| resolve(&base, p));
         cfg.tls_key = cfg.tls_key.as_ref().map(|p| resolve(&base, p));
         if !auth::is_valid_hash(&cfg.admin_password_hash) {
-            bail!("admin_password_hash in {} is not a valid argon2 hash", path.display());
+            bail!(
+                "admin_password_hash in {} is not a valid argon2 hash",
+                path.display()
+            );
         }
         if cfg.tls && (cfg.tls_cert.is_none() || cfg.tls_key.is_none()) {
             bail!("tls = true requires tls_cert and tls_key");
@@ -88,7 +91,10 @@ fn resolve(base: &Path, p: &Path) -> PathBuf {
 }
 
 pub enum InitOutcome {
-    Created { password: String, warnings: Vec<String> },
+    Created {
+        password: String,
+        warnings: Vec<String>,
+    },
     Exists,
 }
 
@@ -154,8 +160,8 @@ pub fn reset_password(config_path: &Path) -> Result<String> {
     let text = std::fs::read_to_string(config_path)
         .with_context(|| format!("reading config {}", config_path.display()))?;
     // Make sure the file is valid before we touch it.
-    let _: toml::Table =
-        toml::from_str(&text).with_context(|| format!("parsing config {}", config_path.display()))?;
+    let _: toml::Table = toml::from_str(&text)
+        .with_context(|| format!("parsing config {}", config_path.display()))?;
     let password = auth::generate_password();
     let hash = auth::hash_password(&password)?;
     let new_text = replace_hash_line(&text, &hash);
@@ -209,7 +215,9 @@ fn generate_self_signed() -> Result<(String, String)> {
     use chrono::Datelike;
     params.not_before = rcgen::date_time_ymd(now.year() - 1, 1, 1);
     params.not_after = rcgen::date_time_ymd(now.year() + 10, 1, 1);
-    let cert = params.self_signed(&key).context("self-signing certificate")?;
+    let cert = params
+        .self_signed(&key)
+        .context("self-signing certificate")?;
     Ok((cert.pem(), key.serialize_pem()))
 }
 
@@ -219,13 +227,17 @@ mod tests {
 
     #[test]
     fn replaces_hash_line_only() {
-        let text = "# comment\nlisten = \"0.0.0.0:8443\"\nadmin_password_hash = \"old\"\ntls = true\n";
+        let text =
+            "# comment\nlisten = \"0.0.0.0:8443\"\nadmin_password_hash = \"old\"\ntls = true\n";
         let out = replace_hash_line(text, "$argon2id$v=19$new");
         assert!(out.contains("# comment"));
         assert!(out.contains("admin_password_hash = \"$argon2id$v=19$new\""));
         assert!(!out.contains("\"old\""));
         let t: toml::Table = toml::from_str(&out).unwrap();
-        assert_eq!(t["admin_password_hash"].as_str(), Some("$argon2id$v=19$new"));
+        assert_eq!(
+            t["admin_password_hash"].as_str(),
+            Some("$argon2id$v=19$new")
+        );
         assert_eq!(t["tls"].as_bool(), Some(true));
     }
 
@@ -252,7 +264,11 @@ mod tests {
                 assert!(cfg.tls);
                 assert!(dir.join("backups").is_dir());
                 use std::os::unix::fs::PermissionsExt;
-                for p in [&path, cfg.tls_key.as_ref().unwrap(), cfg.tls_cert.as_ref().unwrap()] {
+                for p in [
+                    &path,
+                    cfg.tls_key.as_ref().unwrap(),
+                    cfg.tls_cert.as_ref().unwrap(),
+                ] {
                     let mode = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
                     assert_eq!(mode, 0o600, "{}", p.display());
                 }

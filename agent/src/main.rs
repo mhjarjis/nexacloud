@@ -79,6 +79,20 @@ fn init(path: PathBuf) -> Result<()> {
 fn reset_password(path: PathBuf) -> Result<()> {
     let password = config::reset_password(&path)?;
     println!("NEXACLOUD_ADMIN_PASSWORD={password}");
+    // The running agent holds the old hash (and old sessions) in memory.
+    // Restart it so the new password works now and existing logins end.
+    // `try-restart` does nothing when the service isn't running.
+    match std::process::Command::new("systemctl")
+        .args(["try-restart", "nexacloud"])
+        .status()
+    {
+        Ok(s) if s.success() => {
+            eprintln!("Restarted the nexacloud service: the new password works now and old sessions were signed out.")
+        }
+        _ => eprintln!(
+            "Note: could not restart the nexacloud service. Run `systemctl restart nexacloud` for the new password to take effect."
+        ),
+    }
     Ok(())
 }
 
@@ -112,7 +126,13 @@ async fn run(cfg: Config) -> Result<()> {
         Some(
             axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
                 .await
-                .with_context(|| format!("loading TLS cert {} / key {}", cert.display(), key.display()))?,
+                .with_context(|| {
+                    format!(
+                        "loading TLS cert {} / key {}",
+                        cert.display(),
+                        key.display()
+                    )
+                })?,
         )
     } else {
         None

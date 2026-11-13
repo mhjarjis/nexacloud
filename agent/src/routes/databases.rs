@@ -13,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
-use crate::util::cmd::Cmd;
+use crate::util::cmd::{Cmd, CmdOutput};
 use crate::util::{create_private_dir, is_valid_db_name};
 
 pub const BACKUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -32,16 +32,51 @@ pub struct EngineInfo {
     pub available: bool,
     pub version: Option<String>,
     pub databases: Vec<DbInfo>,
+    /// Why the engine is unavailable when it is installed but unreachable
+    /// (null when it simply isn't installed).
+    pub error: Option<String>,
 }
 
 impl EngineInfo {
-    fn unavailable() -> Self {
+    fn unavailable(error: Option<String>) -> Self {
         EngineInfo {
             available: false,
             version: None,
             databases: Vec::new(),
+            error,
         }
     }
+}
+
+/// Turn a failed client call into a message a person can act on.
+pub fn explain_failure(engine: &str, out: &CmdOutput) -> Option<String> {
+    if out.missing {
+        return None;
+    }
+    if out.timed_out {
+        return Some(format!("{engine} did not answer in time."));
+    }
+    let first = out
+        .stderr
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let lower = first.to_ascii_lowercase();
+    let hint = if engine == "MySQL" && lower.contains("access denied") {
+        "MySQL refused the root login. NexaCloud connects as root over the unix socket; if your root user has a password, put it in /root/.my.cnf ([client] user=root password=…, mode 600) and reload the page."
+            .to_string()
+    } else if lower.contains("can't connect")
+        || lower.contains("could not connect")
+        || lower.contains("no such file")
+    {
+        format!("{engine} is installed but not running.")
+    } else if first.is_empty() {
+        format!("{engine} client failed without an error message.")
+    } else {
+        format!("{engine} client error: {first}")
+    };
+    Some(hint)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,13 +128,18 @@ pub fn parse_mysql_listing(out: &str) -> Vec<DbInfo> {
 pub async fn mysql_info() -> EngineInfo {
     let ver = mysql("SELECT VERSION()").run().await;
     if !ver.ok {
-        return EngineInfo::unavailable();
+        return EngineInfo::unavailable(explain_failure("MySQL", &ver));
     }
     let list = mysql(MYSQL_LIST_QUERY).run().await;
     EngineInfo {
         available: true,
         version: Some(clean_mysql_version(&ver.stdout)).filter(|s| !s.is_empty()),
-        databases: if list.ok { parse_mysql_listing(&list.stdout) } else { Vec::new() },
+        databases: if list.ok {
+            parse_mysql_listing(&list.stdout)
+        } else {
+            Vec::new()
+        },
+        error: None,
     }
 }
 
@@ -132,11 +172,15 @@ pub fn parse_pg_listing(out: &str) -> Vec<(String, u64)> {
 pub async fn postgres_info() -> EngineInfo {
     let ver = psql(&[], "SHOW server_version").run().await;
     if !ver.ok {
-        return EngineInfo::unavailable();
+        return EngineInfo::unavailable(explain_failure("PostgreSQL", &ver));
     }
     let version = ver.stdout.split_whitespace().next().map(str::to_string);
     let list = psql(&[], PG_LIST_QUERY).run().await;
-    let rows = if list.ok { parse_pg_listing(&list.stdout) } else { Vec::new() };
+    let rows = if list.ok {
+        parse_pg_listing(&list.stdout)
+    } else {
+        Vec::new()
+    };
     let futs = rows
         .iter()
         .map(|(name, _)| {
@@ -169,6 +213,7 @@ pub async fn postgres_info() -> EngineInfo {
                 tables: t.unwrap_or(0),
             })
             .collect(),
+        error: None,
     }
 }
 
@@ -236,7 +281,10 @@ pub async fn backup(
         Engine::Postgres => postgres_info().await,
     };
     if !listing.available {
-        return Err(ApiError::bad_request(format!("{} is not available", engine.as_str())));
+        return Err(ApiError::bad_request(format!(
+            "{} is not available",
+            engine.as_str()
+        )));
     }
     if !listing.databases.iter().any(|d| d.name == name) {
         return Err(ApiError::not_found(format!("database not found: {name}")));
@@ -278,7 +326,9 @@ async fn run_backup(state: &AppState, job: &str, engine: Engine, name: &str) -> 
         .open(&tmp_path)
         .with_context(|| format!("creating {}", tmp_path.display()))?;
 
-    state.jobs.log(job, &format!("Dumping {} database {name}", engine.as_str()));
+    state
+        .jobs
+        .log(job, &format!("Dumping {} database {name}", engine.as_str()));
     let result = dump_pipeline(state, job, engine, name, file).await;
     match result {
         Ok(()) => {
@@ -393,13 +443,24 @@ mod tests {
         assert_eq!(
             v,
             vec![
-                DbInfo { name: "shop_prod".into(), size_bytes: 1288490188, tables: 84 },
-                DbInfo { name: "blog".into(), size_bytes: 0, tables: 0 },
+                DbInfo {
+                    name: "shop_prod".into(),
+                    size_bytes: 1288490188,
+                    tables: 84
+                },
+                DbInfo {
+                    name: "blog".into(),
+                    size_bytes: 0,
+                    tables: 0
+                },
             ]
         );
         assert_eq!(clean_mysql_version("8.0.40-0ubuntu0.24.04.1\n"), "8.0.40");
         assert_eq!(clean_mysql_version("8.4.3"), "8.4.3");
-        assert_eq!(clean_mysql_version("10.11.8-MariaDB-0ubuntu0.24.04.1"), "10.11.8-MariaDB");
+        assert_eq!(
+            clean_mysql_version("10.11.8-MariaDB-0ubuntu0.24.04.1"),
+            "10.11.8-MariaDB"
+        );
     }
 
     #[test]
@@ -413,12 +474,55 @@ mod tests {
 
     #[test]
     fn backup_param_validation() {
-        assert_eq!(validate_backup_params("mysql", "shop_prod").unwrap(), Engine::Mysql);
-        assert_eq!(validate_backup_params("postgres", "app-1").unwrap(), Engine::Postgres);
+        assert_eq!(
+            validate_backup_params("mysql", "shop_prod").unwrap(),
+            Engine::Mysql
+        );
+        assert_eq!(
+            validate_backup_params("postgres", "app-1").unwrap(),
+            Engine::Postgres
+        );
         assert!(validate_backup_params("sqlite", "x").is_err());
         assert!(validate_backup_params("mysql", "../etc").is_err());
         assert!(validate_backup_params("mysql", "a b").is_err());
         assert!(validate_backup_params("mysql", "").is_err());
         assert!(validate_backup_params("MYSQL", "x").is_err());
+    }
+}
+
+#[cfg(test)]
+mod explain_tests {
+    use super::explain_failure;
+    use crate::util::cmd::CmdOutput;
+
+    fn failed(stderr: &str) -> CmdOutput {
+        CmdOutput {
+            ok: false,
+            missing: false,
+            timed_out: false,
+            stdout: String::new(),
+            stderr: stderr.into(),
+        }
+    }
+
+    #[test]
+    fn missing_client_is_not_an_error() {
+        let out = CmdOutput {
+            missing: true,
+            ..Default::default()
+        };
+        assert_eq!(explain_failure("MySQL", &out), None);
+    }
+
+    #[test]
+    fn access_denied_points_to_my_cnf() {
+        let msg = explain_failure("MySQL", &failed("ERROR 1045 (28000): Access denied for user 'root'@'localhost' (using password: NO)")).unwrap();
+        assert!(msg.contains("/root/.my.cnf"), "{msg}");
+    }
+
+    #[test]
+    fn socket_missing_means_not_running() {
+        let msg = explain_failure("MySQL", &failed("ERROR 2002 (HY000): Can't connect to local MySQL server through socket '/var/run/mysqld/mysqld.sock' (2)")).unwrap();
+        assert!(msg.contains("not running"), "{msg}");
     }
 }

@@ -102,7 +102,10 @@ async fn no_store(req: Request, next: Next) -> Response {
 async fn security_headers(req: Request, next: Next) -> Response {
     let mut resp = next.run(req).await;
     let h = resp.headers_mut();
-    h.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    h.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
     h.insert("x-frame-options", HeaderValue::from_static("DENY"));
     h.insert("referrer-policy", HeaderValue::from_static("same-origin"));
     resp
@@ -118,7 +121,10 @@ async fn jobs_list(State(state): State<AppState>) -> Json<Vec<Job>> {
     Json(state.jobs.list())
 }
 
-async fn job_get(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> ApiResult<Json<Job>> {
+async fn job_get(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+) -> ApiResult<Json<Job>> {
     state
         .jobs
         .get(&id)

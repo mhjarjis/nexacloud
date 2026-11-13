@@ -63,7 +63,11 @@ pub fn parse_systemctl_show(out: &str) -> UnitState {
         installed,
         active: installed && active == "active",
         state: if installed {
-            if active.is_empty() { "unknown".into() } else { active.to_string() }
+            if active.is_empty() {
+                "unknown".into()
+            } else {
+                active.to_string()
+            }
         } else if load == "masked" {
             "masked".into()
         } else {
@@ -128,11 +132,7 @@ type VersionCache = Mutex<HashMap<String, (Option<String>, Instant)>>;
 static VERSIONS: LazyLock<VersionCache> = LazyLock::new(Default::default);
 
 async fn unit_version(unit: &str) -> Option<String> {
-    if let Some((v, at)) = VERSIONS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(unit)
-    {
+    if let Some((v, at)) = VERSIONS.lock().unwrap_or_else(|e| e.into_inner()).get(unit) {
         if at.elapsed() < VERSION_TTL {
             return v.clone();
         }
@@ -217,7 +217,14 @@ mod tests {
     #[test]
     fn systemctl_show_parsing() {
         let s = parse_systemctl_show("LoadState=loaded\nActiveState=active\n");
-        assert_eq!(s, UnitState { installed: true, active: true, state: "active".into() });
+        assert_eq!(
+            s,
+            UnitState {
+                installed: true,
+                active: true,
+                state: "active".into()
+            }
+        );
         let s = parse_systemctl_show("ActiveState=failed\nLoadState=loaded\n");
         assert!(s.installed && !s.active);
         assert_eq!(s.state, "failed");
