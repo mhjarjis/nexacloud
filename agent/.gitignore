@@ -1,2 +1,4 @@
 target/
 dev-backups/
+dev-data/
+dev-state.db*

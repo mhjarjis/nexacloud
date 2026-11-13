@@ -9,7 +9,7 @@ const NAV: { to: string; label: string; icon: IconName }[] = [
   { to: '/services', label: 'Services', icon: 'services' },
   { to: '/databases', label: 'Databases & Backups', icon: 'databases' },
   { to: '/security', label: 'Security', icon: 'security' },
-  { to: '/jobs', label: 'Jobs', icon: 'jobs' },
+  { to: '/activity', label: 'Activity', icon: 'activity' },
 ]
 
 const api = useApi()
@@ -95,6 +95,7 @@ async function signOut() {
     </aside>
 
     <main id="main" class="main">
+      <SudoPrompt />
       <slot />
     </main>
   </div>

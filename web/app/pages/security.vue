@@ -1,9 +1,72 @@
 <script setup lang="ts">
-import type { SecurityInfo, Tone } from '~/types/api'
+import type { ChangePreviewData, ChangeStarted, ChangeSummary, JobStatus, SecurityInfo, Tone } from '~/types/api'
 
 useHead({ title: 'Security · NexaCloud' })
 
+const api = useApi()
 const sec = useResource<SecurityInfo>('/api/security')
+
+// ---- One-click fix: hide the nginx version (change pipeline: preview → apply → result)
+type FixStep = 'idle' | 'previewing' | 'preview' | 'applying' | 'running' | 'result'
+const fix = reactive({
+  step: 'idle' as FixStep,
+  preview: null as ChangePreviewData | null,
+  started: null as ChangeStarted | null,
+  result: null as ChangeSummary | null,
+  error: null as string | null,
+})
+
+async function previewFix() {
+  fix.step = 'previewing'
+  fix.error = null
+  fix.result = null
+  try {
+    fix.preview = await api.post<ChangePreviewData>('/api/advisor/nginx-hardening/preview')
+    fix.step = 'preview'
+  } catch (err) {
+    fix.error = errorMessage(err)
+    fix.step = 'idle'
+  }
+}
+
+async function applyFix() {
+  if (!fix.preview) return
+  fix.step = 'applying'
+  fix.error = null
+  try {
+    fix.started = await api.post<ChangeStarted>('/api/advisor/nginx-hardening/apply', { plan_hash: fix.preview.plan_hash })
+    fix.step = 'running'
+  } catch (err) {
+    fix.step = 'preview'
+    if (!(err instanceof SudoCancelled)) fix.error = errorMessage(err)
+  }
+}
+
+async function onFixFinished(_s: JobStatus) {
+  if (!fix.started) return
+  try {
+    fix.result = await api.get<ChangeSummary>(`/api/changes/${encodeURIComponent(fix.started.change_id)}`)
+  } catch (err) {
+    fix.error = errorMessage(err)
+  }
+  fix.step = 'result'
+}
+
+function resetFix() {
+  fix.step = 'idle'
+  fix.preview = null
+  fix.started = null
+  fix.result = null
+  fix.error = null
+}
+
+const fixPill = computed<{ tone: Tone; label: string } | null>(() => {
+  if (fix.step === 'result' && fix.result) return changeStatus(fix.result.status)
+  if (fix.step === 'running' || fix.step === 'applying') return { tone: 'info', label: 'Applying' }
+  if (fix.preview?.nothing_to_do) return { tone: 'ok', label: 'Nothing to do' }
+  if (fix.preview) return { tone: 'warn', label: 'Version visible' }
+  return null
+})
 
 interface Check {
   id: string
@@ -72,7 +135,72 @@ const okCount = computed(() => checks.value.filter((c) => c.tone === 'ok').lengt
     />
   </PageHeader>
 
-  <InfoNote>One-click fixes arrive in v0.2. For now each check tells you what it means and how to fix it by hand.</InfoNote>
+  <InfoNote>One-click fixes go through NexaCloud's change pipeline: you see exactly what changes, files are snapshotted first, and anything that fails is reverted automatically. The other checks tell you how to fix them by hand for now.</InfoNote>
+
+  <section class="card fix" aria-labelledby="fix-nginx-h">
+    <div class="check" style="border-bottom: 0">
+      <div class="check-icon info" aria-hidden="true"><AppIcon name="security" :size="16" :stroke="2.2" /></div>
+      <div class="grow stack" style="gap: 10px">
+        <div class="row wrap" style="gap: 10px; justify-content: space-between">
+          <div class="stack" style="gap: 2px">
+            <span class="lbl">One-click fix</span>
+            <h2 id="fix-nginx-h" class="check-title">Hide nginx version</h2>
+          </div>
+          <StatusPill v-if="fixPill" v-bind="fixPill" />
+        </div>
+        <p class="text-2 check-why">
+          nginx prints its version number in error pages and the <span class="mono">Server</span> header, which helps attackers look up known holes.
+          This adds <span class="mono">server_tokens off;</span> in NexaCloud's own drop-in file
+          (<span class="mono">/etc/nginx/conf.d/zz-nexacloud.conf</span>); your config files are not edited.
+        </p>
+
+        <div v-if="fix.step === 'idle' || fix.step === 'previewing'" class="row wrap" style="gap: 10px">
+          <button type="button" class="btn btn-s" :disabled="fix.step === 'previewing'" @click="previewFix">
+            <span v-if="fix.step === 'previewing'" class="spinner" aria-hidden="true" />
+            Preview
+          </button>
+          <span class="small muted">Shows exactly what would change. Nothing is applied yet.</span>
+        </div>
+
+        <ChangePreview
+          v-if="(fix.step === 'preview' || fix.step === 'applying') && fix.preview"
+          :preview="fix.preview"
+          :applying="fix.step === 'applying'"
+          apply-label="Apply"
+          @apply="applyFix"
+          @cancel="resetFix"
+        />
+        <div v-if="fix.step === 'preview' && fix.preview?.nothing_to_do">
+          <button type="button" class="btn btn-s btn-ghost" @click="resetFix">Close</button>
+        </div>
+
+        <div v-if="fix.step === 'running' && fix.started" class="stack" style="gap: 10px">
+          <div class="progress" role="progressbar" aria-label="Applying change" aria-busy="true"><span /></div>
+          <JobLog :job-id="fix.started.job_id" status="running" @finished="onFixFinished" />
+        </div>
+
+        <div v-if="fix.step === 'result' && fix.result" class="stack fix-result" style="gap: 8px">
+          <div class="progress" :class="fix.result.status === 'applied' ? 'done' : 'failed'"><span /></div>
+          <p v-if="fix.result.status === 'applied'" style="color: var(--ok)">
+            Done. nginx no longer shows its version.
+          </p>
+          <p v-else-if="fix.result.status === 'reverted'" style="color: var(--warn)">
+            The change did not pass its checks and was reverted automatically: {{ fix.result.error }}
+          </p>
+          <p v-else style="color: var(--bad)">{{ fix.result.error ?? 'The change did not apply.' }}</p>
+          <div class="row wrap" style="gap: 12px">
+            <NuxtLink v-if="fix.result.can_rollback" :to="`/activity?open=${fix.result.id}`" class="btn btn-s">
+              <AppIcon name="undo" :size="14" :stroke="2" /> Rollback
+            </NuxtLink>
+            <NuxtLink :to="`/activity?open=${fix.result.id}`" class="small">View in Activity</NuxtLink>
+            <button type="button" class="btn btn-s btn-ghost" @click="resetFix">Close</button>
+          </div>
+        </div>
+
+        <p v-if="fix.error" class="small" style="color: var(--bad)" role="alert">{{ fix.error }}</p>
+      </div>
+    </div>
+  </section>
 
   <div v-if="sec.loading.value" class="card card-pad"><SkeletonRows :rows="6" label="Loading security checks" /></div>
   <ErrorBox
@@ -111,4 +239,5 @@ const okCount = computed(() => checks.value.filter((c) => c.tone === 'ok').lengt
 .check-why { font-size: 13px; line-height: 1.5; max-width: 72ch; }
 .rules { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
 .rules .logbox { max-height: 240px; }
+.fix { border-color: #24405A; }
 </style>

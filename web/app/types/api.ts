@@ -1,4 +1,4 @@
-// Types for the NexaCloud agent API (docs/API.md, v0.1).
+// Types for the NexaCloud agent API (docs/API.md, v0.2).
 // Fields the agent may report as unknown are typed nullable on purpose.
 
 export interface Health {
@@ -117,7 +117,7 @@ export interface Backup {
   created_at: string
 }
 
-export type JobStatus = 'queued' | 'running' | 'ok' | 'failed'
+export type JobStatus = 'queued' | 'running' | 'ok' | 'failed' | 'cancelled' | 'interrupted'
 
 export interface Job {
   id: string
@@ -125,8 +125,108 @@ export interface Job {
   title: string
   status: JobStatus
   log: string
+  created_at: string
+  /** When it started running (null while queued). */
   started_at: string | null
   finished_at: string | null
+  heavy: boolean
+  locks: string[]
+  timeout_secs: number | null
+  /** Whether it can be cancelled while running. */
+  cancellable: boolean
+  error: string | null
+  change_id: string | null
+  actor_ip: string | null
+}
+
+export interface Me {
+  ok: boolean
+  sudo_until: string | null
+}
+
+export type ChangeStatus =
+  | 'pending' | 'applying' | 'applied' | 'failed' | 'reverted'
+  | 'revert_failed' | 'rolled_back' | 'interrupted' | 'cancelled'
+
+export interface FilePreview {
+  path: string
+  action: 'create' | 'modify' | 'delete' | 'permissions'
+  diff: string
+  mode: string | null
+  owner: string | null
+  old_sha256: string | null
+  new_sha256: string | null
+}
+
+export type VerifyStep =
+  | { kind: 'command'; argv: string[]; timeout_secs: number }
+  | { kind: 'http'; url: string; expect_status: number; timeout_secs: number }
+
+export interface VerifyResult {
+  step: string
+  ok: boolean
+  detail: string
+}
+
+/** Response of an advisor `.../preview` endpoint. */
+export interface ChangePreviewData {
+  kind: string
+  title: string
+  target: string
+  nothing_to_do: boolean
+  note: string | null
+  plan_hash: string
+  locks: string[]
+  files: FilePreview[]
+  commands: string[][]
+  verify: VerifyStep[]
+  on_revert: string[][]
+}
+
+export interface ChangeSummary {
+  id: string
+  kind: string
+  title: string
+  target: string
+  status: ChangeStatus
+  created_at: string
+  finished_at: string | null
+  error: string | null
+  job_id: string | null
+  actor_ip: string | null
+  rollback_of: string | null
+  rolled_back_by: string | null
+  plan_hash: string
+  files_count: number
+  commands_count: number
+  can_rollback: boolean
+}
+
+export interface ChangeDetail extends ChangeSummary {
+  note: string | null
+  files: FilePreview[]
+  commands: string[][]
+  verify: VerifyStep[]
+  on_revert: string[][]
+  verify_results: VerifyResult[]
+}
+
+/** Response of apply / rollback endpoints. */
+export interface ChangeStarted {
+  change_id: string
+  job_id: string
+}
+
+export interface AuditEntry {
+  id: number
+  ts: string
+  ip: string | null
+  action: string
+  target: string | null
+  change_id: string | null
+  job_id: string | null
+  plan_hash: string | null
+  result: string
 }
 
 export interface SecurityInfo {

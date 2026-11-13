@@ -1,8 +1,13 @@
 //! NexaCloud agent: manages a VPS hosting Laravel and plain-PHP sites.
 
+mod advisor;
 mod alerts;
+mod audit;
 mod auth;
+mod changes;
+mod cli;
 mod config;
+mod db;
 mod error;
 mod jobs;
 mod nginx;
@@ -45,6 +50,26 @@ enum Command {
         #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
         config: PathBuf,
     },
+    /// Undo an applied change by restoring its snapshot (works with the
+    /// service stopped).
+    Rollback {
+        #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
+        config: PathBuf,
+        /// Roll back the most recent applied change.
+        #[arg(long, conflicts_with = "change_id")]
+        last: bool,
+        /// Overwrite files that were edited after the change was applied.
+        #[arg(long)]
+        force: bool,
+        /// Change id (see the Activity page).
+        change_id: Option<String>,
+    },
+    /// Check config permissions, state database, nginx, disk space and the
+    /// service; exits 1 when something is wrong.
+    Doctor {
+        #[arg(long, default_value = DEFAULT_CONFIG_PATH)]
+        config: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -53,6 +78,13 @@ fn main() -> ExitCode {
         Command::Serve { config } => serve(config),
         Command::Init { config } => init(config),
         Command::ResetPassword { config } => reset_password(config),
+        Command::Rollback {
+            config,
+            last,
+            force,
+            change_id,
+        } => cli::rollback(&config, change_id, last, force),
+        Command::Doctor { config } => return cli::doctor(&config),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -138,19 +170,28 @@ async fn run(cfg: Config) -> Result<()> {
         None
     };
 
-    let state = AppState::new(cfg);
+    let state = AppState::new(cfg)?;
+    // Startup sweep (serve only — the CLI opens the same database while the
+    // service may be running): work owned by a previous process will never
+    // finish.
+    let jobs = state.jobs.mark_interrupted_at_startup()?;
+    let chg = changes::mark_interrupted_at_startup(&state.db)?;
+    if jobs + chg > 0 {
+        tracing::warn!("marked {jobs} job(s) and {chg} change(s) as interrupted");
+    }
     routes::system::CpuSampler::spawn(state.clone());
     let app = routes::router(state.clone()).into_make_service_with_connect_info::<SocketAddr>();
 
     let handle: axum_server::Handle<SocketAddr> = axum_server::Handle::new();
-    tokio::spawn(shutdown_on_signal(handle.clone()));
+    tokio::spawn(shutdown_on_signal(handle.clone(), state.clone()));
 
     tracing::info!(
-        "nexacloud {} listening on {}://{addr} (web_dir {}, backup_dir {})",
+        "nexacloud {} listening on {}://{addr} (web_dir {}, backup_dir {}, data_dir {})",
         env!("CARGO_PKG_VERSION"),
         if tls.is_some() { "https" } else { "http" },
         state.config.web_dir.display(),
         state.config.backup_dir.display(),
+        state.config.data_dir.display(),
     );
     match tls {
         Some(tls) => {
@@ -166,7 +207,7 @@ async fn run(cfg: Config) -> Result<()> {
     Ok(())
 }
 
-async fn shutdown_on_signal(handle: axum_server::Handle<SocketAddr>) {
+async fn shutdown_on_signal(handle: axum_server::Handle<SocketAddr>, state: AppState) {
     let ctrl_c = tokio::signal::ctrl_c();
     let term = async {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
@@ -181,5 +222,6 @@ async fn shutdown_on_signal(handle: axum_server::Handle<SocketAddr>) {
         _ = term => {},
     }
     tracing::info!("shutting down");
+    state.jobs.begin_shutdown();
     handle.graceful_shutdown(Some(Duration::from_secs(10)));
 }

@@ -1,14 +1,17 @@
 pub mod backups;
+pub mod changes;
 pub mod databases;
+pub mod jobs;
 pub mod php;
 pub mod security;
 pub mod services;
 pub mod sites;
 pub mod system;
+pub mod test_hooks;
 
 use std::path::Path;
 
-use axum::extract::{Path as UrlPath, Request, State};
+use axum::extract::Request;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
@@ -20,9 +23,9 @@ use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
 use crate::alerts::{self, Alert, SiteSsl};
+use crate::audit;
 use crate::auth;
-use crate::error::{json_errors, ApiError, ApiResult};
-use crate::jobs::Job;
+use crate::error::{json_errors, ApiError};
 use crate::state::AppState;
 
 pub fn router(state: AppState) -> Router {
@@ -30,22 +33,49 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/auth/login", post(auth::login));
 
+    // Dangerous actions: need sudo mode (password re-entered < 15 min ago).
+    // Later phases add their mutating endpoints here.
+    let mut dangerous = Router::new()
+        .route("/services/{unit}/restart", post(services::restart))
+        .route("/jobs/{id}/cancel", post(jobs::cancel))
+        .route("/changes/{id}/rollback", post(changes::rollback))
+        .route(
+            "/advisor/nginx-hardening/apply",
+            post(changes::nginx_hardening_apply),
+        );
+    if state.test_hooks {
+        tracing::warn!("NEXACLOUD_TEST_HOOKS=1: test-only endpoints are enabled");
+        dangerous = dangerous
+            .route("/test-hooks/broken-change", post(test_hooks::broken_change))
+            .route("/test-hooks/sleep-job", post(test_hooks::sleep_job));
+    }
+    let dangerous = dangerous.route_layer(from_fn_with_state(state.clone(), auth::require_sudo));
+
     let protected = Router::new()
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
+        .route("/auth/sudo", post(auth::sudo))
         .route("/overview", get(overview))
         .route("/system", get(system::get))
         .route("/services", get(services::list))
-        .route("/services/{unit}/restart", post(services::restart))
         .route("/php", get(php::get))
         .route("/sites", get(sites::list))
         .route("/databases", get(databases::list))
         .route("/databases/{engine}/{name}/backup", post(databases::backup))
         .route("/backups", get(backups::list))
         .route("/backups/download", get(backups::download))
-        .route("/jobs", get(jobs_list))
-        .route("/jobs/{id}", get(job_get))
+        .route("/jobs", get(jobs::list))
+        .route("/jobs/{id}", get(jobs::get))
+        .route("/jobs/{id}/stream", get(jobs::stream))
+        .route("/changes", get(changes::list))
+        .route("/changes/{id}", get(changes::get))
+        .route(
+            "/advisor/nginx-hardening/preview",
+            post(changes::nginx_hardening_preview),
+        )
+        .route("/audit", get(changes::audit_list))
         .route("/security", get(security::get))
+        .merge(dangerous)
         .route_layer(from_fn_with_state(state.clone(), auth::require_session));
 
     let api = public
@@ -53,7 +83,8 @@ pub fn router(state: AppState) -> Router {
         .fallback(api_not_found)
         .layer(from_fn(auth::origin_check))
         .layer(from_fn(json_errors))
-        .layer(from_fn(no_store));
+        .layer(from_fn(no_store))
+        .layer(from_fn_with_state(state.clone(), audit::middleware));
 
     let web_dir = state.config.web_dir.clone();
     let app = Router::new().nest("/api", api);
@@ -113,23 +144,6 @@ async fn security_headers(req: Request, next: Next) -> Response {
 
 async fn health() -> Json<Value> {
     Json(json!({"ok": true, "version": env!("CARGO_PKG_VERSION")}))
-}
-
-// ------------------------------------------------------------------ jobs
-
-async fn jobs_list(State(state): State<AppState>) -> Json<Vec<Job>> {
-    Json(state.jobs.list())
-}
-
-async fn job_get(
-    State(state): State<AppState>,
-    UrlPath(id): UrlPath<String>,
-) -> ApiResult<Json<Job>> {
-    state
-        .jobs
-        .get(&id)
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found("job not found"))
 }
 
 // -------------------------------------------------------------- overview

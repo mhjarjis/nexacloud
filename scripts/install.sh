@@ -5,15 +5,16 @@
 #
 # Options (pass after `bash -s --` when piping):
 #   --version vX.Y.Z   install a specific release instead of the latest
-#   --uninstall        remove the agent (keeps /etc/nexacloud and backups)
-#   --purge            with --uninstall: also delete /etc/nexacloud
+#   --uninstall        remove the agent (keeps /etc/nexacloud, /var/lib/nexacloud and backups)
+#   --purge            with --uninstall: also delete /etc/nexacloud and /var/lib/nexacloud
 #
 # Environment:
 #   NEXACLOUD_TARBALL=/path/file.tar.gz   install from a local tarball (CI / offline)
 #   NEXACLOUD_REPO=owner/repo             download releases from another repo
 #
 # What it touches (and nothing else): /opt/nexacloud, /etc/nexacloud,
-# /var/backups/nexacloud, /usr/local/bin/nexacloud, /etc/systemd/system/nexacloud.service
+# /var/lib/nexacloud (state, job logs, change snapshots), /var/backups/nexacloud,
+# /usr/local/bin/nexacloud, /etc/systemd/system/nexacloud.service
 
 set -euo pipefail
 
@@ -24,6 +25,7 @@ ASSET="nexacloud-x86_64-linux.tar.gz"
 PREFIX="/opt/nexacloud"
 CONF_DIR="/etc/nexacloud"
 CONF="$CONF_DIR/config.toml"
+DATA_DIR="/var/lib/nexacloud"
 UNIT="/etc/systemd/system/nexacloud.service"
 UNINSTALL=0
 PURGE=0
@@ -42,7 +44,7 @@ while [ $# -gt 0 ]; do
     --version) NC_VERSION="${2:?--version needs a value}"; shift 2 ;;
     --uninstall) UNINSTALL=1; shift ;;
     --purge) PURGE=1; shift ;;
-    -h|--help) sed -n '2,17p' "$0" 2>/dev/null || true; exit 0 ;;
+    -h|--help) sed -n '2,18p' "$0" 2>/dev/null || true; exit 0 ;;
     *) die "unknown option: $1" ;;
   esac
 done
@@ -58,10 +60,10 @@ if [ "$UNINSTALL" -eq 1 ]; then
   systemctl daemon-reload
   rm -rf "$PREFIX"
   if [ "$PURGE" -eq 1 ]; then
-    rm -rf "$CONF_DIR"
-    say "Removed $CONF_DIR"
+    rm -rf "$CONF_DIR" "$DATA_DIR"
+    say "Removed $CONF_DIR and $DATA_DIR"
   else
-    say "Kept $CONF_DIR (use --purge to delete it)"
+    say "Kept $CONF_DIR and $DATA_DIR (change history and rollback snapshots; use --purge to delete them)"
   fi
   say "Kept /var/backups/nexacloud (your database backups)"
   say "NexaCloud removed. Your sites, nginx and PHP were not touched."
@@ -137,6 +139,7 @@ rm -rf "$PREFIX/web"
 mv "$PREFIX/web.new" "$PREFIX/web"
 ln -sf "$PREFIX/bin/nexacloud" /usr/local/bin/nexacloud
 install -d -m 0700 "$CONF_DIR"
+install -d -m 0700 "$DATA_DIR"
 
 init_out="$("$PREFIX/bin/nexacloud" init --config "$CONF")"
 password="$(printf '%s\n' "$init_out" | sed -n 's/^NEXACLOUD_ADMIN_PASSWORD=//p')"
@@ -155,6 +158,9 @@ StartLimitBurst=20
 ExecStart=$PREFIX/bin/nexacloud serve --config $CONF
 Restart=on-failure
 RestartSec=3
+# stop: SIGTERM only the agent first, so it can record running jobs as
+# interrupted; leftover job processes are killed afterwards
+KillMode=mixed
 Environment=RUST_LOG=info
 Environment=HOME=/root
 

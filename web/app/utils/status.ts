@@ -1,5 +1,5 @@
 // Map raw API fields to labels and pill tones. Auto-imported from app/utils.
-import type { AlertLevel, Job, PhpVersion, Service, Site, SiteKind, Tone } from '~/types/api'
+import type { AlertLevel, ChangeStatus, Job, PhpVersion, Service, Site, SiteKind, Tone } from '~/types/api'
 
 export interface Status {
   tone: Tone
@@ -48,12 +48,38 @@ export function jobStatus(status: Job['status']): Status {
     case 'running': return { tone: 'info', label: 'Running' }
     case 'ok': return { tone: 'ok', label: 'Done' }
     case 'failed': return { tone: 'bad', label: 'Failed' }
+    case 'cancelled': return { tone: 'off', label: 'Cancelled' }
+    case 'interrupted': return { tone: 'warn', label: 'Interrupted' }
     default: return { tone: 'off', label: String(status) }
   }
 }
 
 export function isJobFinished(status: Job['status']): boolean {
-  return status === 'ok' || status === 'failed'
+  return status !== 'queued' && status !== 'running'
+}
+
+export function changeStatus(status: ChangeStatus): Status {
+  switch (status) {
+    case 'pending': return { tone: 'off', label: 'Queued' }
+    case 'applying': return { tone: 'info', label: 'Applying' }
+    case 'applied': return { tone: 'ok', label: 'Applied' }
+    case 'failed': return { tone: 'bad', label: 'Failed' }
+    case 'reverted': return { tone: 'warn', label: 'Reverted' }
+    case 'revert_failed': return { tone: 'bad', label: 'Revert failed' }
+    case 'rolled_back': return { tone: 'off', label: 'Rolled back' }
+    case 'interrupted': return { tone: 'warn', label: 'Interrupted' }
+    case 'cancelled': return { tone: 'off', label: 'Cancelled' }
+    default: return { tone: 'off', label: String(status) }
+  }
+}
+
+export function isChangeFinished(status: ChangeStatus): boolean {
+  return status !== 'pending' && status !== 'applying'
+}
+
+/** `["nginx", "-t"]` → `nginx -t` (args with spaces quoted). */
+export function displayArgv(argv: string[]): string {
+  return argv.map((a) => (a === '' || /[\s']/.test(a) ? `'${a.replace(/'/g, `'\\''`)}'` : a)).join(' ')
 }
 
 export interface PhpSupport extends Status {

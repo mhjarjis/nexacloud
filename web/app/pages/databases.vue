@@ -102,7 +102,7 @@ function toggleLog(id: string) {
 function progressClass(job: Job | null): string {
   if (!job) return ''
   if (job.status === 'ok') return 'done'
-  if (job.status === 'failed') return 'failed'
+  if (job.status === 'failed' || job.status === 'cancelled' || job.status === 'interrupted') return 'failed'
   return ''
 }
 </script>
@@ -159,6 +159,8 @@ function progressClass(job: Job | null): string {
       <p v-if="w.lost" class="small" style="color: var(--warn)">{{ w.lost }}</p>
       <p v-else-if="w.job?.status === 'ok'" class="small" style="color: var(--ok)">Backup finished. It's in the list below.</p>
       <p v-else-if="w.job?.status === 'failed'" class="small" style="color: var(--bad)">Backup failed. Show the output for details.</p>
+      <p v-else-if="w.job?.status === 'cancelled'" class="small muted">Backup cancelled.</p>
+      <p v-else-if="w.job?.status === 'interrupted'" class="small" style="color: var(--warn)">The agent restarted before this backup finished. Start it again.</p>
       <pre v-if="w.job?.log && openLogs.has(w.id)" class="logbox">{{ w.job.log }}</pre>
     </div>
   </section>

@@ -16,6 +16,10 @@ pub struct ApiError {
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
+/// Response extension carrying an error's message (read by the audit log).
+#[derive(Debug, Clone)]
+pub struct ErrorText(pub String);
+
 impl ApiError {
     pub fn new(status: StatusCode, message: impl Into<String>) -> Self {
         ApiError {
@@ -32,11 +36,21 @@ impl ApiError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
     }
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, message)
+    }
+    /// `403 {"error":"sudo_required"}`: re-enter the password via
+    /// `POST /api/auth/sudo`, then retry.
+    pub fn sudo_required() -> Self {
+        Self::new(StatusCode::FORBIDDEN, "sudo_required")
+    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
+        let mut r = (self.status, Json(json!({ "error": self.message }))).into_response();
+        r.extensions_mut().insert(ErrorText(self.message));
+        r
     }
 }
 

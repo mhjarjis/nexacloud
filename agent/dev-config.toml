@@ -5,3 +5,5 @@ web_dir = "../web/.output/public"
 backup_dir = "./dev-backups"
 admin_password_hash = "$argon2id$v=19$m=19456,t=2,p=1$yX2hTNdLAU4pD0KuYhFmEw$gCKoblKUIuGbUqh8V32Onjd9ducsywueDc26vVb3iLc"
 tls = false
+data_dir = "./dev-data"
+state_db = "./dev-state.db"

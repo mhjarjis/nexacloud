@@ -1,5 +1,6 @@
 // Single entry point for talking to the NexaCloud agent.
-// Every request sends the session cookie; a 401 sends the user to /login.
+// Every request sends the session cookie; a 401 sends the user to /login;
+// a 403 `sudo_required` asks for the password (<SudoPrompt>) and retries.
 
 export class ApiError extends Error {
   status: number
@@ -15,6 +16,8 @@ interface RequestOptions {
   body?: Record<string, unknown>
   /** Don't redirect to /login on 401 (used by the login form itself). */
   allowUnauthorized?: boolean
+  /** Internal: the retry after sudo; never prompt twice for one call. */
+  sudoRetried?: boolean
 }
 
 /** Whether the current browser session is signed in (null = not checked yet). */
@@ -23,6 +26,7 @@ export const useAuthState = () => useState<boolean | null>('nc-authed', () => nu
 let redirecting = false
 
 export function errorMessage(err: unknown): string {
+  if (err instanceof SudoCancelled) return err.message
   if (err instanceof ApiError) return err.message
   if (err instanceof Error) return err.message
   return 'Something went wrong'
@@ -31,6 +35,7 @@ export function errorMessage(err: unknown): string {
 export function useApi() {
   const authed = useAuthState()
   const router = useRouter()
+  const sudo = useSudo()
 
   async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
     try {
@@ -47,6 +52,12 @@ export function useApi() {
       const serverMsg = data && typeof data.error === 'string' ? data.error : null
       const message = serverMsg
         ?? (status ? `Request failed (HTTP ${status})` : 'Could not reach the NexaCloud agent')
+
+      if (status === 403 && serverMsg === 'sudo_required' && !opts.sudoRetried) {
+        // Throws SudoCancelled if the person dismisses the prompt.
+        await sudo.requestSudo()
+        return request<T>(path, { ...opts, sudoRetried: true })
+      }
 
       if (status === 401 && !opts.allowUnauthorized) {
         authed.value = false

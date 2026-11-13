@@ -4,16 +4,21 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use axum::extract::{Path as UrlPath, State};
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, Path as UrlPath, State};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::Utc;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+use crate::audit::{audited, AuditInfo};
 use crate::error::{ApiError, ApiResult};
+use crate::jobs::{JobCtx, JobSpec};
 use crate::state::AppState;
-use crate::util::cmd::{Cmd, CmdOutput};
+use crate::util::cmd::{Cmd, CmdOutput, ProcessGroupGuard};
 use crate::util::{create_private_dir, is_valid_db_name};
 
 pub const BACKUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -271,11 +276,32 @@ pub fn validate_backup_params(engine: &str, name: &str) -> Result<Engine, ApiErr
     Ok(engine)
 }
 
+/// `POST /api/databases/{engine}/{name}/backup` → `{"job_id"}`. Runs as a
+/// heavy job (one dump at a time) holding the `db:<engine>/<name>` lock.
 pub async fn backup(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     UrlPath((engine, name)): UrlPath<(String, String)>,
-) -> ApiResult<Json<Value>> {
-    let engine = validate_backup_params(&engine, &name)?;
+) -> Response {
+    let mut info = AuditInfo::action("db.backup", format!("{engine}/{name}"));
+    let res = backup_inner(&state, addr, &engine, &name).await;
+    if let Ok(id) = &res {
+        info.job_id = Some(id.clone());
+    }
+    audited(
+        res.map(|id| Json(json!({ "job_id": id })).into_response())
+            .unwrap_or_else(IntoResponse::into_response),
+        info,
+    )
+}
+
+async fn backup_inner(
+    state: &AppState,
+    addr: SocketAddr,
+    engine: &str,
+    name: &str,
+) -> ApiResult<String> {
+    let engine = validate_backup_params(engine, name)?;
     let listing = match engine {
         Engine::Mysql => mysql_info().await,
         Engine::Postgres => postgres_info().await,
@@ -290,24 +316,36 @@ pub async fn backup(
         return Err(ApiError::not_found(format!("database not found: {name}")));
     }
     let title = format!("Back up {}/{}", engine.as_str(), name);
-    let job_id = state.jobs.create("db_backup", &title);
+    let spec = JobSpec::new("db_backup", &title)
+        .heavy()
+        .lock(format!("db:{}/{name}", engine.as_str()))
+        .timeout(BACKUP_TIMEOUT)
+        .actor(Some(addr.ip().to_canonical().to_string()));
     let st = state.clone();
-    let id = job_id.clone();
-    tokio::spawn(async move {
-        st.jobs.set_running(&id);
-        let ok = match run_backup(&st, &id, engine, &name).await {
-            Ok(()) => true,
-            Err(e) => {
-                st.jobs.log(&id, &format!("FAILED: {e:#}"));
-                false
-            }
-        };
-        st.jobs.finish(&id, ok);
-    });
-    Ok(Json(json!({ "job_id": job_id })))
+    let name = name.to_string();
+    let id = state.jobs.submit(spec, move |ctx| async move {
+        run_backup(&st, &ctx, engine, &name).await
+    })?;
+    Ok(id)
 }
 
-async fn run_backup(state: &AppState, job: &str, engine: Engine, name: &str) -> anyhow::Result<()> {
+/// Removes the partial dump file unless the backup completed.
+struct PartialFile(Option<PathBuf>);
+
+impl Drop for PartialFile {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+async fn run_backup(
+    state: &AppState,
+    job: &JobCtx,
+    engine: Engine,
+    name: &str,
+) -> anyhow::Result<()> {
     use anyhow::Context;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -325,25 +363,18 @@ async fn run_backup(state: &AppState, job: &str, engine: Engine, name: &str) -> 
         .mode(0o600)
         .open(&tmp_path)
         .with_context(|| format!("creating {}", tmp_path.display()))?;
+    // Cleans up on failure, timeout or cancel (the future is dropped).
+    let mut partial = PartialFile(Some(tmp_path.clone()));
 
-    state
-        .jobs
-        .log(job, &format!("Dumping {} database {name}", engine.as_str()));
-    let result = dump_pipeline(state, job, engine, name, file).await;
-    match result {
-        Ok(()) => {
-            std::fs::rename(&tmp_path, &final_path)
-                .with_context(|| format!("renaming to {}", final_path.display()))?;
-            let size = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
-            let rel = relative(&backup_dir, &final_path);
-            state.jobs.log(job, &format!("Wrote {rel} ({size} bytes)"));
-            Ok(())
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp_path);
-            Err(e)
-        }
-    }
+    job.log(&format!("Dumping {} database {name}", engine.as_str()));
+    dump_pipeline(job, engine, name, file).await?;
+    std::fs::rename(&tmp_path, &final_path)
+        .with_context(|| format!("renaming to {}", final_path.display()))?;
+    partial.0 = None;
+    let size = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
+    let rel = relative(&backup_dir, &final_path);
+    job.log(&format!("Wrote {rel} ({size} bytes)"));
+    Ok(())
 }
 
 fn relative(base: &Path, p: &Path) -> String {
@@ -354,10 +385,11 @@ fn relative(base: &Path, p: &Path) -> String {
         .into_owned()
 }
 
-/// `<dump> | gzip -c > file`, wired process-to-process (no shell).
+/// `<dump> | gzip -c > file`, wired process-to-process (no shell). Both
+/// processes share one process group, killed if this future is dropped
+/// (job cancelled or timed out).
 async fn dump_pipeline(
-    state: &AppState,
-    job: &str,
+    job: &JobCtx,
     engine: Engine,
     name: &str,
     file: std::fs::File,
@@ -365,10 +397,15 @@ async fn dump_pipeline(
     use anyhow::{anyhow, bail};
 
     let mut dump_cmd = engine.dump_command(name).command();
-    dump_cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    dump_cmd
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut dump = dump_cmd
         .spawn()
         .map_err(|e| anyhow!("cannot start {} dump: {e}", engine.as_str()))?;
+    let mut group = ProcessGroupGuard::new(dump.id());
+    let pgid = dump.id().and_then(|p| i32::try_from(p).ok()).unwrap_or(0);
     let dump_out: Stdio = dump
         .stdout
         .take()
@@ -377,47 +414,32 @@ async fn dump_pipeline(
         .map_err(|e| anyhow!("pipe: {e}"))?;
     let mut gz_cmd = Cmd::new("gzip").arg("-c").command();
     gz_cmd
+        .process_group(pgid)
         .stdin(dump_out)
         .stdout(Stdio::from(file))
         .stderr(Stdio::null());
-    let mut gzip = match gz_cmd.spawn() {
-        Ok(g) => g,
-        Err(e) => {
-            let _ = dump.kill().await;
-            bail!("cannot start gzip: {e}");
-        }
-    };
+    let mut gzip = gz_cmd
+        .spawn()
+        .map_err(|e| anyhow!("cannot start gzip: {e}"))?;
 
     // Stream dump stderr into the job log.
     let stderr_task = dump.stderr.take().map(|err| {
-        let st = state.clone();
-        let job = job.to_string();
+        let log = job.log.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(err).lines();
             let mut n = 0;
             while let Ok(Some(line)) = lines.next_line().await {
                 if n < 200 {
-                    st.jobs.log(&job, &line);
+                    log.line(&line);
                 }
                 n += 1;
             }
         })
     });
 
-    let waited = tokio::time::timeout(BACKUP_TIMEOUT, async {
-        let d = dump.wait().await;
-        let g = gzip.wait().await;
-        (d, g)
-    })
-    .await;
-    let (d, g) = match waited {
-        Ok(x) => x,
-        Err(_) => {
-            let _ = dump.kill().await;
-            let _ = gzip.kill().await;
-            bail!("timed out after {} minutes", BACKUP_TIMEOUT.as_secs() / 60);
-        }
-    };
+    let d = dump.wait().await;
+    let g = gzip.wait().await;
+    group.disarm();
     if let Some(t) = stderr_task {
         let _ = tokio::time::timeout(Duration::from_secs(5), t).await;
     }
@@ -502,6 +524,7 @@ mod explain_tests {
             timed_out: false,
             stdout: String::new(),
             stderr: stderr.into(),
+            ..Default::default()
         }
     }
 

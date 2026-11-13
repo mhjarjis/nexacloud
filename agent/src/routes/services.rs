@@ -189,7 +189,19 @@ pub async fn list() -> Json<Vec<ServiceStatus>> {
     Json(statuses(true).await)
 }
 
-pub async fn restart(Path(unit): Path<String>) -> ApiResult<Json<Value>> {
+/// `POST /api/services/{unit}/restart` (sudo).
+pub async fn restart(Path(unit): Path<String>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let info = crate::audit::AuditInfo::action("service.restart", unit.clone());
+    let res = restart_inner(unit).await;
+    crate::audit::audited(
+        res.map(IntoResponse::into_response)
+            .unwrap_or_else(IntoResponse::into_response),
+        info,
+    )
+}
+
+async fn restart_inner(unit: String) -> ApiResult<Json<Value>> {
     let known = known_units();
     if !is_known_unit(&unit, &known) {
         return Err(ApiError::bad_request(format!("unknown service: {unit}")));

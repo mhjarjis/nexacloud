@@ -46,7 +46,8 @@ async function restart(s: Service) {
     results.value = { ...results.value, [s.unit]: { ok: true, message: `${s.label} restarted.` } }
     await services.refresh()
   } catch (err) {
-    results.value = { ...results.value, [s.unit]: { ok: false, message: `Restart failed: ${errorMessage(err)}` } }
+    const message = err instanceof SudoCancelled ? 'Not restarted: password not confirmed.' : `Restart failed: ${errorMessage(err)}`
+    results.value = { ...results.value, [s.unit]: { ok: false, message } }
   } finally {
     busy.value = { ...busy.value, [s.unit]: false }
   }
@@ -79,7 +80,7 @@ async function restart(s: Service) {
             <div class="svc-badge" :style="{ color: tint(s.unit) }" aria-hidden="true">{{ abbr(s) }}</div>
             <div class="grow cell-stack">
               <span class="svc-name">{{ s.label }}</span>
-              <span class="mono small muted">{{ s.unit }}<template v-if="s.version"> · {{ s.version }}</template></span>
+              <span class="mono small muted svc-meta" :title="s.version ? `${s.unit} · ${s.version}` : s.unit">{{ s.unit }}<template v-if="s.version"> · {{ s.version }}</template></span>
             </div>
             <StatusPill v-bind="serviceStatus(s)" />
           </div>
@@ -113,7 +114,7 @@ async function restart(s: Service) {
             <div class="svc-badge" aria-hidden="true">{{ abbr(s) }}</div>
             <div class="grow cell-stack">
               <span class="svc-name">{{ s.label }}</span>
-              <span class="mono small muted">{{ s.unit }}</span>
+              <span class="mono small muted svc-meta" :title="s.unit">{{ s.unit }}</span>
             </div>
             <StatusPill v-bind="serviceStatus(s)" />
           </div>
@@ -134,4 +135,6 @@ async function restart(s: Service) {
   font-family: var(--font-head); font-weight: 700; font-size: 13px; color: var(--muted); flex: none;
 }
 .svc-name { font-size: 15px; font-weight: 600; }
+/* unit · version stays on one line; long values end in an ellipsis */
+.svc-meta { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style>

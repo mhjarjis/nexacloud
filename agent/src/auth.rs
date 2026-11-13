@@ -13,12 +13,15 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use chrono::{DateTime, Utc};
 use rand::distr::{Alphanumeric, SampleString};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::audit::{audited, AuditInfo};
 use crate::error::ApiError;
 use crate::state::AppState;
+use crate::util::fmt_ts;
 
 pub const COOKIE_NAME: &str = "nc_session";
 pub const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
@@ -27,6 +30,8 @@ pub const THROTTLE_WINDOW: Duration = Duration::from_secs(15 * 60);
 pub const MAX_FAILURES: usize = 5;
 const FAILED_LOGIN_DELAY: Duration = Duration::from_millis(400);
 const MAX_PASSWORD_LEN: usize = 1024;
+/// How long `POST /api/auth/sudo` elevates a session.
+pub const SUDO_TTL: Duration = Duration::from_secs(15 * 60);
 
 // ---------------------------------------------------------------- passwords
 
@@ -64,9 +69,16 @@ pub fn generate_token() -> String {
 
 // ---------------------------------------------------------------- sessions
 
+struct Session {
+    expires: Instant,
+    /// Sudo mode: dangerous endpoints are allowed until this time.
+    sudo_until: Option<DateTime<Utc>>,
+}
+
+/// In-memory sessions (a restart signs everybody out).
 #[derive(Default)]
 pub struct Sessions {
-    map: Mutex<HashMap<String, Instant>>,
+    map: Mutex<HashMap<String, Session>>,
 }
 
 impl Sessions {
@@ -74,8 +86,14 @@ impl Sessions {
         let token = generate_token();
         let now = Instant::now();
         let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
-        m.retain(|_, exp| *exp > now);
-        m.insert(token.clone(), now + SESSION_TTL);
+        m.retain(|_, s| s.expires > now);
+        m.insert(
+            token.clone(),
+            Session {
+                expires: now + SESSION_TTL,
+                sudo_until: None,
+            },
+        );
         token
     }
 
@@ -83,7 +101,7 @@ impl Sessions {
         let now = Instant::now();
         let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
         match m.get(token) {
-            Some(exp) if *exp > now => true,
+            Some(s) if s.expires > now => true,
             Some(_) => {
                 m.remove(token);
                 false
@@ -97,6 +115,23 @@ impl Sessions {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(token);
+    }
+
+    /// Enter sudo mode for `SUDO_TTL` from `now`. None if the session is gone.
+    pub fn elevate(&self, token: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let s = m.get_mut(token)?;
+        let until = now + chrono::Duration::from_std(SUDO_TTL).unwrap_or_default();
+        s.sudo_until = Some(until);
+        Some(until)
+    }
+
+    /// When sudo mode ends, if it is active at `now`.
+    pub fn sudo_until(&self, token: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        m.get(token)
+            .and_then(|s| s.sudo_until)
+            .filter(|until| *until > now)
     }
 }
 
@@ -266,6 +301,22 @@ pub async fn require_session(
     }
 }
 
+/// Gate for dangerous endpoints (apply/rollback a change, restart a service,
+/// cancel a job…): `403 {"error":"sudo_required"}` unless the session entered
+/// sudo mode in the last 15 minutes. Mount with `route_layer` on the
+/// "dangerous" router; `require_session` must run first.
+pub async fn require_sudo(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let elevated = req
+        .extensions()
+        .get::<SessionToken>()
+        .and_then(|t| state.sessions.sudo_until(&t.0, Utc::now()))
+        .is_some();
+    if !elevated {
+        return ApiError::sudo_required().into_response();
+    }
+    next.run(req).await
+}
+
 // ---------------------------------------------------------------- handlers
 
 #[derive(Deserialize)]
@@ -278,21 +329,28 @@ pub async fn login(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     body: Bytes,
 ) -> Response {
-    let ip = addr.ip().to_canonical();
+    audited(
+        login_inner(state, addr, body).await,
+        AuditInfo::action("auth.login", "admin"),
+    )
+}
+
+/// Check a password with the login throttle (shared by login and sudo).
+/// Err is the response to send.
+async fn check_password(state: &AppState, ip: IpAddr, body: &[u8]) -> Result<(), ApiError> {
     if !state.throttle.begin_attempt(ip, Instant::now()) {
-        return ApiError::new(
+        return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many attempts, try again later",
-        )
-        .into_response();
+        ));
     }
-    let password = match serde_json::from_slice::<LoginBody>(&body) {
+    let password = match serde_json::from_slice::<LoginBody>(body) {
         Ok(b) => b.password,
         Err(_) => {
-            // Malformed body: don't count it as a password guess.
             state.throttle.cancel_attempt(ip);
-            return ApiError::bad_request("invalid request body: expected {\"password\": \"...\"}")
-                .into_response();
+            return Err(ApiError::bad_request(
+                "invalid request body: expected {\"password\": \"...\"}",
+            ));
         }
     };
     let hash = state.config.admin_password_hash.clone();
@@ -301,11 +359,47 @@ pub async fn login(
             .await
             .unwrap_or(false);
     if !ok {
-        tracing::warn!(%ip, "failed login");
         tokio::time::sleep(FAILED_LOGIN_DELAY).await;
-        return ApiError::new(StatusCode::UNAUTHORIZED, "wrong password").into_response();
+        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "wrong password"));
     }
     state.throttle.succeeded(ip);
+    Ok(())
+}
+
+/// `POST /api/auth/sudo {"password"}`: re-enter the password to unlock
+/// dangerous actions for 15 minutes. Wrong attempts count towards the login
+/// throttle.
+pub async fn sudo(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    axum::Extension(SessionToken(token)): axum::Extension<SessionToken>,
+    body: Bytes,
+) -> Response {
+    let ip = addr.ip().to_canonical();
+    let resp = match check_password(&state, ip, &body).await {
+        Err(e) => {
+            tracing::warn!(%ip, "failed sudo attempt");
+            e.into_response()
+        }
+        Ok(()) => match state.sessions.elevate(&token, Utc::now()) {
+            Some(until) => {
+                tracing::info!(%ip, "sudo mode on");
+                Json(json!({"ok": true, "sudo_until": fmt_ts(until)})).into_response()
+            }
+            None => ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+        },
+    };
+    audited(resp, AuditInfo::action("auth.sudo", "admin"))
+}
+
+async fn login_inner(state: AppState, addr: SocketAddr, body: Bytes) -> Response {
+    let ip = addr.ip().to_canonical();
+    if let Err(e) = check_password(&state, ip, &body).await {
+        if e.status == StatusCode::UNAUTHORIZED {
+            tracing::warn!(%ip, "failed login");
+        }
+        return e.into_response();
+    }
     let token = state.sessions.create();
     tracing::info!(%ip, "login");
     let mut resp = Json(json!({"ok": true})).into_response();
@@ -324,11 +418,16 @@ pub async fn logout(
     if let Ok(v) = HeaderValue::from_str(&clear_cookie(state.config.tls)) {
         resp.headers_mut().insert(header::SET_COOKIE, v);
     }
-    resp
+    audited(resp, AuditInfo::action("auth.logout", "admin"))
 }
 
-pub async fn me() -> Json<serde_json::Value> {
-    Json(json!({"ok": true}))
+/// `{"ok":true,"sudo_until":"<rfc3339>"|null}`
+pub async fn me(
+    State(state): State<AppState>,
+    axum::Extension(SessionToken(token)): axum::Extension<SessionToken>,
+) -> Json<serde_json::Value> {
+    let until = state.sessions.sudo_until(&token, Utc::now()).map(fmt_ts);
+    Json(json!({"ok": true, "sudo_until": until}))
 }
 
 #[cfg(test)]
@@ -391,6 +490,27 @@ mod tests {
         assert!(!s.is_valid("nope"));
         s.remove(&t);
         assert!(!s.is_valid(&t));
+    }
+
+    #[test]
+    fn sudo_mode_expires_after_15_minutes() {
+        let s = Sessions::default();
+        let t = s.create();
+        let now = Utc::now();
+        assert_eq!(s.sudo_until(&t, now), None);
+        let until = s.elevate(&t, now).unwrap();
+        assert_eq!(until - now, chrono::Duration::minutes(15));
+        assert_eq!(
+            s.sudo_until(&t, now + chrono::Duration::minutes(14)),
+            Some(until)
+        );
+        assert_eq!(s.sudo_until(&t, now + chrono::Duration::minutes(15)), None);
+        assert_eq!(s.sudo_until(&t, now + chrono::Duration::minutes(16)), None);
+        // Unknown / signed-out sessions can't be elevated.
+        assert!(s.elevate("nope", now).is_none());
+        s.remove(&t);
+        assert!(s.elevate(&t, now).is_none());
+        assert_eq!(s.sudo_until(&t, now), None);
     }
 
     #[test]

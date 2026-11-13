@@ -1,10 +1,18 @@
 //! Running external commands safely: argument arrays only (never a shell),
 //! stdin closed, a hard timeout, and the child killed if we stop waiting.
+//!
+//! Two ways to run:
+//! - [`Cmd::run`] collects stdout/stderr (short status queries).
+//! - [`Cmd::run_streaming`] puts the command in its own process group, writes
+//!   every stdout/stderr line to a [`LineSink`] (a job log) as it arrives, and
+//!   kills the whole group on timeout or when the future is dropped (job
+//!   cancelled). Use it for anything long-running or that a person watches.
 
 use std::io::ErrorKind;
 use std::process::Stdio;
 use std::time::Duration;
 
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 
 /// Default timeout for external commands.
@@ -18,6 +26,8 @@ pub struct CmdOutput {
     pub missing: bool,
     /// We gave up waiting and killed it.
     pub timed_out: bool,
+    /// Exit code when the process exited normally (None: killed / not started).
+    pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
 }
@@ -141,6 +151,7 @@ impl Cmd {
                 ok: out.status.success(),
                 missing: false,
                 timed_out: false,
+                exit_code: out.status.code(),
                 stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             },
@@ -153,6 +164,128 @@ impl Cmd {
                 stderr: format!("timed out after {}s", self.timeout.as_secs()),
                 ..Default::default()
             },
+        }
+    }
+}
+
+/// Where [`Cmd::run_streaming`] sends output lines (implemented by job logs).
+pub trait LineSink: Send + Sync {
+    fn line(&self, line: &str);
+}
+
+/// Discards every line (when only the collected output matters).
+pub struct NullSink;
+
+impl LineSink for NullSink {
+    fn line(&self, _line: &str) {}
+}
+
+/// Collect at most this much of each stream in `CmdOutput` (the sink still
+/// sees every line).
+const MAX_CAPTURE: usize = 1024 * 1024;
+
+/// Kills a whole process group (SIGKILL) when dropped, unless disarmed.
+/// Pair it with `Command::process_group(0)` so that grandchildren (e.g.
+/// `runuser` → `pg_dump`) die with the job instead of being orphaned.
+pub struct ProcessGroupGuard {
+    pgid: Option<i32>,
+}
+
+impl ProcessGroupGuard {
+    /// Guard the group led by `pid` (the child spawned with `process_group(0)`).
+    pub fn new(pid: Option<u32>) -> Self {
+        ProcessGroupGuard {
+            pgid: pid.and_then(|p| i32::try_from(p).ok()).filter(|p| *p > 1),
+        }
+    }
+
+    /// The process exited on its own: don't signal the group on drop.
+    pub fn disarm(&mut self) {
+        self.pgid = None;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid.take() {
+            // SAFETY: plain syscall; a negative pid addresses the process group.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+async fn pump<R: AsyncRead + Unpin>(r: Option<R>, sink: &dyn LineSink) -> String {
+    let Some(r) = r else { return String::new() };
+    let mut lines = BufReader::new(r).lines();
+    let mut buf = String::new();
+    while let Ok(Some(line)) = lines.next_line().await {
+        sink.line(&line);
+        if buf.len() + line.len() < MAX_CAPTURE {
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+    }
+    buf
+}
+
+impl Cmd {
+    /// Run the command in its own process group, streaming every stdout and
+    /// stderr line to `sink`. The timeout may be as long as needed (hours for
+    /// a dump). On timeout — or if this future is dropped, e.g. because the
+    /// job was cancelled — the entire process group is killed.
+    pub async fn run_streaming(self, sink: &dyn LineSink) -> CmdOutput {
+        let mut c = self.command();
+        c.process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = match c.spawn() {
+            Ok(ch) => ch,
+            Err(e) => {
+                sink.line(&format!("cannot start {}: {e}", self.program));
+                return CmdOutput {
+                    missing: e.kind() == ErrorKind::NotFound
+                        || e.kind() == ErrorKind::PermissionDenied,
+                    stderr: e.to_string(),
+                    ..Default::default()
+                };
+            }
+        };
+        let mut guard = ProcessGroupGuard::new(child.id());
+        let out = child.stdout.take();
+        let err = child.stderr.take();
+        let work = async {
+            let (o, e, st) = tokio::join!(pump(out, sink), pump(err, sink), child.wait());
+            (o, e, st)
+        };
+        match tokio::time::timeout(self.timeout, work).await {
+            Ok((stdout, stderr, Ok(status))) => {
+                guard.disarm();
+                CmdOutput {
+                    ok: status.success(),
+                    missing: false,
+                    timed_out: false,
+                    exit_code: status.code(),
+                    stdout,
+                    stderr,
+                }
+            }
+            Ok((stdout, stderr, Err(e))) => CmdOutput {
+                stdout,
+                stderr: format!("{stderr}{e}"),
+                ..Default::default()
+            },
+            Err(_) => {
+                drop(guard); // kill the group now
+                let msg = format!("timed out after {}s", self.timeout.as_secs());
+                sink.line(&msg);
+                CmdOutput {
+                    timed_out: true,
+                    stderr: msg,
+                    ..Default::default()
+                }
+            }
         }
     }
 }
@@ -212,6 +345,46 @@ mod tests {
             .await;
         assert!(out.missing);
         assert!(!out.ok);
+    }
+
+    #[derive(Default)]
+    struct Collect(std::sync::Mutex<Vec<String>>);
+    impl LineSink for Collect {
+        fn line(&self, line: &str) {
+            self.0.lock().unwrap().push(line.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_sends_lines_and_exit_code() {
+        let sink = Collect::default();
+        let out = Cmd::new("sh")
+            .args(["-c", "echo one; echo two >&2; exit 3"])
+            .run_streaming(&sink)
+            .await;
+        assert!(!out.ok);
+        assert_eq!(out.exit_code, Some(3));
+        let lines = sink.0.lock().unwrap().clone();
+        assert!(lines.contains(&"one".to_string()));
+        assert!(lines.contains(&"two".to_string()));
+        assert_eq!(out.stdout, "one\n");
+    }
+
+    #[tokio::test]
+    async fn streaming_timeout_kills_process_group() {
+        let sink = Collect::default();
+        let marker = std::env::temp_dir().join(format!("nc-pg-{}", uuid::Uuid::new_v4()));
+        // The grandchild would create the marker after 1 s unless the whole
+        // group is killed at the 200 ms timeout.
+        let script = format!("(sleep 1; touch {}) & wait", marker.display());
+        let out = Cmd::new("sh")
+            .args(["-c", &script])
+            .timeout(Duration::from_millis(200))
+            .run_streaming(&sink)
+            .await;
+        assert!(out.timed_out);
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert!(!marker.exists(), "grandchild survived the group kill");
     }
 
     #[tokio::test]

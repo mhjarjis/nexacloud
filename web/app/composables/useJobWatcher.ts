@@ -32,8 +32,8 @@ export function useJobWatcher(opts: { interval?: number; onFinish?: (job: Job) =
       const status = err instanceof ApiError ? err.status : 0
       const current = jobs.value[id]
       if (status === 404) {
-        // Jobs live in memory on the agent; a restart forgets them.
-        jobs.value[id] = { id, job: current?.job ?? null, lost: 'The agent no longer knows this job (it may have restarted). Check the Jobs page or the backups list.' }
+        // Jobs are kept on disk; a 404 means it was pruned or never existed.
+        jobs.value[id] = { id, job: current?.job ?? null, lost: 'The agent no longer knows this job. Check the Activity page or the backups list.' }
         return
       }
       if (status === 401 || failures >= 5) {
