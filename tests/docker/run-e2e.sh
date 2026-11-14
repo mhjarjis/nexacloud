@@ -708,6 +708,133 @@ st="$(plan site_delete '{"id":"crm.test.local"}')"
 check "remove crm.test.local → applied" test "$st" = applied
 check "…its pool, worker and cron are cleaned up" in_box "[ ! -e /etc/php/8.3/fpm/pool.d/nc_crm_test_local.conf ] && [ ! -e /etc/supervisor/conf.d/nexacloud-crm-test-local.conf ] && [ ! -e /etc/cron.d/nexacloud-crm-test-local ]"
 
+# ------------------------------------------------------------------ batch A
+step "Panel users, roles, API tokens and two-factor sign-in"
+H="$(dirname "$0")/helpers"
+sudo_on "$PASS"
+PORTAL_DIR="$(api projects/portal.test.local | jq -r .dir)"
+check "users list has the built-in admin" jqe "$(api users)" '[.[].username]|index("admin")!=null'
+check "short password refused" test "$(post_code users '{"username":"dev1","role":"developer","projects":["portal.test.local"],"password":"short"}')" = 400
+check "create developer dev1 (portal only)" jqe "$(post_json users '{"username":"dev1","role":"developer","projects":["portal.test.local"],"password":"dev1-password-123"}')" '.ok==true'
+check "create viewer view1" jqe "$(post_json users '{"username":"view1","role":"viewer","password":"view1-password-123"}')" '.ok==true'
+DJ="$(mktemp)"; VJ="$(mktemp)"
+curl -fsSk -c "$DJ" -H "Origin: $U" -H 'Content-Type: application/json' -d '{"username":"dev1","password":"dev1-password-123"}' "$U/api/auth/login" >/dev/null
+curl -fsSk -c "$VJ" -H "Origin: $U" -H 'Content-Type: application/json' -d '{"username":"view1","password":"view1-password-123"}' "$U/api/auth/login" >/dev/null
+check "dev1 signs in as a developer" jqe "$(curl -fsSk -b "$DJ" "$U/api/auth/me")" '.username=="dev1" and .role=="developer" and .projects==["portal.test.local"]'
+check "wrong password for dev1 refused" test "$(code -H "Origin: $U" -H 'Content-Type: application/json' -d '{"username":"dev1","password":"nope-nope-nope"}' "$U/api/auth/login")" = 401
+check "dev1 cannot list users (403)" test "$(code -b "$DJ" "$U/api/users")" = 403
+check "dev1 cannot create users (403)" test "$(code -b "$DJ" -H "Origin: $U" -H 'Content-Type: application/json' -d '{"username":"x","role":"admin","password":"xxxxxxxxxxxxxx"}' "$U/api/users")" = 403
+check "dev1 cannot change another site (403)" test "$(code -b "$DJ" -H "Origin: $U" -H 'Content-Type: application/json' -d '{"kind":"site_root","params":{"id":"shop.test.local","root":"/tmp"}}' "$U/api/plans/preview")" = 403
+check "viewer can read the dashboard" test "$(code -b "$VJ" "$U/api/overview")" = 200
+check "viewer cannot change anything (403)" test "$(code -b "$VJ" -H "Origin: $U" -H 'Content-Type: application/json' -d '{}' "$U/api/projects/portal.test.local/deploy")" = 403
+check "viewer cannot open files (403)" test "$(code -b "$VJ" "$U/api/files?path=$PORTAL_DIR")" = 403
+
+RT="$(post_json account/tokens '{"name":"ci read","scope":"read","expires_days":30}' | jq -r .secret)"
+DT="$(post_json account/tokens '{"name":"ci deploy","scope":"deploy"}' | jq -r .secret)"
+check "token secrets look like nc_…" bash -c "[[ '$RT' == nc_* && '$DT' == nc_* ]]"
+check "read token: GET works" test "$(code -H "Authorization: Bearer $RT" "$U/api/overview")" = 200
+check "read token: POST refused (403)" test "$(code -H "Authorization: Bearer $RT" -H 'Content-Type: application/json' -d '{}' "$U/api/projects/portal.test.local/deploy")" = 403
+check "deploy token: system info refused (403)" test "$(code -H "Authorization: Bearer $DT" "$U/api/system")" = 403
+check "deploy token: may start a deploy (portal has no Git → 409, not 403)" test "$(code -H "Authorization: Bearer $DT" -H 'Content-Type: application/json' -d '{}' "$U/api/projects/portal.test.local/deploy")" = 409
+check "bad token → 401" test "$(code -H "Authorization: Bearer nc_nope" "$U/api/overview")" = 401
+check "tokens are listed without secrets" jqe "$(api account/tokens)" '(length>=2) and all(.[]; has("secret")|not) and ([.[].last_used_at]|map(select(.!=null))|length)>=1'
+TID="$(api account/tokens | jq -r '[.[] | select(.name=="ci read")][0].id')"
+curl -fsSk -b "$JAR" -H "Origin: $U" -X DELETE "$U/api/account/tokens/$TID" >/dev/null
+check "revoked token → 401" test "$(code -H "Authorization: Bearer $RT" "$U/api/overview")" = 401
+
+SEC="$(post_json account/2fa/setup '{}' | jq -r .secret)"
+check "2FA setup returns a base32 secret" bash -c "[[ '$SEC' =~ ^[A-Z2-7]{32}$ ]]"
+check "wrong code does not turn 2FA on" test "$(post_code account/2fa/enable '{"code":"000000"}')" = 400
+RC="$(post_json account/2fa/enable "{\"code\":\"$(python3 "$H/totp.py" "$SEC")\"}")"
+check "2FA on; 10 recovery codes" jqe "$RC" '.enabled==true and (.recovery_codes|length)==10'
+REC="$(jq -r '.recovery_codes[0]' <<<"$RC")"
+check "password alone now asks for a code (401 totp_required)" bash -c "curl -sk -H 'Origin: $U' -H 'Content-Type: application/json' -d '{\"password\":\"$PASS\"}' '$U/api/auth/login' | jq -e '.error==\"totp_required\"'"
+TJ="$(mktemp)"
+sleep 1
+C1="$(python3 "$H/totp.py" "$SEC" 1)"   # next step (allowed ±1) — not used yet
+check "password + code signs in" curl -fsSk -c "$TJ" -H "Origin: $U" -H 'Content-Type: application/json' -d "{\"password\":\"$PASS\",\"code\":\"$C1\"}" "$U/api/auth/login"
+R="$(code -H "Origin: $U" -H 'Content-Type: application/json' -d "{\"password\":\"$PASS\",\"code\":\"$C1\"}" "$U/api/auth/login")"; echo "    replay → $R"
+check "the same code can't be used twice" test "$R" = 401
+check "a recovery code signs in once" curl -fsSk -c "$TJ" -H "Origin: $U" -H 'Content-Type: application/json' -d "{\"password\":\"$PASS\",\"code\":\"$REC\"}" "$U/api/auth/login"
+R="$(code -H "Origin: $U" -H 'Content-Type: application/json' -d "{\"password\":\"$PASS\",\"code\":\"$REC\"}" "$U/api/auth/login")"; echo "    recovery replay → $R"
+check "…and not twice" test "$R" = 401
+check "me reports 2FA on" jqe "$(api auth/me)" '.totp_enabled==true'
+sudo_on "$PASS"
+check "turn 2FA off again" jqe "$(post_json account/2fa/disable '{}')" '.enabled==false'
+check "password alone works again" login "$PASS"
+sudo_on "$PASS"
+
+step "Cron jobs"
+CJ="$(post_json cron '{"schedule":"*/5 * * * *","command":"echo hi-from-cron $((40+2)) 50%"}')"
+CJID="$(jq -r .id <<<"$CJ")"
+check "server cron job created (runs as root)" jqe "$CJ" '.user=="root" and .enabled==true'
+check "bad schedule refused" test "$(post_code cron '{"schedule":"every day","command":"true"}')" = 400
+check "/etc/cron.d/nexacloud-jobs has the job (% escaped)" in_box "grep -q 'cron-run $CJID' /etc/cron.d/nexacloud-jobs && grep -q '50\\\\%' /etc/cron.d/nexacloud-jobs"
+st="$(wait_job2 "$(post_json "cron/$CJID/run" '{}' | jq -r .job_id)")"
+check "run now → ok" test "$st" = ok
+check "last output kept (hi-from-cron 42 50%)" jqe "$(api "cron/$CJID/log")" '(.log|test("hi-from-cron 42 50%")) and .last_exit==0'
+check "list shows the last run" jqe "$(api cron)" "[.[] | select(.id==\"$CJID\")][0].last_exit==0"
+PJ="$(post_json cron '{"project_id":"portal.test.local","schedule":"@hourly","command":"echo whoami=$(id -un) dir=$(pwd)"}')"
+PJID="$(jq -r .id <<<"$PJ")"
+PU="$(api projects/portal.test.local/overview | jq -r .permissions.web_user)"
+PO="$(in_box "stat -c %U $PORTAL_DIR")"
+check "project job runs as the project's PHP user ($PU) in its folder" jqe "$PJ" ".user==\"$PU\" and .cwd==\"$PORTAL_DIR\""
+st="$(wait_job2 "$(post_json "cron/$PJID/run" '{}' | jq -r .job_id)")"
+check "project job ran as $PU in $PORTAL_DIR" jqe "$(api "cron/$PJID/log")" ".log|test(\"whoami=$PU dir=$PORTAL_DIR\")"
+check "dev1 sees only portal's job" bash -c "curl -fsSk -b '$DJ' '$U/api/cron' | jq -e 'length==1 and .[0].project_id==\"portal.test.local\"'"
+check "dev1 cannot add a server job (403)" test "$(code -b "$DJ" -H "Origin: $U" -H 'Content-Type: application/json' -d '{"schedule":"* * * * *","command":"id"}' "$U/api/cron")" = 403
+check "pause a job" jqe "$(curl -fsSk -b "$JAR" -H "Origin: $U" -H 'Content-Type: application/json' -X PUT -d '{"schedule":"*/5 * * * *","command":"echo hi-from-cron $((40+2)) 50%","enabled":false}' "$U/api/cron/$CJID")" '.enabled==false'
+check "paused job is left out of cron" in_box "! grep -q 'cron-run $CJID' /etc/cron.d/nexacloud-jobs"
+for id in "$CJID" "$PJID"; do curl -fsSk -b "$JAR" -H "Origin: $U" -X DELETE "$U/api/cron/$id" >/dev/null; done
+check "deleted jobs are gone from cron" in_box "! grep -q '$CJID' /etc/cron.d/nexacloud-jobs"
+
+step "File manager"
+FM=/var/www/nc-fm-test
+fpost() { post_json "files/$1" "$2"; }
+check "roots: /var/www, /srv, /home writable" jqe "$(api files)" '[.roots[] | select(.writable)] | map(.path) | index("/var/www")!=null'
+check "mkdir" jqe "$(fpost mkdir "{\"path\":\"$FM\"}")" '.ok'
+WB="$(jq -nc --arg p "$FM/hello.txt" '{path:$p, content:"hello nexacloud\n"}')"
+check "write a file" jqe "$(fpost write "$WB")" '.created==true'
+check "read it back" jqe "$(api "files/read?path=$FM/hello.txt")" '.content=="hello nexacloud\n" and .writable==true'
+check "listing shows it" jqe "$(api "files?path=$FM")" '[.entries[].name]==["hello.txt"]'
+printf 'uploaded-bytes' > /tmp/nc-up.bin
+check "upload (raw body)" bash -c "curl -fsSk -b '$JAR' -H 'Origin: $U' --data-binary @/tmp/nc-up.bin '$U/api/files/upload?dir=$FM&name=up.bin' | jq -e '.size==14'"
+check "download returns the same bytes" bash -c "[ \"\$(curl -fsSk -b '$JAR' '$U/api/files/download?path=$FM/up.bin')\" = uploaded-bytes ]"
+B="{\"path\":\"$FM/hello.txt\",\"mode\":\"640\"}"
+check "chmod 640" jqe "$(fpost chmod "$B")" '.ok'
+check "…mode is 640" in_box "[ \$(stat -c %a $FM/hello.txt) = 640 ]"
+B="{\"path\":\"$FM/hello.txt\",\"mode\":\"777\"}"
+check "chmod 777 refused" test "$(post_code files/chmod "$B")" = 400
+B="{\"from\":\"$FM/up.bin\",\"to\":\"$FM/up2.bin\"}"
+check "rename" jqe "$(fpost rename "$B")" '.ok'
+B="{\"paths\":[\"$FM/hello.txt\",\"$FM/up2.bin\"],\"dest\":\"$FM/pack.zip\"}"
+check "compress to zip" jqe "$(fpost compress "$B")" '.ok'
+B="{\"path\":\"$FM/pack.zip\",\"dest\":\"$FM/out\"}"
+check "extract into a folder" jqe "$(fpost extract "$B")" '.ok'
+check "…extracted files are there" in_box "grep -q 'hello nexacloud' $FM/out/hello.txt && [ -f $FM/out/up2.bin ]"
+check "path traversal refused (403)" test "$(code -b "$JAR" "$U/api/files/read?path=/var/www/../../etc/shadow")" = 403
+in_box "ln -sfn /etc $FM/etc-link"
+check "symlink out of the allowed folders refused (403)" test "$(code -b "$JAR" "$U/api/files/read?path=$FM/etc-link/shadow")" = 403
+check "/etc/nginx is read only (write → 403)" test "$(post_code files/write '{"path":"/etc/nginx/x.conf","content":"x"}')" = 403
+check "/var/www itself can't be deleted (403)" test "$(post_code files/delete '{"paths":["/var/www"]}')" = 403
+check "dev1 can list their project folder" test "$(code -b "$DJ" "$U/api/files?path=$PORTAL_DIR")" = 200
+check "dev1 cannot open another folder (403)" test "$(code -b "$DJ" "$U/api/files?path=$FM")" = 403
+check "files written in a project folder keep the folder's owner" bash -c "curl -fsSk -b '$DJ' -H 'Origin: $U' -H 'Content-Type: application/json' -d '{\"path\":\"$PORTAL_DIR/nc-owner.txt\",\"content\":\"x\"}' '$U/api/files/write' >/dev/null && [ \"\$(docker exec $NAME stat -c %U $PORTAL_DIR/nc-owner.txt)\" = '$PO' ]"
+B="{\"paths\":[\"$FM\",\"$PORTAL_DIR/nc-owner.txt\"]}"
+check "delete" jqe "$(fpost delete "$B")" '.ok'
+check "…gone" in_box "[ ! -e $FM ]"
+
+step "Web terminal"
+sudo_on "$PASS"
+check "root terminal runs commands" python3 "$H/ws_term.py" "$U" "$JAR" "cols=100&rows=30" 'echo nc-term-$((6*7)) $(id -un)' 'nc-term-42 root'
+check "project terminal runs as the project's user" python3 "$H/ws_term.py" "$U" "$JAR" "project=portal.test.local" 'echo nc-term-$((6*7)) $(id -un) $(pwd)' "nc-term-42 $PU $PORTAL_DIR"
+check "foreign Origin refused" bash -c "python3 '$H/ws_term.py' '$U' '$JAR' 'cols=80' 'id' 'x' 'https://evil.example' | grep -q 403"
+check "dev1 cannot open a root terminal" bash -c "python3 '$H/ws_term.py' '$U' '$DJ' 'cols=80' 'id' 'x' | grep -q 403"
+check "terminal sessions are in the audit log" jqe "$(api audit)" '[.[] | select(.action=="terminal.open")] | length>=2'
+check "delete users" bash -c "curl -fsSk -b '$JAR' -H 'Origin: $U' -X DELETE '$U/api/users/dev1' && curl -fsSk -b '$JAR' -H 'Origin: $U' -X DELETE '$U/api/users/view1'"
+check "deleted user's session is gone (401)" test "$(code -b "$DJ" "$U/api/auth/me")" = 401
+rm -f "$DJ" "$VJ" "$TJ"
+
 # ------------------------------------------------------------------ throttle
 step "Login throttling"
 for _ in 1 2 3 4 5 6; do code -H "Origin: $U" -H 'Content-Type: application/json' -d '{"password":"bad"}' "$U/api/auth/login" >/dev/null; done

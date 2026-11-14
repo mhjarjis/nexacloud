@@ -128,6 +128,14 @@ pub fn atomic_write(
     result
 }
 
+/// Home folder of a login name, from /etc/passwd.
+pub fn user_home(name: &str) -> Option<String> {
+    std::fs::read_to_string("/etc/passwd").ok()?.lines().find_map(|l| {
+        let f: Vec<&str> = l.split(':').collect();
+        (f.len() > 5 && f[0] == name).then(|| f[5].to_string())
+    })
+}
+
 /// Login name for a uid, from /etc/passwd (no subprocess).
 pub fn user_name(uid: u32) -> Option<String> {
     std::fs::read_to_string("/etc/passwd")

@@ -537,6 +537,9 @@ async function disconnect() {
     </div>
     <div class="row wrap" style="gap: 10px">
       <a v-if="ov.data.value" class="btn" :href="ov.data.value.site.url" target="_blank" rel="noopener"><AppIcon name="external" :size="14" /> Visit site</a>
+      <NuxtLink v-if="p.data.value" class="btn" :to="`/files?path=${encodeURIComponent(p.data.value.dir)}`"><AppIcon name="folder" :size="14" /> Files</NuxtLink>
+      <NuxtLink v-if="p.data.value" class="btn" :to="`/terminal?project=${encodeURIComponent(p.data.value.id)}`"><AppIcon name="terminal" :size="14" /> Terminal</NuxtLink>
+      <NuxtLink v-if="p.data.value" class="btn" :to="`/cron?project=${encodeURIComponent(p.data.value.id)}`"><AppIcon name="clock" :size="14" /> Cron</NuxtLink>
       <button v-if="ov.data.value && (isLaravel || model)" type="button" class="btn" :class="{ 'btn-warn': maintenanceOn }" :disabled="maintBusy" :aria-pressed="maintenanceOn" @click="toggleMaintenance">
         <AppIcon name="wrench" :size="14" /> {{ maintBusy ? 'Switching…' : `Maintenance mode: ${maintenanceOn ? 'On' : 'Off'}` }}
       </button>

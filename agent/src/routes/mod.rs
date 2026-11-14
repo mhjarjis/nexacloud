@@ -1,3 +1,4 @@
+pub mod accounts;
 pub mod backups;
 pub mod changes;
 pub mod databases;
@@ -85,6 +86,16 @@ pub fn router(state: AppState) -> Router {
         .route("/notify/settings", put(crate::monitor::routes::settings_put))
         .route("/notify/test", post(crate::monitor::routes::test))
         .route("/apps", post(crate::apps::create))
+        .route("/account/2fa/setup", post(accounts::totp_setup))
+        .route("/account/2fa/disable", post(accounts::totp_disable))
+        .route("/account/password", post(accounts::change_password))
+        .route("/account/tokens", post(accounts::token_create))
+        .route("/account/tokens/{id}", delete(accounts::token_revoke))
+        .route("/users", post(accounts::user_create))
+        .route("/cron", post(crate::cron::create))
+        .route("/cron/{id}", put(crate::cron::update).delete(crate::cron::remove))
+        .route("/cron/{id}/run", post(crate::cron::run_now))
+        .route("/users/{name}", put(accounts::user_update).delete(accounts::user_delete))
         .route("/projects/{id}/releases/{name}/activate", post(dp::release_activate));
     if state.test_hooks {
         tracing::warn!("NEXACLOUD_TEST_HOOKS=1: test-only endpoints are enabled");
@@ -158,6 +169,26 @@ pub fn router(state: AppState) -> Router {
         .route("/domains", get(domains::domains))
         .route("/system/history", get(crate::monitor::routes::server_history))
         .route("/workspace", get(domains::workspace))
+        .route("/account/2fa/enable", post(accounts::totp_enable))
+        .route("/account/tokens", get(accounts::tokens))
+        .route("/users", get(accounts::users_list))
+        .route("/files", get(crate::files::list))
+        .route("/files/read", get(crate::files::read))
+        .route("/files/download", get(crate::files::download))
+        .route("/files/write", post(crate::files::write))
+        .route(
+            "/files/upload",
+            post(crate::files::upload).layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024 * 1024)),
+        )
+        .route("/files/mkdir", post(crate::files::mkdir))
+        .route("/files/rename", post(crate::files::rename))
+        .route("/files/delete", post(crate::files::delete))
+        .route("/files/chmod", post(crate::files::chmod))
+        .route("/files/compress", post(crate::files::compress))
+        .route("/files/extract", post(crate::files::extract))
+        .route("/terminal", get(crate::terminal::open))
+        .route("/cron", get(crate::cron::list_route))
+        .route("/cron/{id}/log", get(crate::cron::log))
         .route("/monitor", get(crate::monitor::routes::list))
         .route("/monitor/{site}", get(crate::monitor::routes::site))
         .route("/notifications", get(crate::monitor::routes::notifications))

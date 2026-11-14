@@ -64,7 +64,7 @@ try {
   await shot('01-login')
   await ev(`const i=document.querySelector('input[type=password]'); i.value='definitely-wrong'; i.dispatchEvent(new Event('input')); document.querySelector('form').requestSubmit(); return 1`)
   await sleep(1500)
-  expect(/wrong password/i.test(await text()), 'wrong password shows an error')
+  expect(/wrong (username or )?password/i.test(await text()), 'wrong password shows an error')
   await ev(`const i=document.querySelector('input[type=password]'); i.value=${JSON.stringify(PASSWORD)}; i.dispatchEvent(new Event('input')); document.querySelector('form').requestSubmit(); return 1`)
   await sleep(3000)
   expect((await ev('return location.pathname')) === '/', 'correct password lands on the dashboard')
@@ -91,6 +91,11 @@ try {
     ['/monitoring', '17-monitoring', ['Monitoring', 'shop.test.local', 'Where to send alerts', 'Recent alerts']],
     ['/apps/new', '18-new-app', ['What are you deploying?', 'Laravel', 'Plain PHP']],
     ['/db/mysql/shop_prod', '15-db-browser', ['orders', 'SQL']],
+    ['/account', '20-account', ['Account & users', 'Two-factor sign-in', 'API tokens', 'Panel users', 'Create token']],
+    ['/cron', '21-cron', ['Cron jobs', 'Scheduled jobs', 'New cron job']],
+    ['/files', '22-files', ['File manager', '/var/www', 'read and write']],
+    ['/files?path=/var/www', '22b-files-list', ['File manager', 'Permissions', 'Owner', 'Upload', 'New folder']],
+    ['/terminal', '23-terminal', ['Terminal', 'Open terminal', 'Needs sudo']],
     ['/db/mysql/shop_prod?t=orders', '16-db-rows', ['orders', '11.50', 'Insert row']],
   ]
   for (const [path, name, needles] of pages) {

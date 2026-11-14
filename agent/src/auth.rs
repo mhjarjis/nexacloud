@@ -73,6 +73,29 @@ struct Session {
     expires: Instant,
     /// Sudo mode: dangerous endpoints are allowed until this time.
     sudo_until: Option<DateTime<Utc>>,
+    username: String,
+}
+
+/// Who is making the request (cookie session or API token). The role and
+/// project list are read fresh from the database on every request.
+#[derive(Clone, Debug)]
+pub struct Identity {
+    pub username: String,
+    pub role: crate::users::Role,
+    pub projects: Vec<String>,
+    /// `Some(scope)` when authenticated with an API token.
+    pub token_scope: Option<String>,
+}
+
+impl Identity {
+    /// May this identity change project `id`?
+    pub fn can_change_project(&self, id: &str) -> bool {
+        match self.role {
+            crate::users::Role::Admin => true,
+            crate::users::Role::Developer => self.projects.iter().any(|p| p == id),
+            crate::users::Role::Viewer => false,
+        }
+    }
 }
 
 /// In-memory sessions (a restart signs everybody out).
@@ -82,7 +105,7 @@ pub struct Sessions {
 }
 
 impl Sessions {
-    pub fn create(&self) -> String {
+    pub fn create(&self, username: &str) -> String {
         let token = generate_token();
         let now = Instant::now();
         let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
@@ -92,22 +115,29 @@ impl Sessions {
             Session {
                 expires: now + SESSION_TTL,
                 sudo_until: None,
+                username: username.to_string(),
             },
         );
         token
     }
 
-    pub fn is_valid(&self, token: &str) -> bool {
+    /// The user of a live session.
+    pub fn username(&self, token: &str) -> Option<String> {
         let now = Instant::now();
         let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
         match m.get(token) {
-            Some(s) if s.expires > now => true,
+            Some(s) if s.expires > now => Some(s.username.clone()),
             Some(_) => {
                 m.remove(token);
-                false
+                None
             }
-            None => false,
+            None => None,
         }
+    }
+
+    /// Sign out every session of a user (password change, user removed).
+    pub fn remove_user(&self, username: &str) {
+        self.map.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, s| s.username != username);
     }
 
     pub fn remove(&self, token: &str) {
@@ -265,7 +295,8 @@ fn is_mutating(m: &Method) -> bool {
 /// CSRF defence: mutating requests must carry an Origin matching Host.
 /// (HTTP/2 has no Host header; the authority comes from the URI then.)
 pub async fn origin_check(req: Request, next: Next) -> Response {
-    if is_mutating(req.method()) {
+    let bearer = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).is_some_and(|v| v.starts_with("Bearer "));
+    if is_mutating(req.method()) && !bearer {
         let origin = req
             .headers()
             .get(header::ORIGIN)
@@ -292,12 +323,84 @@ pub async fn require_session(
     mut req: Request,
     next: Next,
 ) -> Response {
-    match token_from_headers(req.headers()) {
-        Some(t) if state.sessions.is_valid(&t) => {
-            req.extensions_mut().insert(SessionToken(t));
-            next.run(req).await
+    let bearer = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|v| v.trim().to_string());
+    let identity = if let Some(secret) = bearer {
+        match crate::users::authenticate_token(&state.db, &secret) {
+            Some((t, u)) => {
+                req.extensions_mut().insert(SessionToken(format!("token:{}", t.id)));
+                Identity { username: u.username, role: u.role, projects: u.projects, token_scope: Some(t.scope) }
+            }
+            None => return ApiError::new(StatusCode::UNAUTHORIZED, "invalid or expired API token").into_response(),
         }
-        _ => ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+    } else {
+        let Some(t) = token_from_headers(req.headers()) else {
+            return ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        };
+        let Some(username) = state.sessions.username(&t) else {
+            return ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        };
+        let Some(u) = crate::users::get(&state.db, &username).ok().flatten() else {
+            state.sessions.remove(&t);
+            return ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        };
+        req.extensions_mut().insert(SessionToken(t));
+        Identity { username: u.username, role: u.role, projects: u.projects, token_scope: None }
+    };
+    if let Err(msg) = allowed(&identity, req.method(), req.uri().path()) {
+        return ApiError::new(StatusCode::FORBIDDEN, msg).into_response();
+    }
+    req.extensions_mut().insert(identity);
+    next.run(req).await
+}
+
+/// Role / token-scope rules that only need the method and path. Handlers that
+/// act on a project from the request body (plans, files, terminal, cron)
+/// check `Identity::can_change_project` themselves.
+pub fn allowed(id: &Identity, method: &Method, path: &str) -> Result<(), &'static str> {
+    use crate::users::Role;
+    let read = *method == Method::GET || *method == Method::HEAD;
+    let seg: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    let own_account = seg.first() == Some(&"auth") || seg.first() == Some(&"account");
+    match id.token_scope.as_deref() {
+        Some("read") if !read => return Err("this API token is read-only"),
+        Some("deploy") => {
+            let deploy = *method == Method::POST && seg.len() == 3 && seg[0] == "projects" && seg[2] == "deploy";
+            let readable = read && matches!(seg.first(), Some(&"projects") | Some(&"jobs") | Some(&"deploys") | Some(&"health"));
+            if !(deploy || readable) {
+                return Err("this API token can only start deploys and read projects");
+            }
+            if deploy && !id.can_change_project(seg[1]) {
+                return Err("this API token's user cannot deploy that project");
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+    if read || own_account {
+        // Admin-only reads: user management and other users' tokens.
+        if seg.first() == Some(&"users") && id.role != Role::Admin {
+            return Err("only admins can manage users");
+        }
+        return Ok(());
+    }
+    match id.role {
+        Role::Admin => Ok(()),
+        Role::Viewer => Err("your account is read-only"),
+        Role::Developer => {
+            let project_path = seg.first() == Some(&"projects") && seg.len() >= 2 && id.can_change_project(seg[1]);
+            // body-scoped endpoints check the project in the handler
+            let scoped = matches!(seg.first(), Some(&"plans") | Some(&"files") | Some(&"terminal") | Some(&"cron"));
+            if project_path || scoped {
+                Ok(())
+            } else {
+                Err("developers can only change their own projects")
+            }
+        }
     }
 }
 
@@ -306,11 +409,16 @@ pub async fn require_session(
 /// sudo mode in the last 15 minutes. Mount with `route_layer` on the
 /// "dangerous" router; `require_session` must run first.
 pub async fn require_sudo(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    let elevated = req
+    let full_token = req
         .extensions()
-        .get::<SessionToken>()
-        .and_then(|t| state.sessions.sudo_until(&t.0, Utc::now()))
-        .is_some();
+        .get::<Identity>()
+        .is_some_and(|i| i.token_scope.as_deref() == Some("full") || i.token_scope.as_deref() == Some("deploy"));
+    let elevated = full_token
+        || req
+            .extensions()
+            .get::<SessionToken>()
+            .and_then(|t| state.sessions.sudo_until(&t.0, Utc::now()))
+            .is_some();
     if !elevated {
         return ApiError::sudo_required().into_response();
     }
@@ -321,7 +429,12 @@ pub async fn require_sudo(State(state): State<AppState>, req: Request, next: Nex
 
 #[derive(Deserialize)]
 struct LoginBody {
+    #[serde(default)]
+    username: Option<String>,
     password: String,
+    /// 2FA code or recovery code.
+    #[serde(default)]
+    code: Option<String>,
 }
 
 /// The client IP for throttling: the socket peer, or — only when the peer is
@@ -347,23 +460,28 @@ pub async fn login(
     body: Bytes,
 ) -> Response {
     let ip = throttle_ip(&addr, &headers);
+    let who = serde_json::from_slice::<LoginBody>(&body)
+        .ok()
+        .and_then(|b| b.username)
+        .unwrap_or_else(|| crate::users::ADMIN.into());
     audited(
         login_inner(state, ip, body).await,
-        AuditInfo::action("auth.login", "admin"),
+        AuditInfo::action("auth.login", crate::util::cmd::truncate(&who, 40)),
     )
 }
 
 /// Check a password with the login throttle (shared by login and sudo).
-/// Err is the response to send.
-async fn check_password(state: &AppState, ip: IpAddr, body: &[u8]) -> Result<(), ApiError> {
+/// `user`: the session's user for sudo; None at login (username from the
+/// body, default admin). Returns the user. Err is the response to send.
+async fn check_password(state: &AppState, ip: IpAddr, body: &[u8], user: Option<&str>, need_2fa: bool) -> Result<crate::users::User, ApiError> {
     if !state.throttle.begin_attempt(ip, Instant::now()) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "too many attempts, try again later",
         ));
     }
-    let password = match serde_json::from_slice::<LoginBody>(body) {
-        Ok(b) => b.password,
+    let b = match serde_json::from_slice::<LoginBody>(body) {
+        Ok(b) => b,
         Err(_) => {
             state.throttle.cancel_attempt(ip);
             return Err(ApiError::bad_request(
@@ -371,17 +489,48 @@ async fn check_password(state: &AppState, ip: IpAddr, body: &[u8]) -> Result<(),
             ));
         }
     };
-    let hash = state.config.admin_password_hash.clone();
+    let username = user
+        .map(String::from)
+        .or(b.username.clone())
+        .map(|u| u.trim().to_ascii_lowercase())
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| crate::users::ADMIN.into());
+    let u = crate::users::get(&state.db, &username).ok().flatten();
+    let hash = match &u {
+        Some(u) if u.username == crate::users::ADMIN => Some(state.config.admin_password_hash.clone()),
+        Some(u) => u.password_hash.clone(),
+        None => None,
+    };
+    let password = b.password;
     let ok = password.len() <= MAX_PASSWORD_LEN
-        && tokio::task::spawn_blocking(move || verify_password(&password, &hash))
-            .await
-            .unwrap_or(false);
+        && match hash {
+            Some(h) => tokio::task::spawn_blocking(move || verify_password(&password, &h))
+                .await
+                .unwrap_or(false),
+            None => false,
+        };
     if !ok {
         tokio::time::sleep(FAILED_LOGIN_DELAY).await;
-        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "wrong password"));
+        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "wrong username or password"));
+    }
+    let u = u.expect("checked above");
+    if need_2fa && u.totp_enabled {
+        match b.code.as_deref().filter(|c| !c.trim().is_empty()) {
+            None => {
+                // Not a failed attempt: the password was right.
+                state.throttle.cancel_attempt(ip);
+                return Err(ApiError::new(StatusCode::UNAUTHORIZED, "totp_required"));
+            }
+            Some(code) => {
+                if !crate::users::check_second_factor(&state.db, &u, code) {
+                    tokio::time::sleep(FAILED_LOGIN_DELAY).await;
+                    return Err(ApiError::new(StatusCode::UNAUTHORIZED, "wrong two-factor code"));
+                }
+            }
+        }
     }
     state.throttle.succeeded(ip);
-    Ok(())
+    Ok(u)
 }
 
 /// `POST /api/auth/sudo {"password"}`: re-enter the password to unlock
@@ -392,15 +541,16 @@ pub async fn sudo(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
     axum::Extension(SessionToken(token)): axum::Extension<SessionToken>,
+    axum::Extension(me): axum::Extension<Identity>,
     body: Bytes,
 ) -> Response {
     let ip = throttle_ip(&addr, &headers);
-    let resp = match check_password(&state, ip, &body).await {
+    let resp = match check_password(&state, ip, &body, Some(&me.username), false).await {
         Err(e) => {
             tracing::warn!(%ip, "failed sudo attempt");
             e.into_response()
         }
-        Ok(()) => match state.sessions.elevate(&token, Utc::now()) {
+        Ok(_) => match state.sessions.elevate(&token, Utc::now()) {
             Some(until) => {
                 tracing::info!(%ip, "sudo mode on");
                 Json(json!({"ok": true, "sudo_until": fmt_ts(until)})).into_response()
@@ -408,17 +558,21 @@ pub async fn sudo(
             None => ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
         },
     };
-    audited(resp, AuditInfo::action("auth.sudo", "admin"))
+    audited(resp, AuditInfo::action("auth.sudo", me.username.clone()))
 }
 
 async fn login_inner(state: AppState, ip: IpAddr, body: Bytes) -> Response {
-    if let Err(e) = check_password(&state, ip, &body).await {
-        if e.status == StatusCode::UNAUTHORIZED {
-            tracing::warn!(%ip, "failed login");
+    let u = match check_password(&state, ip, &body, None, true).await {
+        Ok(u) => u,
+        Err(e) => {
+            if e.status == StatusCode::UNAUTHORIZED && e.message != "totp_required" {
+                tracing::warn!(%ip, "failed login");
+            }
+            return e.into_response();
         }
-        return e.into_response();
-    }
-    let token = state.sessions.create();
+    };
+    crate::users::touch_login(&state.db, &u.username);
+    let token = state.sessions.create(&u.username);
     tracing::info!(%ip, "login");
     let mut resp = Json(json!({"ok": true})).into_response();
     if let Ok(v) = HeaderValue::from_str(&session_cookie(&token, state.config.tls)) {
@@ -443,9 +597,15 @@ pub async fn logout(
 pub async fn me(
     State(state): State<AppState>,
     axum::Extension(SessionToken(token)): axum::Extension<SessionToken>,
+    axum::Extension(me): axum::Extension<Identity>,
 ) -> Json<serde_json::Value> {
     let until = state.sessions.sudo_until(&token, Utc::now()).map(fmt_ts);
-    Json(json!({"ok": true, "sudo_until": until}))
+    let u = crate::users::get(&state.db, &me.username).ok().flatten();
+    Json(json!({
+        "ok": true, "sudo_until": until, "username": me.username, "role": me.role,
+        "projects": me.projects, "totp_enabled": u.map(|u| u.totp_enabled).unwrap_or(false),
+        "via_token": me.token_scope.is_some(),
+    }))
 }
 
 #[cfg(test)]
@@ -503,17 +663,47 @@ mod tests {
     #[test]
     fn sessions() {
         let s = Sessions::default();
-        let t = s.create();
-        assert!(s.is_valid(&t));
-        assert!(!s.is_valid("nope"));
+        let t = s.create("admin");
+        assert_eq!(s.username(&t).as_deref(), Some("admin"));
+        assert!(s.username("nope").is_none());
+        let t2 = s.create("dev1");
+        s.remove_user("dev1");
+        assert!(s.username(&t2).is_none(), "remove_user signs that user out");
         s.remove(&t);
-        assert!(!s.is_valid(&t));
+        assert!(s.username(&t).is_none());
+    }
+
+    #[test]
+    fn role_and_token_rules() {
+        use crate::users::Role;
+        let id = |role, projects: &[&str], scope: Option<&str>| Identity { username: "u".into(), role, projects: projects.iter().map(|s| s.to_string()).collect(), token_scope: scope.map(String::from) };
+        let dev = id(Role::Developer, &["shop.test"], None);
+        assert!(allowed(&dev, &Method::GET, "/sites").is_ok());
+        assert!(allowed(&dev, &Method::POST, "/projects/shop.test/deploy").is_ok());
+        assert!(allowed(&dev, &Method::POST, "/projects/other.test/deploy").is_err());
+        assert!(allowed(&dev, &Method::POST, "/services/nginx/restart").is_err());
+        assert!(allowed(&dev, &Method::POST, "/plans/apply").is_ok(), "checked in the handler");
+        assert!(allowed(&dev, &Method::GET, "/users").is_err());
+        assert!(allowed(&dev, &Method::POST, "/account/tokens").is_ok());
+        let viewer = id(Role::Viewer, &[], None);
+        assert!(allowed(&viewer, &Method::POST, "/projects/shop.test/deploy").is_err());
+        assert!(allowed(&viewer, &Method::POST, "/auth/sudo").is_ok());
+        let admin = id(Role::Admin, &[], None);
+        assert!(allowed(&admin, &Method::POST, "/services/nginx/restart").is_ok());
+        let ro = id(Role::Admin, &[], Some("read"));
+        assert!(allowed(&ro, &Method::POST, "/projects/x/deploy").is_err());
+        assert!(allowed(&ro, &Method::GET, "/sites").is_ok());
+        let dep = id(Role::Admin, &[], Some("deploy"));
+        assert!(allowed(&dep, &Method::POST, "/projects/x/deploy").is_ok());
+        assert!(allowed(&dep, &Method::GET, "/projects/x").is_ok());
+        assert!(allowed(&dep, &Method::GET, "/sites").is_err());
+        assert!(allowed(&dep, &Method::PUT, "/projects/x").is_err());
     }
 
     #[test]
     fn sudo_mode_expires_after_15_minutes() {
         let s = Sessions::default();
-        let t = s.create();
+        let t = s.create("admin");
         let now = Utc::now();
         assert_eq!(s.sudo_until(&t, now), None);
         let until = s.elevate(&t, now).unwrap();

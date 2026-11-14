@@ -32,6 +32,7 @@ impl AppState {
     pub fn new(config: Config) -> Result<Self> {
         config.ensure_data_dirs()?;
         let db = Db::open(&config.state_db_path())?;
+        crate::users::ensure_admin(&db)?;
         let jobs = Jobs::new(db.clone(), config.jobs_dir());
         let changes_env = ChangeEnv::system(config.snapshots_dir());
         Ok(AppState(Arc::new(Inner {

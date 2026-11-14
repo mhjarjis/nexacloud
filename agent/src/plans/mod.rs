@@ -182,9 +182,41 @@ fn parse<T: for<'de> Deserialize<'de>>(body: &Bytes) -> Result<T, ApiError> {
     serde_json::from_slice(body).map_err(|e| ApiError::bad_request(format!("invalid request: {e}")))
 }
 
-pub async fn preview(State(state): State<AppState>, body: Bytes) -> Response {
+impl PlanRequest {
+    /// The project/site a developer may run this plan on (None: admins only).
+    fn project_target(&self) -> Option<&str> {
+        match self {
+            PlanRequest::ProjectEnv(p) => Some(&p.id),
+            PlanRequest::ProjectEnvRaw(p) => Some(&p.id),
+            PlanRequest::ProjectWorker(w) => Some(&w.id),
+            PlanRequest::ProjectScheduler { id, .. }
+            | PlanRequest::ProjectPermissions { id }
+            | PlanRequest::ProjectShared { id, .. }
+            | PlanRequest::ProjectReleases { id }
+            | PlanRequest::SitePhp { id, .. }
+            | PlanRequest::SiteRoot { id, .. } => Some(id),
+            PlanRequest::SiteOptions(p) => Some(&p.id),
+            PlanRequest::SiteSsl(p) => Some(&p.id),
+            _ => None,
+        }
+    }
+}
+
+fn check_scope(me: Option<&crate::auth::Identity>, req: &PlanRequest) -> ApiResult<()> {
+    let Some(me) = me else { return Ok(()) };
+    if me.role == crate::users::Role::Admin {
+        return Ok(());
+    }
+    match req.project_target() {
+        Some(id) if me.can_change_project(id) => Ok(()),
+        _ => Err(ApiError::new(axum::http::StatusCode::FORBIDDEN, "developers can only change their own projects")),
+    }
+}
+
+pub async fn preview(State(state): State<AppState>, me: Option<axum::Extension<crate::auth::Identity>>, body: Bytes) -> Response {
     let res: ApiResult<Response> = async {
         let req: PlanRequest = parse(&body)?;
+        check_scope(me.as_deref(), &req)?;
         let plan = build(&state, &req).await.map_err(ApiError::conflict)?;
         Ok(Json(changes::preview(&plan)).into_response())
     }
@@ -198,11 +230,13 @@ pub async fn preview(State(state): State<AppState>, body: Bytes) -> Response {
 pub async fn apply(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    me: Option<axum::Extension<crate::auth::Identity>>,
     body: Bytes,
 ) -> Response {
     let mut info = AuditInfo::action("change.apply", "plan");
     let res: ApiResult<Response> = async {
         let env: ApplyEnvelope = parse(&body)?;
+        check_scope(me.as_deref(), &env.req)?;
         info = AuditInfo::action(&format!("plan.{}", env.req.name()), "server");
         let plan = build(&state, &env.req).await.map_err(ApiError::conflict)?;
         info = AuditInfo::action(&format!("plan.{}", env.req.name()), plan.target.clone());

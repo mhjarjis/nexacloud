@@ -187,6 +187,45 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX server_samples_ts ON server_samples (ts);
     "#,
+    // v6 — panel users, 2FA, API tokens.
+    r#"
+    CREATE TABLE users (
+        username       TEXT PRIMARY KEY,
+        role           TEXT NOT NULL,
+        projects       TEXT NOT NULL DEFAULT '[]',
+        password_hash  TEXT,
+        totp_secret    TEXT,
+        totp_enabled   INTEGER NOT NULL DEFAULT 0,
+        totp_last_step INTEGER NOT NULL DEFAULT 0,
+        recovery       TEXT NOT NULL DEFAULT '[]',
+        created_at     TEXT NOT NULL,
+        last_login     TEXT
+    );
+    CREATE TABLE api_tokens (
+        id           TEXT PRIMARY KEY,
+        name         TEXT NOT NULL,
+        username     TEXT NOT NULL,
+        scope        TEXT NOT NULL,
+        token_hash   TEXT NOT NULL UNIQUE,
+        prefix       TEXT NOT NULL,
+        created_at   TEXT NOT NULL,
+        last_used_at TEXT,
+        expires_at   TEXT
+    );
+    "#,
+    // v7 — cron jobs.
+    r#"
+    CREATE TABLE cron_jobs (
+        id         TEXT PRIMARY KEY,
+        project_id TEXT,
+        user       TEXT NOT NULL,
+        schedule   TEXT NOT NULL,
+        command    TEXT NOT NULL,
+        cwd        TEXT NOT NULL,
+        enabled    INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL
+    );
+    "#,
 ];
 
 /// Latest schema version this binary knows.

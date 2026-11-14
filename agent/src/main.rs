@@ -9,16 +9,20 @@ mod backups;
 mod changes;
 mod cli;
 mod config;
+mod cron;
 mod db;
 mod dbm;
 mod deploys;
 mod error;
+mod files;
 mod jobs;
 mod monitor;
 mod nginx;
 mod plans;
 mod routes;
 mod state;
+mod terminal;
+mod users;
 mod util;
 
 use std::net::SocketAddr;
@@ -189,6 +193,10 @@ async fn run(cfg: Config) -> Result<()> {
     backups::spawn_scheduler(state.clone());
     deploys::spawn_poller(state.clone());
     monitor::spawn(state.clone());
+    {
+        let st = state.clone();
+        tokio::spawn(async move { cron::startup(&st).await });
+    }
     let app = routes::router(state.clone()).into_make_service_with_connect_info::<SocketAddr>();
 
     let handle: axum_server::Handle<SocketAddr> = axum_server::Handle::new();
