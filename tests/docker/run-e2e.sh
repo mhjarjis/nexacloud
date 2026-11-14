@@ -697,7 +697,7 @@ SB="{\"files\":\"/var/www/crm.test.local\",\"database\":\"mysql/crm_test_local\"
 jid="$(post_json "backup/runs/$ERUN/staging" "$SB" | jq -r .job_id)"; st="$(wait_job2 "$jid")"
 [ "$st" = ok ] || api "jobs/$jid" | jq -r .log | tail -30
 check "restore to staging from the encrypted NAS copy (local copy deleted) → ok" test "$st" = ok
-check "staging copy answers (crm v2) on its own domain" bash -c "[ \"\$(docker exec $NAME curl -s -H 'Host: staging.crm.test.local' http://127.0.0.1/version)\" = 'crm v2' ]"
+check "staging copy answers (crm v2) on its own domain" bash -c "for i in \$(seq 1 20); do [ \"\$(docker exec $NAME curl -s -H 'Host: staging.crm.test.local' http://127.0.0.1/version)\" = 'crm v2' ] && exit 0; sleep 1; done; exit 1"
 check "staging .env points at the copied database, mail to log" in_box "grep -q '^DB_DATABASE=crm_test_local_staging_' /var/www/staging.crm.test.local/shared/.env && grep -q '^MAIL_MAILER=log' /var/www/staging.crm.test.local/shared/.env && grep -q '^APP_ENV=staging' /var/www/staging.crm.test.local/shared/.env"
 check "staging database has the data (users table)" in_box "mysql -N -e 'SHOW DATABASES' | grep -q '^crm_test_local_staging_' && mysql -N -e \"SHOW TABLES FROM \$(mysql -N -e 'SHOW DATABASES' | grep '^crm_test_local_staging_')\" | grep -qx users"
 check "staging runs as its own user" in_box "[ \$(stat -c %U /var/www/staging.crm.test.local) = nc_staging_crm_test_local ]"
@@ -925,6 +925,114 @@ check "duplicate / system usernames refused" test "$(post_code sftp '{"username"
 check "delete SFTP account" jqe "$(curl -fsSk -b "$JAR" -H "Origin: $U" -X DELETE "$U/api/sftp/appftp")" '.ok==true'
 check "…the site's PHP workers kept running" in_box "pgrep -u nc_app_test_local php-fpm >/dev/null"
 check "…user, mount and fstab line gone; files kept" in_box "! getent passwd appftp && ! grep -q nexacloud-sftp:appftp /etc/fstab && ! mountpoint -q /srv/sftp/appftp/site 2>/dev/null && [ -f $APP_DIR/up.txt ] && rm -f $APP_DIR/up.txt"
+
+# ------------------------------------------------------------------ batch C
+step "Server tools: timezone, updates, SSH keys, reboot guard"
+in_box "printf '[Service]\nEnvironment=NEXACLOUD_CLOUDFLARE_API=http://127.0.0.1:8098/cf\nEnvironment=NEXACLOUD_HOSTINGER_API=http://127.0.0.1:8098/hs\nEnvironment=NEXACLOUD_WP_URL=file:///opt/wordpress-latest.tar.gz\nEnvironment=NEXACLOUD_CLAMAV_DB=/opt/clamdb\n' > /etc/systemd/system/nexacloud.service.d/batchc.conf && systemctl daemon-reload && systemctl restart nexacloud"
+wait_health; login "$PASS"; sudo_on "$PASS"
+check "server info has a timezone" jqe "$(api server)" '(.timezone|type)=="string" and (.uptime_secs|type)=="number"'
+check "timezone list includes Europe/Amsterdam" jqe "$(api server/timezones)" 'index("Europe/Amsterdam")!=null'
+check "set timezone Europe/Amsterdam" jqe "$(curl -fsSk -b "$JAR" -H "Origin: $U" -H 'Content-Type: application/json' -X PUT -d '{"timezone":"Europe/Amsterdam"}' "$U/api/server/timezone")" '.timezone=="Europe/Amsterdam"'
+check "…the server uses it" in_box "readlink /etc/localtime | grep -q Europe/Amsterdam"
+check "unknown timezone refused" test "$(code -b "$JAR" -H "Origin: $U" -H 'Content-Type: application/json' -X PUT -d '{"timezone":"Mars/Base"}' "$U/api/server/timezone")" = 400
+curl -fsSk -b "$JAR" -H "Origin: $U" -H 'Content-Type: application/json' -X PUT -d '{"timezone":"UTC"}' "$U/api/server/timezone" >/dev/null
+st="$(wait_job2 "$(post_json server/updates/check '{}' | jq -r .job_id)")"
+check "check for updates (apt-get update) → ok" test "$st" = ok
+check "updates list" jqe "$(api server/updates)" '(.packages|type)=="array" and (.security|type)=="number"'
+check "reboot needs the server name typed" test "$(post_code server/reboot '{"confirm":"nope"}')" = 400
+in_box "rm -f /tmp/rk1 /tmp/rk1.pub /tmp/rk2 /tmp/rk2.pub && ssh-keygen -q -t ed25519 -N '' -C first@test -f /tmp/rk1 && ssh-keygen -q -t ed25519 -N '' -C second@test -f /tmp/rk2 && rm -f /root/.ssh/authorized_keys"
+K1="$(jq -nc --arg k "$(in_box 'cat /tmp/rk1.pub')" '{key:$k}')"; K2="$(jq -nc --arg k "$(in_box 'cat /tmp/rk2.pub')" '{key:$k}')"
+FP1="$(post_json server/ssh-keys "$K1" | jq -r .fingerprint)"
+check "add root SSH key" bash -c "[[ '$FP1' == SHA256:* ]]"
+check "…listed with its comment" jqe "$(api server/ssh-keys)" '[.keys[] | select(.comment=="first@test")] | length==1'
+check "duplicate key refused" test "$(post_code server/ssh-keys "$K1")" = 400
+check "garbage key refused" test "$(post_code server/ssh-keys '{"key":"ssh-ed25519 notakey"}')" = 400
+check "removing the last key is refused" test "$(code -b "$JAR" -H "Origin: $U" -X DELETE "$U/api/server/ssh-keys/$(jq -rn --arg f "$FP1" '$f|@uri')")" = 400
+post_json server/ssh-keys "$K2" >/dev/null
+check "with two keys, one can be removed" jqe "$(curl -fsSk -b "$JAR" -H "Origin: $U" -X DELETE "$U/api/server/ssh-keys/$(jq -rn --arg f "$FP1" '$f|@uri')")" '.ok==true'
+check "…file is 600 and has only the second key" in_box "[ \$(stat -c %a /root/.ssh/authorized_keys) = 600 ] && grep -q second@test /root/.ssh/authorized_keys && ! grep -q first@test /root/.ssh/authorized_keys"
+
+step "WordPress in one click"
+check "username 'admin' refused" test "$(post_code apps/wordpress '{"domain":"wp.test.local","php_version":"8.3","title":"T","admin_user":"admin","admin_email":"a@example.com","admin_password":"wp-admin-pass-123"}')" = 400
+WJ="$(post_json apps/wordpress '{"domain":"wp.test.local","php_version":"8.3","title":"NC Blog","admin_user":"sara","admin_email":"sara@example.com","admin_password":"wp-admin-pass-123"}' | jq -r .job_id)"
+st="$(wait_job2 "$WJ")"; [ "$st" = ok ] || api "jobs/$WJ" | jq -r .log | tail -30
+check "WordPress installer → ok" test "$st" = ok
+check "…home page is the WordPress blog" in_box "curl -s -H 'Host: wp.test.local' http://127.0.0.1/ | grep -q 'NC Blog'"
+check "…admin account sara exists" in_box "mysql -N -e 'SELECT user_login FROM wp_test_local.wp_users' | grep -qx sara"
+check "…wp-config.php readable by the site user only" in_box "[ \"\$(stat -c '%a %U' /var/www/wp.test.local/wp-config.php)\" = '640 nc_wp_test_local' ]"
+check "…files owned by the site user, PHP runs as it" in_box "[ \$(stat -c %U /var/www/wp.test.local/wp-settings.php) = nc_wp_test_local ] && [ -f /etc/php/8.3/fpm/pool.d/nc_wp_test_local.conf ]"
+check "…sign-in page answers" in_box "[ \$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: wp.test.local' http://127.0.0.1/wp-login.php) = 200 ]"
+check "…listed as a project" jqe "$(api projects)" '[.[] | select(.id=="wp.test.local")] | length==1'
+check "same domain twice refused" test "$(post_code apps/wordpress '{"domain":"wp.test.local","php_version":"8.3","title":"T","admin_user":"bob","admin_email":"a@example.com","admin_password":"wp-admin-pass-123"}')" = 400
+
+step "Node.js app"
+in_box 'set -e
+rm -rf /srv/git/nodeapp.git /tmp/nodesrc && git init -q --bare /srv/git/nodeapp.git && mkdir /tmp/nodesrc && cd /tmp/nodesrc
+printf "{\"name\":\"nodeapp\",\"version\":\"1.0.0\",\"scripts\":{\"start\":\"node server.js\"}}\n" > package.json
+printf "require(\"http\").createServer((q, r) => r.end(\"node v1 on \" + process.env.PORT + \" \" + (process.env.GREETING||\"\"))).listen(process.env.PORT)\n" > server.js
+git init -q -b main && git config user.email dev@example.com && git config user.name Dev && git add -A && git commit -qm v1 && git remote add origin /srv/git/nodeapp.git && git push -q origin main && chmod -R a+rX /srv/git/nodeapp.git'
+NJ="$(post_json apps/node '{"domain":"node.test.local","repo":"/srv/git/nodeapp.git","branch":"main","env":{"GREETING":"hello"}}')"
+NP="$(jq -r .port <<<"$NJ")"
+st="$(wait_job2 "$(jq -r .job_id <<<"$NJ")")"; [ "$st" = ok ] || api "jobs/$(jq -r .job_id <<<"$NJ")" | jq -r .log | tail -30
+check "Node.js wizard → ok (port $NP)" test "$st" = ok
+check "…first deploy ok" bash -c "for i in \$(seq 1 300); do s=\$(curl -fsSk -b '$JAR' '$U/api/projects/node.test.local/deploys' | jq -r '.[0].status // empty'); case \$s in ok) exit 0;; failed|rolled_back) exit 1;; esac; sleep 1; done; exit 1"
+check "…app answers through nginx with PORT and .env" bash -c "for i in \$(seq 1 20); do docker exec $NAME curl -s -H 'Host: node.test.local' http://127.0.0.1/ | grep -qx 'node v1 on $NP hello' && exit 0; sleep 1; done; exit 1"
+check "…runs as its own user under systemd" in_box "systemctl is-active --quiet nexacloud-node-node-test-local && [ \$(ps -o user= -p \$(systemctl show -p MainPID --value nexacloud-node-node-test-local)) = nc_node_test_local ]"
+check "…status endpoint" jqe "$(api projects/node.test.local/node)" ".active==\"active\" and .port==$NP"
+check "…listed as a Node project" jqe "$(api workspace)" '[.[] | select(.id=="node.test.local")][0].project.kind=="node"'
+in_box "cd /tmp/nodesrc && sed -i 's/node v1/node v2/' server.js && git commit -qam v2 && git push -q origin main && chmod -R a+rX /srv/git/nodeapp.git"
+st="$(wait_job2 "$(post_json projects/node.test.local/deploy '{}' | jq -r .job_id)")"
+check "deploy v2 → restarted and serving v2" bash -c "[ '$st' = ok ] && for i in \$(seq 1 20); do docker exec $NAME curl -s -H 'Host: node.test.local' http://127.0.0.1/ | grep -q 'node v2' && exit 0; sleep 1; done; exit 1"
+check "restart button" jqe "$(post_json projects/node.test.local/node/restart '{}')" '.ok==true'
+
+step "Malware scan, visitor stats"
+st="$(wait_job2 "$(post_json malware/install '{}' | jq -r .job_id)")"
+check "ClamAV ready (test signatures)" bash -c "[ '$st' = ok ] && curl -fsSk -b '$JAR' '$U/api/malware' | jq -e '.installed==true'"
+in_box "mkdir -p /var/www/wp.test.local/wp-content/uploads && echo WDVPIVAlQEFQWzRcUFpYNTQoUF4pN0NDKTd9JEVJQ0FSLVNUQU5EQVJELUFOVElWSVJVUy1URVNULUZJTEUhJEgrSCo= | base64 -d > /var/www/wp.test.local/wp-content/uploads/evil.php"
+check "test file is the 68-byte EICAR string" in_box "[ \$(md5sum < /var/www/wp.test.local/wp-content/uploads/evil.php | cut -c1-32) = 44d88612fea8a8f36de82e1278abb02f ]"
+st="$(wait_job2 "$(post_json malware/scan '{"path":"/var/www/wp.test.local"}' | jq -r .job_id)")"
+check "scan wp.test.local → ok" test "$st" = ok
+check "…found the test file" jqe "$(api malware)" '.last.found==[{"file":"/var/www/wp.test.local/wp-content/uploads/evil.php","signature":"Eicar-Test-Signature.UNOFFICIAL"}] or (.last.found|length==1 and (.[0].file|endswith("evil.php")))'
+check "quarantine it" jqe "$(post_json malware/quarantine '{"file":"/var/www/wp.test.local/wp-content/uploads/evil.php"}')" '.ok==true'
+check "…moved out of the site, root-only" in_box "[ ! -e /var/www/wp.test.local/wp-content/uploads/evil.php ] && [ \$(ls /var/lib/nexacloud/quarantine | wc -l) = 1 ]"
+check "scanning /etc is refused" test "$(post_code malware/scan '{"path":"/etc"}')" = 400
+
+check "stats are off until turned on" jqe "$(api sites/wp.test.local/stats)" '.enabled==false'
+check "turn on visitor stats → applied" test "$(plan stats_enable '{}')" = applied
+sleep 2
+in_box "for i in 1 2 3; do curl -s -o /dev/null -A 'Mozilla/5.0 Chrome/120' -e https://news.example/x -H 'Host: wp.test.local' 'http://127.0.0.1/?p=1'; done; curl -s -o /dev/null -A 'Googlebot/2.1' -H 'Host: wp.test.local' http://127.0.0.1/; curl -s -o /dev/null -A 'Mozilla/5.0 Chrome/120' -H 'Host: node.test.local' http://127.0.0.1/"
+check "stats for wp.test.local: 3 page requests, 1 bot, referrer" bash -c "for i in \$(seq 1 10); do curl -fsSk -b '$JAR' '$U/api/sites/wp.test.local/stats?days=1' | jq -e '.totals.human_requests>=3 and .totals.bot_requests>=1 and .totals.visitors>=1 and (.top_referrers[0].name==\"news.example\") and (.top_pages[0].name==\"/\")' >/dev/null && exit 0; sleep 1; done; exit 1"
+check "…other sites' hits not counted" jqe "$(api 'sites/node.test.local/stats?days=1')" '.totals.human_requests>=1 and (.top_referrers|length)==0'
+
+step "DNS zone editor (Cloudflare + Hostinger APIs, faked)"
+check "bad token refused (checked against the provider)" test "$(post_code dns/providers '{"kind":"cloudflare","name":"cf","token":"bad-token-xxxxxxxxxxxxxxxxx"}')" = 400
+CFP="$(post_json dns/providers '{"kind":"cloudflare","name":"My Cloudflare","token":"good-dns-token-0123456789abcdef"}')"
+CFID="$(jq -r .id <<<"$CFP")"
+check "connect Cloudflare; token never sent back" bash -c "[ -n '$CFID' ] && ! curl -fsSk -b '$JAR' '$U/api/dns/providers' | grep -q good-dns-token"
+B='{"type":"A","name":"www","content":"203.0.113.10","ttl":1,"proxied":true}'
+check "add A record www" jqe "$(post_json "dns/$CFID/zones/example.test/records" "$B")" '.ok==true'
+R="$(api "dns/$CFID/zones/example.test/records")"
+RID="$(jq -r '.records[] | select(.name=="www") | .id' <<<"$R")"
+check "…listed as www (relative name), proxied" jqe "$R" '[.records[] | select(.name=="www" and .content=="203.0.113.10" and .proxied==true)] | length==1'
+check "invalid A record refused" test "$(post_code "dns/$CFID/zones/example.test/records" '{"type":"A","name":"x","content":"nope"}')" = 400
+B='{"type":"A","name":"www","content":"203.0.113.11","ttl":300}'
+check "edit it" bash -c "curl -fsSk -b '$JAR' -H 'Origin: $U' -H 'Content-Type: application/json' -X PUT -d '$B' '$U/api/dns/$CFID/zones/example.test/records/$RID' | jq -e .ok >/dev/null && curl -fsSk -b '$JAR' '$U/api/dns/$CFID/zones/example.test/records' | jq -e '[.records[] | select(.content==\"203.0.113.11\")] | length==1'"
+B='{"provider":"google","dkim_selector":"google","dkim_value":"v=DKIM1; k=rsa; p=MIIBtest","dmarc_policy":"quarantine","dmarc_email":"dmarc@example.test"}'
+check "email wizard (Google) → MX, SPF, DKIM, DMARC" bash -c "curl -fsSk -b '$JAR' -H 'Origin: $U' -H 'Content-Type: application/json' -d '$B' '$U/api/dns/$CFID/zones/example.test/email' | jq -e .ok >/dev/null && curl -fsSk -b '$JAR' '$U/api/dns/$CFID/zones/example.test/records' | jq -e '([.records[] | select(.type==\"MX\" and .content==\"smtp.google.com\")] | length==1) and ([.records[] | select(.name==\"_dmarc\")] | length==1) and ([.records[] | select(.name==\"google._domainkey\")] | length==1) and ([.records[] | select(.content|startswith(\"v=spf1 include:_spf.google.com\"))] | length==1)'"
+check "running it again replaces instead of duplicating" bash -c "curl -fsSk -b '$JAR' -H 'Origin: $U' -H 'Content-Type: application/json' -d '$B' '$U/api/dns/$CFID/zones/example.test/email' >/dev/null && curl -fsSk -b '$JAR' '$U/api/dns/$CFID/zones/example.test/records' | jq -e '[.records[] | select(.type==\"MX\")] | length==1'"
+check "delete the www record" jqe "$(curl -fsSk -b "$JAR" -H "Origin: $U" -X DELETE "$U/api/dns/$CFID/zones/example.test/records/$RID")" '.ok==true'
+check "unknown zone → clear error" test "$(code -b "$JAR" "$U/api/dns/$CFID/zones/other.test/records")" = 404
+
+HSID="$(post_json dns/providers '{"kind":"hostinger","name":"Hostinger","token":"good-dns-token-0123456789abcdef"}' | jq -r .id)"
+check "connect Hostinger" test -n "$HSID"
+post_json "dns/$HSID/zones/example.test/records" '{"type":"A","name":"@","content":"203.0.113.20","ttl":3600}' >/dev/null
+post_json "dns/$HSID/zones/example.test/records" '{"type":"A","name":"@","content":"203.0.113.21","ttl":3600}' >/dev/null
+check "Hostinger: two A records in one set" jqe "$(api "dns/$HSID/zones/example.test/records")" '[.records[] | select(.type=="A" and .name=="@")] | length==2'
+HRID="$(api "dns/$HSID/zones/example.test/records" | jq -r '.records[] | select(.content=="203.0.113.20") | .id')"
+check "Hostinger: delete one keeps the other" bash -c "curl -fsSk -b '$JAR' -H 'Origin: $U' -X DELETE '$U/api/dns/$HSID/zones/example.test/records/$(jq -rn --arg i "$HRID" '$i|@uri')' >/dev/null && curl -fsSk -b '$JAR' '$U/api/dns/$HSID/zones/example.test/records' | jq -e '[.records[] | select(.type==\"A\")] | map(.content)==[\"203.0.113.21\"]'"
+check "Hostinger: MX via email wizard (priority kept)" bash -c "curl -fsSk -b '$JAR' -H 'Origin: $U' -H 'Content-Type: application/json' -d '{\"provider\":\"zoho\"}' '$U/api/dns/$HSID/zones/example.test/email' >/dev/null && curl -fsSk -b '$JAR' '$U/api/dns/$HSID/zones/example.test/records' | jq -e '[.records[] | select(.type==\"MX\")] | map(\"\(.priority) \(.content)\") == [\"10 mx.zoho.com\",\"20 mx2.zoho.com\",\"50 mx3.zoho.com\"]'"
+check "wildcard SSL needs Cloudflare" test "$(post_code "dns/$HSID/wildcard" '{"zone":"example.test","email":"a@example.test"}')" = 400
+check "disconnect a DNS account" jqe "$(curl -fsSk -b "$JAR" -H "Origin: $U" -X DELETE "$U/api/dns/providers/$HSID")" '.ok==true'
 
 # ------------------------------------------------------------------ throttle
 step "Login throttling"

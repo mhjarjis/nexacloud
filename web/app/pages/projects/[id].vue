@@ -69,16 +69,16 @@ async function connectGit() {
 const phpTarget = ref('')
 const phpOptions = computed(() => (php.data.value?.versions ?? []).filter((v) => v.fpm_installed).map((v) => ({ value: v.version, label: `PHP ${v.version}`, hint: v.version === ov.data.value?.site.php_version ? 'current' : (v.eol ? 'end of life' : undefined), disabled: v.version === ov.data.value?.site.php_version })))
 
-type Tab = 'overview' | 'env' | 'logs' | 'deploys' | 'settings'
+type Tab = 'overview' | 'env' | 'logs' | 'deploys' | 'visitors' | 'settings'
 const qTab = String(route.query.tab ?? '')
-const tab = ref<Tab>(route.query.new || ['setup', 'pipeline', 'deploys'].includes(qTab) ? 'deploys' : (['env', 'logs', 'settings'].includes(qTab) ? qTab as Tab : 'overview'))
+const tab = ref<Tab>(route.query.new || ['setup', 'pipeline', 'deploys'].includes(qTab) ? 'deploys' : (['env', 'logs', 'settings', 'visitors'].includes(qTab) ? qTab as Tab : 'overview'))
 const err = ref<string | null>(null)
 const deployJob = ref<string | null>(null)
 const isLaravel = computed(() => p.data.value?.kind === 'laravel')
 const tabs: [Tab, string][] = [
-  ['overview', 'Overview'], ['env', 'Environment'], ['logs', 'Logs'], ['deploys', 'Deployments'], ['settings', 'Settings'],
+  ['overview', 'Overview'], ['env', 'Environment'], ['logs', 'Logs'], ['deploys', 'Deployments'], ['visitors', 'Visitors'], ['settings', 'Settings'],
 ]
-const TAB_ICONS: Record<Tab, IconName> = { overview: 'dashboard', env: 'key', logs: 'list', deploys: 'git', settings: 'settings' }
+const TAB_ICONS: Record<Tab, IconName> = { overview: 'dashboard', env: 'key', logs: 'list', deploys: 'git', visitors: 'users', settings: 'settings' }
 
 function fail(e: unknown) { if (!(e instanceof SudoCancelled)) err.value = errorMessage(e) }
 
@@ -147,6 +147,11 @@ async function runArtisan(cmd = artisanCmd.value.trim()) {
   } catch (e) { fail(e) }
 }
 const maintBusy = ref(false)
+const nodeSt = ref<{ unit: string; active: string; port: number | null; logs: string } | null>(null)
+const nodeBusy = ref(false)
+async function loadNode() { if (p.data.value?.kind !== 'node') return; try { nodeSt.value = await api.get(`/api/projects/${enc.value}/node`) } catch { nodeSt.value = null } }
+async function restartNode() { nodeBusy.value = true; err.value = null; try { await api.post(`/api/projects/${enc.value}/node/restart`); await new Promise((r) => setTimeout(r, 1500)); await loadNode() } catch (e) { fail(e) } finally { nodeBusy.value = false } }
+watch(() => p.data.value?.kind, (k) => { if (k === 'node') loadNode() }, { immediate: true })
 const meInfo = useResource<{ role: string }>('/api/auth/me')
 const meRole = computed(() => meInfo.data.value?.role ?? '')
 interface SiteModelLite { root: string | null; project_dir: string | null; options: Record<string, unknown> & { maintenance?: boolean; front_controller?: boolean } }
@@ -559,6 +564,16 @@ async function disconnect() {
 
   <!-- ================================================================ overview -->
   <div v-if="tab === 'overview'" class="stack" style="gap: 20px">
+    <section v-if="p.data.value?.kind === 'node'" class="card card-pad stack" aria-labelledby="node-h" style="gap: 10px">
+      <div class="row" style="justify-content: space-between; gap: 10px; flex-wrap: wrap">
+        <div class="row" style="gap: 10px"><AppIcon name="server" :size="18" /><h2 id="node-h">Node.js process</h2>
+          <span v-if="nodeSt" :class="`pill ${nodeSt.active === 'active' ? 'ok' : 'bad'}`">{{ nodeSt.active }}</span>
+          <span v-if="nodeSt?.port" class="mono small muted">{{ nodeSt.unit }} · 127.0.0.1:{{ nodeSt.port }}</span>
+        </div>
+        <div class="row" style="gap: 8px"><button type="button" class="btn btn-s" @click="loadNode"><AppIcon name="refresh" :size="14" /> Refresh</button><button type="button" class="btn btn-s btn-p" :disabled="nodeBusy" @click="restartNode">{{ nodeBusy ? 'Restarting…' : 'Restart' }}</button></div>
+      </div>
+      <pre v-if="nodeSt?.logs" class="logview mono" style="max-height: 260px; min-height: 0">{{ nodeSt.logs }}</pre>
+    </section>
     <JobLog v-if="artisanJob" :key="artisanJob" :job-id="artisanJob" status="running" @finished="onArtisanDone" />
     <section v-if="ov.data.value?.permissions && !ov.data.value.permissions.ok" class="card perm" role="alert">
       <div class="row wrap" style="gap: 12px; align-items: flex-start">
@@ -935,6 +950,7 @@ async function disconnect() {
   </div>
   </div>
   <!-- ================================================================ settings -->
+  <SiteStats v-if="tab === 'visitors' && p.data.value" :site-id="p.data.value.site_id" />
   <div v-if="tab === 'settings' && p.data.value" class="stack" style="gap: 16px">
     <div class="split">
       <section class="card card-pad stack set-card" aria-labelledby="set-php">

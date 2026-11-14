@@ -20,10 +20,10 @@ const defaults = useResource<{ php_versions: string[]; mysql: boolean; postgres:
 const sys = useResource<{ hostname: string }>('/api/system')
 
 // ---- list
-const filter = ref<'all' | 'laravel' | 'php' | 'static'>('all')
+const filter = ref<'all' | 'laravel' | 'php' | 'static' | 'node'>('all')
 const q = ref(String(route.query.q ?? ''))
 const TINTS = ['#3DDC97', '#6CB4FF', '#F7C55E', '#B79CFF', '#FF9A9A', '#7FE0D4']
-const all = computed(() => (ws.data.value ?? []).filter((c) => c.site.kind !== 'proxy').map((c, i) => {
+const all = computed(() => (ws.data.value ?? []).filter((c) => c.site.kind !== 'proxy' || c.project?.kind === 'node').map((c, i) => {
   const code = c.monitor.last_code
   const failed = c.last_deploy && ['failed', 'rolled_back'].includes(c.last_deploy.status)
   const eol = php.data.value?.versions.find((v) => v.version === c.site.php_version)?.eol
@@ -33,10 +33,10 @@ const all = computed(() => (ws.data.value ?? []).filter((c) => c.site.kind !== '
         : c.site.ssl_expires && (daysUntil(c.site.ssl_expires) ?? 99) < 14 ? ['warn', 'SSL expiring']
           : code === null ? ['off', 'Not checked yet'] : ['ok', 'Healthy']
   return {
-    id: c.id, k: c.site.kind,
+    id: c.id, k: c.project?.kind === 'node' ? 'node' : c.site.kind,
     name: c.id,
     repo: c.project?.repo ? `${c.project.repo.replace(/^.*[:/]([^/:]+\/[^/]+?)(\.git)?$/, '$1')} · ${c.project.branch}` : (c.site.root ?? ''),
-    fw: ({ laravel: 'Laravel', php: 'PHP (OOP)', static: 'Static' } as Record<string, string>)[c.site.kind] ?? c.site.kind,
+    fw: c.project?.kind === 'node' ? 'Node.js' : (({ laravel: 'Laravel', php: 'PHP (OOP)', static: 'Static' } as Record<string, string>)[c.site.kind] ?? c.site.kind),
     php: c.site.php_version,
     ssl: c.site.ssl ? 'HTTPS' : 'No HTTPS',
     extra: c.project?.repo ? (c.project.strategy === 'releases' ? 'Zero-downtime' : 'Git deploys') : (c.managed ? 'No Git yet' : 'Unmanaged'),
@@ -52,7 +52,7 @@ const all = computed(() => (ws.data.value ?? []).filter((c) => c.site.kind !== '
 const shown = computed(() => all.value
   .filter((p) => filter.value === 'all' || p.k === filter.value)
   .filter((p) => !q.value.trim() || `${p.name} ${p.repo}`.toLowerCase().includes(q.value.trim().toLowerCase())))
-const filters = computed(() => ([['all', 'All'], ['laravel', 'Laravel'], ['php', 'Plain PHP'], ['static', 'Static']] as const).map(([id, label]) => ({
+const filters = computed(() => ([['all', 'All'], ['laravel', 'Laravel'], ['php', 'Plain PHP'], ['static', 'Static'], ['node', 'Node.js']] as const).map(([id, label]) => ({
   id, label: `${label} · ${all.value.filter((p) => id === 'all' || p.k === id).length}`,
   pressed: filter.value === id,
   bg: filter.value === id ? '#1F2833' : 'transparent',
@@ -67,14 +67,20 @@ async function deploy(id: string) {
 }
 
 // ---- new project
-const kind = ref<'laravel' | 'php' | 'static'>('laravel')
-const types = computed(() => ([['laravel', 'Laravel', 'Artisan, queues, scheduler'], ['php', 'Plain PHP', 'OOP / custom, any web root'], ['static', 'Static', 'HTML or built SPA']] as const).map(([id, label, hint]) => ({
+const kind = ref<'laravel' | 'php' | 'static' | 'wordpress' | 'node'>((['wordpress', 'node'].includes(String(route.query.kind)) ? String(route.query.kind) : 'laravel') as 'laravel')
+const types = computed(() => ([['laravel', 'Laravel', 'Artisan, queues, scheduler'], ['php', 'Plain PHP', 'OOP / custom, any web root'], ['static', 'Static', 'HTML or built SPA'], ['wordpress', 'WordPress', 'One click: files, database, admin'], ['node', 'Node.js', 'npm start behind nginx']] as const).map(([id, label, hint]) => ({
   id, label, hint, pressed: kind.value === id,
   bg: kind.value === id ? '#13211B' : '#0F1318',
   border: kind.value === id ? '#3DDC97' : '#2A3441',
 })))
 const isLaravel = computed(() => kind.value === 'laravel')
 const isPlain = computed(() => kind.value === 'php')
+const isWp = computed(() => kind.value === 'wordpress')
+const isNode = computed(() => kind.value === 'node')
+const usesPhp = computed(() => ['laravel', 'php', 'wordpress'].includes(kind.value))
+const wp = reactive({ title: '', user: '', email: '', password: '', hide: false })
+const nodeF = reactive({ start: 'npm start', port: '' })
+function genWpPw() { const a = new Uint8Array(18); crypto.getRandomValues(a); wp.password = btoa(String.fromCharCode(...a)).replace(/[+/=]/g, '').slice(0, 20) }
 const f = reactive({ repo: '', branch: 'main', php: '', domain: '', webRoot: 'public_html', db: 'mysql', ssl: false, sslEmail: '', backup: true, worker: true, scheduler: true, npm: false, composer: true })
 watch(() => defaults.data.value, (d) => { if (d && !f.php) f.php = d.php_versions[d.php_versions.length - 1] ?? '' }, { immediate: true })
 const repoOptions = computed(() => [...new Set((ws.data.value ?? []).map((c) => c.project?.repo).filter((r): r is string => !!r))].map((r) => ({ value: r, label: r.replace(/^git@github\.com:/, '').replace(/\.git$/, ''), hint: 'used before' })))
@@ -92,6 +98,8 @@ const repoOk = computed(() => /^(git@[\w.-]+:[\w./-]+|https:\/\/[\w.-]+\/[\w./-]
 const host = computed(() => sys.data.value?.hostname ?? 'server')
 const d = computed(() => f.domain.trim().toLowerCase() || 'blog.example.com')
 const plan = computed(() => {
+  if (isWp.value) return [`✓ /var/www/${d.value} (own Linux user + PHP-FPM ${f.php} pool)`, '✓ latest WordPress from wordpress.org', '✓ MySQL database + user, wp-config.php with fresh salts', `✓ admin account ${wp.user.trim() || '…'} (file editing in wp-admin turned off)`, f.ssl ? '✓ SSL certificate + HTTP→HTTPS redirect' : '✓ HTTP (add SSL any time)'].join('\n')
+  if (isNode.value) return [`✓ /var/www/${d.value} (own Linux user)`, '✓ Node.js from Ubuntu (installed if missing)', `✓ systemd service running "${nodeF.start.trim() || 'npm start'}" with PORT=${nodeF.port.trim() || 'auto'}`, '✓ nginx reverse proxy (WebSockets work)', f.ssl ? '✓ SSL certificate + HTTP→HTTPS redirect' : '✓ HTTP (add SSL any time)', `✓ ${f.repo.trim() ? 'npm install + build on every deploy, then restart' : 'Git repository needed'}`].join('\n')
   const lines: string[] = [`✓ /var/www/${d.value} (own Linux user)`]
   if (kind.value === 'static') lines.push(`✓ nginx vhost with gzip + cache headers`)
   else lines.push(`✓ nginx vhost → /${isLaravel.value ? 'public' : (f.webRoot.trim().replace(/^\/+/, '') || '')} · PHP-FPM ${f.php} pool`)
@@ -103,7 +111,13 @@ const plan = computed(() => {
   lines.push(`✓ ${f.repo.trim() ? 'first deploy from Git → zero-downtime releases' : 'Git repository needed'}`)
   return lines.join('\n')
 })
-const canCreate = computed(() => domainOk.value && repoOk.value && (kind.value === 'static' || !!f.php) && (!f.ssl || /.+@.+\..+/.test(f.sslEmail)))
+const sslOk = computed(() => !f.ssl || /.+@.+\..+/.test(f.sslEmail))
+const canCreate = computed(() => {
+  if (!domainOk.value || !sslOk.value) return false
+  if (isWp.value) return !!f.php && !!wp.title.trim() && wp.user.trim().length >= 3 && wp.user.trim().toLowerCase() !== 'admin' && /.+@.+\..+/.test(wp.email) && wp.password.length >= 12
+  if (isNode.value) return repoOk.value && !!nodeF.start.trim()
+  return repoOk.value && (kind.value === 'static' || !!f.php)
+})
 const creating = ref(false)
 const createErr = ref<string | null>(null)
 const job = ref<string | null>(null)
@@ -113,6 +127,16 @@ async function create() {
   createErr.value = null
   creating.value = true
   try {
+    if (isWp.value || isNode.value) {
+      const url = isWp.value ? '/api/apps/wordpress' : '/api/apps/node'
+      const b = isWp.value
+        ? { domain: f.domain.trim().toLowerCase(), php_version: f.php || '8.3', title: wp.title.trim(), admin_user: wp.user.trim(), admin_email: wp.email.trim(), admin_password: wp.password, hide_from_search: wp.hide, ssl_email: f.ssl ? f.sslEmail.trim() : '' }
+        : { domain: f.domain.trim().toLowerCase(), repo: f.repo.trim(), branch: f.branch.trim() || 'main', start: nodeF.start.trim(), port: nodeF.port.trim() ? Number(nodeF.port) : null, ssl_email: f.ssl ? f.sslEmail.trim() : '', releases: true, auto_deploy: true }
+      const r = await api.post<{ job_id: string; project_id: string }>(url, b)
+      job.value = r.job_id
+      newId.value = r.project_id
+      return
+    }
     const body = {
       kind: kind.value, domain: f.domain.trim().toLowerCase(), php_version: f.php || '8.3', repo: f.repo.trim(), branch: f.branch.trim() || 'main',
       database: kind.value === 'static' ? 'none' : f.db, isolate: true, releases: true, ssl_email: f.ssl ? f.sslEmail.trim() : '',
@@ -126,7 +150,7 @@ async function create() {
   } catch (e) { if (!(e instanceof SudoCancelled)) createErr.value = errorMessage(e) } finally { creating.value = false }
 }
 function onJobDone(s: string) { jobState.value = s; ws.refresh() }
-function resetForm() { job.value = null; jobState.value = null; f.domain = ''; f.repo = '' }
+function resetForm() { job.value = null; jobState.value = null; f.domain = ''; f.repo = ''; wp.password = '' }
 onMounted(() => { if (route.query.new) setTimeout(() => document.getElementById('newp')?.scrollIntoView({ behavior: 'smooth' }), 200) })
 </script>
 
@@ -189,7 +213,7 @@ onMounted(() => { if (route.query.new) setTimeout(() => document.getElementById(
       <template v-if="!job">
         <fieldset style="border: 0; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px">
           <legend style="font-size: 13px; font-weight: 500; color: #C5CEDA; margin-bottom: 8px">1. What are you deploying?</legend>
-          <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px">
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 8px">
             <button v-for="t in types" :key="t.id" type="button" :aria-pressed="t.pressed" :style="`min-height: 84px; padding: 12px 10px; border-radius: 10px; cursor: pointer; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; text-align: left; background: ${t.bg}; border: 1px solid ${t.border}; color: #E7ECF2`" @click="kind = t.id">
               <span style="font-size: 14px; font-weight: 600">{{ t.label }}</span>
               <span style="font-size: 12px; color: #A3AEBD; line-height: 1.35">{{ t.hint }}</span>
@@ -199,20 +223,40 @@ onMounted(() => { if (route.query.new) setTimeout(() => document.getElementById(
 
         <div style="display: flex; flex-direction: column; gap: 12px">
           <p style="font-size: 13px; font-weight: 500; color: #C5CEDA">2. Source &amp; domain</p>
-          <label class="field"><span>GitHub repository</span>
+          <label v-if="!isWp" class="field"><span>GitHub repository</span>
             <SearchSelect v-model="f.repo" :options="repoOptions" allow-custom mono placeholder="git@github.com:owner/repo.git" aria-label="GitHub repository" />
           </label>
           <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px">
-            <label class="field"><span>Branch</span><SearchSelect v-model="f.branch" :options="['main', 'master', 'production', 'develop']" allow-custom mono placeholder="main" aria-label="Branch" /></label>
-            <label v-if="kind !== 'static'" class="field"><span>PHP version</span><SearchSelect v-model="f.php" :options="phpOptions" placeholder="Choose…" aria-label="PHP version" /></label>
+            <label v-if="!isWp" class="field"><span>Branch</span><SearchSelect v-model="f.branch" :options="['main', 'master', 'production', 'develop']" allow-custom mono placeholder="main" aria-label="Branch" /></label>
+            <label v-if="usesPhp" class="field"><span>PHP version</span><SearchSelect v-model="f.php" :options="phpOptions" placeholder="Choose…" aria-label="PHP version" /></label>
           </div>
           <label class="field"><span>Domain or subdomain</span><input v-model="f.domain" class="in" type="text" placeholder="blog.example.com" autocomplete="off" spellcheck="false"></label>
           <p v-if="isLaravel" style="font-size: 12px; color: #A3AEBD">Web root is set to <span class="mono" style="color: #C5CEDA">/public</span> automatically.</p>
           <label v-if="isPlain" class="field"><span>Web root (folder with index.php)</span><input v-model="f.webRoot" class="in mono" type="text" placeholder="/public_html"></label>
-          <p style="font-size: 12px; color: #A3AEBD">Private repos: use the git@github.com:… form — the read-only deploy key is shown on the project page.</p>
+          <p v-if="!isWp" style="font-size: 12px; color: #A3AEBD">Private repos: use the git@github.com:… form — the read-only deploy key is shown on the project page.</p>
         </div>
 
-        <div v-if="kind !== 'static'" style="display: flex; flex-direction: column; gap: 12px">
+        <div v-if="isWp" style="display: flex; flex-direction: column; gap: 12px">
+          <p style="font-size: 13px; font-weight: 500; color: #C5CEDA">3. WordPress</p>
+          <label class="field"><span>Site title</span><input v-model="wp.title" class="in" type="text" placeholder="My Blog" maxlength="120"></label>
+          <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px">
+            <label class="field"><span>Admin username</span><input v-model="wp.user" class="in mono" type="text" placeholder="not 'admin' — e.g. sara" autocomplete="off" spellcheck="false"></label>
+            <label class="field"><span>Admin email</span><input v-model="wp.email" class="in" type="email" placeholder="you@example.com"></label>
+          </div>
+          <label class="field"><span>Admin password</span><div style="display: flex; gap: 6px"><input v-model="wp.password" class="in mono" type="text" placeholder="12+ characters" autocomplete="off" style="flex: 1"><button type="button" class="btn btn-s" title="Generate" @click="genWpPw"><AppIcon name="refresh" :size="14" /></button></div></label>
+          <label style="display: flex; align-items: center; gap: 10px; font-size: 14px; min-height: 32px"><input v-model="wp.hide" type="checkbox" style="width: 18px; height: 18px; accent-color: #3DDC97">Hide from search engines (staging)</label>
+        </div>
+
+        <div v-if="isNode" style="display: flex; flex-direction: column; gap: 12px">
+          <p style="font-size: 13px; font-weight: 500; color: #C5CEDA">3. Process</p>
+          <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 10px">
+            <label class="field"><span>Start command</span><input v-model="nodeF.start" class="in mono" type="text" placeholder="npm start"></label>
+            <label class="field"><span>Port</span><input v-model="nodeF.port" class="in mono" type="text" inputmode="numeric" placeholder="auto (3000+)"></label>
+          </div>
+          <p style="font-size: 12px; color: #A3AEBD">Your app must listen on <span class="mono">process.env.PORT</span>. .env values are loaded into the process.</p>
+        </div>
+
+        <div v-if="isLaravel || isPlain" style="display: flex; flex-direction: column; gap: 12px">
           <p style="font-size: 13px; font-weight: 500; color: #C5CEDA">3. Database</p>
           <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px" role="radiogroup" aria-label="Database">
             <label v-for="o in dbOptions" :key="o.id" :style="`display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 12px; border: 1px solid ${f.db === o.id ? '#3DDC97' : '#2A3441'}; border-radius: 8px; ${f.db === o.id ? 'background: #13211B;' : ''} font-size: 14px; cursor: pointer; ${o.ok ? '' : 'opacity: .45;'}`"><input v-model="f.db" type="radio" name="db" :value="o.id" :disabled="!o.ok" style="accent-color: #3DDC97">{{ o.label }}</label>
@@ -223,7 +267,7 @@ onMounted(() => { if (route.query.new) setTimeout(() => document.getElementById(
           <p style="font-size: 13px; font-weight: 500; color: #C5CEDA">{{ kind === 'static' ? '3' : '4' }}. Extras</p>
           <label style="display: flex; align-items: center; gap: 10px; font-size: 14px; min-height: 32px"><input v-model="f.ssl" type="checkbox" style="width: 18px; height: 18px; accent-color: #3DDC97">Free SSL (Let's Encrypt, auto-renew)</label>
           <input v-if="f.ssl" v-model="f.sslEmail" class="in" type="email" placeholder="Email for certificate notices (you@example.com)" aria-label="Email for certificate notices">
-          <label v-if="kind !== 'static'" style="display: flex; align-items: center; gap: 10px; font-size: 14px; min-height: 32px"><input v-model="f.backup" type="checkbox" :disabled="f.db === 'none'" style="width: 18px; height: 18px; accent-color: #3DDC97">Nightly database backup</label>
+          <label v-if="isLaravel || isPlain" style="display: flex; align-items: center; gap: 10px; font-size: 14px; min-height: 32px"><input v-model="f.backup" type="checkbox" :disabled="f.db === 'none'" style="width: 18px; height: 18px; accent-color: #3DDC97">Nightly database backup</label>
           <div v-if="isLaravel" style="display: flex; flex-direction: column; gap: 10px">
             <label style="display: flex; align-items: center; gap: 10px; font-size: 14px; min-height: 32px"><input v-model="f.worker" type="checkbox" style="width: 18px; height: 18px; accent-color: #3DDC97">Queue worker (Supervisor, 2 processes)</label>
             <label style="display: flex; align-items: center; gap: 10px; font-size: 14px; min-height: 32px"><input v-model="f.scheduler" type="checkbox" style="width: 18px; height: 18px; accent-color: #3DDC97">Scheduler (php artisan schedule:run)</label>
@@ -243,7 +287,11 @@ onMounted(() => { if (route.query.new) setTimeout(() => document.getElementById(
       <template v-else>
         <JobLog :job-id="job" status="running" @finished="onJobDone" />
         <template v-if="jobState === 'ok'">
-          <p v-if="f.repo.trim().startsWith('git@')" class="note">Add the deploy key shown on the project page to GitHub, then press Deploy now.</p>
+          <template v-if="isWp">
+            <p style="font-size: 13px; color: var(--ok)">WordPress is ready.</p>
+            <a class="btn btn-s" style="align-self: flex-start" :href="`${f.ssl ? 'https' : 'http'}://${newId}/wp-admin/`" target="_blank" rel="noopener"><AppIcon name="external" :size="14" /> Open wp-admin</a>
+          </template>
+          <p v-else-if="f.repo.trim().startsWith('git@')" class="note">Add the deploy key shown on the project page to GitHub, then press Deploy now.</p>
           <p v-else style="font-size: 13px; color: var(--ok)">Created. The first deploy is running.</p>
           <div style="display: flex; gap: 8px; flex-wrap: wrap"><NuxtLink class="btn btn-p" :to="`/projects/${encodeURIComponent(newId)}${f.repo.trim().startsWith('git@') ? '?tab=deploys' : '?tab=deploys'}`">Open project</NuxtLink><button type="button" class="btn" @click="resetForm">New project</button></div>
         </template>

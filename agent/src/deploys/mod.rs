@@ -737,6 +737,11 @@ async fn probe(site_id: &str) -> Option<u16> {
 }
 
 async fn reload_fpm(p: &Project, job: &JobCtx) {
+    if p.kind == "node" {
+        // Node apps: restart the service so the health check sees the new code.
+        crate::node::after_deploy(job, p).await;
+        return;
+    }
     let sites = crate::routes::sites::scan(false).await;
     if let Some(v) = sites
         .iter()

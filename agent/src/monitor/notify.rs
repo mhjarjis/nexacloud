@@ -200,7 +200,7 @@ pub fn valid_email(a: &str) -> bool {
 }
 
 /// Quote a value for a curl config file.
-fn cq(s: &str) -> String {
+pub fn cq(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
         match c {

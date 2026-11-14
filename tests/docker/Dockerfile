@@ -25,6 +25,14 @@ RUN curl -fsSL --retry 5 https://getcomposer.org/installer | php -- --install-di
  && COMPOSER_ALLOW_SUPERUSER=1 composer create-project --no-interaction --prefer-dist --no-progress laravel/laravel /opt/laravel-skel \
  && rm -rf /root/.cache/composer
 
+# Batch C: ClamAV and Node.js preinstalled (no signature download in tests: a tiny
+# EICAR-only signature file), WordPress tarball cached for the installer test
+RUN apt-get update && apt-get install -y --no-install-recommends clamav nodejs npm \
+ && apt-get clean && rm -rf /var/lib/apt/lists/* \
+ && systemctl mask clamav-freshclam.service \
+ && mkdir -p /opt/clamdb && printf '44d88612fea8a8f36de82e1278abb02f:68:Eicar-Test-Signature\n' > /opt/clamdb/test.hdb \
+ && curl -fsSL --retry 5 -o /opt/wordpress-latest.tar.gz https://wordpress.org/latest.tar.gz
+
 COPY fixtures/ /fixtures/
 RUN bash /fixtures/setup-sites.sh
 

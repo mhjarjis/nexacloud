@@ -16,6 +16,7 @@ const MORE: { to: string; label: string; icon: IconName }[] = [
   { to: '/files', label: 'File manager', icon: 'folder' },
   { to: '/terminal', label: 'Terminal', icon: 'terminal' },
   { to: '/cron', label: 'Cron jobs', icon: 'clock' },
+  { to: '/server', label: 'Server', icon: 'server' },
   { to: '/monitoring', label: 'Monitoring', icon: 'pulse' },
   { to: '/advisor', label: 'Advisor', icon: 'advisor' },
   { to: '/security', label: 'Security', icon: 'security' },

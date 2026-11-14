@@ -84,6 +84,9 @@ fn pool_user_for_socket(socket: &str) -> Option<String> {
 
 /// The user PHP runs as for this project's site.
 pub fn web_user(p: &Project) -> String {
+    if p.kind == "node" && !p.run_as.is_empty() && p.run_as != "root" {
+        return p.run_as.clone();
+    }
     let model = crate::plans::sites::load_model(
         &crate::changes::ChangeEnv::system(std::path::PathBuf::from("/tmp")),
         &p.site_id,

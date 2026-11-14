@@ -278,6 +278,8 @@ const siteOptionsList = computed(() => (sites.data.value ?? []).map((s) => ({ va
       <p v-else style="font-size: 13px; color: #A3AEBD">Choose a site to edit its nginx config.</p>
     </section>
   </div>
+
+  <DnsZones :domains="(data.data.value?.domains ?? []).map((d) => d.domain)" />
 </template>
 
 <style scoped>

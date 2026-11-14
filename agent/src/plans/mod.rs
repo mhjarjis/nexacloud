@@ -58,6 +58,7 @@ pub enum PlanRequest {
     SitePool { id: String, pool: sites::PoolOptions },
     SiteSslCustom(sites::SslCustomParams),
     IpBlock { ips: Vec<String> },
+    StatsEnable {},
 }
 
 impl PlanRequest {
@@ -91,6 +92,7 @@ impl PlanRequest {
             PlanRequest::SitePool { .. } => "site_pool",
             PlanRequest::SiteSslCustom(_) => "site_ssl_custom",
             PlanRequest::IpBlock { .. } => "ip_block",
+            PlanRequest::StatsEnable {} => "stats_enable",
         }
     }
 }
@@ -140,6 +142,7 @@ pub async fn build(state: &AppState, req: &PlanRequest) -> Result<ChangePlan, St
         PlanRequest::SitePool { id, pool } => sites::plan_pool(env, id, pool),
         PlanRequest::SiteSslCustom(p) => sites::plan_ssl_custom(env, p),
         PlanRequest::IpBlock { ips } => sites::plan_blocklist(env, ips),
+        PlanRequest::StatsEnable {} => crate::stats::plan_enable(env),
         PlanRequest::NginxRaw(p) => sites::plan_raw(env, p),
         PlanRequest::PhpInstall { version } => system::plan_php_install(env, version),
         PlanRequest::PhpExtensions(p) => system::plan_php_extensions(env, p),

@@ -153,6 +153,22 @@ async function saveBlocklist() {
 }
 const sftpAll = useResource<{ username: string; site_id: string; dir: string; mounted: boolean; has_key: boolean }[]>('/api/sftp')
 
+
+// ---- Malware scan (ClamAV)
+interface MalwareStatus { installed: boolean; signatures_updated: number | null; last: { path: string; finished_at: string; scanned_files: number; found: { file: string; signature: string }[]; ok: boolean } | null; quarantine: string[] }
+const mal = useResource<MalwareStatus>('/api/malware')
+const malJob = ref<string | null>(null)
+const malPath = ref<string | number | null>('/var/www')
+const malErr = ref('')
+const scanTargets = computed(() => ['/var/www', '/srv', '/home', ...((sftpAll.data.value ?? []).map((u) => u.dir))].filter((v, i, a) => a.indexOf(v) === i))
+async function malStart(path: string, body?: Record<string, unknown>) {
+  malErr.value = ''
+  try { malJob.value = (await api.post<{ job_id: string }>(path, body)).job_id } catch (e) { if (!(e instanceof SudoCancelled)) malErr.value = errorMessage(e) }
+}
+async function quarantineFile(file: string) {
+  malErr.value = ''
+  try { await api.post('/api/malware/quarantine', { file }); mal.refresh() } catch (e) { if (!(e instanceof SudoCancelled)) malErr.value = errorMessage(e) }
+}
 </script>
 
 <template>
@@ -287,6 +303,38 @@ const sftpAll = useResource<{ username: string; site_id: string; dir: string; mo
         </tbody>
       </table>
     </div>
+  </section>
+
+  <section class="card" aria-labelledby="mal-h" style="overflow: hidden">
+    <div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 16px 20px">
+      <div style="display: flex; flex-direction: column; gap: 4px">
+        <div class="row" style="gap: 10px"><AppIcon name="search" :size="18" /><h2 id="mal-h" style="font-size: 17px; font-weight: 600">Malware scan</h2></div>
+        <span class="small muted">ClamAV checks site files for web shells and known malware. <template v-if="mal.data.value?.installed">Signatures updated {{ mal.data.value.signatures_updated ? formatRelative(new Date(mal.data.value.signatures_updated * 1000).toISOString()) : 'never' }}.</template></span>
+      </div>
+      <div v-if="mal.data.value?.installed" class="row" style="gap: 8px; flex-wrap: wrap">
+        <div style="width: 220px"><SearchSelect v-model="malPath" :options="scanTargets" allow-custom mono placeholder="/var/www" aria-label="Folder to scan" /></div>
+        <button type="button" class="btn btn-p" :disabled="!malPath" @click="malStart('/api/malware/scan', { path: malPath })">Scan now</button>
+      </div>
+      <button v-else type="button" class="btn btn-p" @click="malStart('/api/malware/install')"><AppIcon name="download" :size="14" /> Install ClamAV</button>
+    </div>
+    <p v-if="malErr" class="small" style="color: var(--bad); padding: 0 20px 12px" role="alert">{{ malErr }}</p>
+    <div v-if="malJob" style="padding: 0 20px 16px"><JobLog :key="malJob" :job-id="malJob" status="running" @finished="mal.refresh()" /></div>
+    <template v-if="mal.data.value?.last">
+      <div style="padding: 0 20px 12px" class="small muted">Last scan of <span class="mono">{{ mal.data.value.last.path }}</span> {{ formatRelative(mal.data.value.last.finished_at) }} · {{ mal.data.value.last.scanned_files }} files · <span :style="`color: ${mal.data.value.last.found.length ? 'var(--bad)' : 'var(--ok)'}`">{{ mal.data.value.last.found.length ? `${mal.data.value.last.found.length} infected` : 'nothing found' }}</span></div>
+      <div v-if="mal.data.value.last.found.length" style="overflow-x: auto">
+        <table>
+          <thead><tr><th>File</th><th>Found</th><th><span style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Actions</span></th></tr></thead>
+          <tbody>
+            <tr v-for="f in mal.data.value.last.found" :key="f.file">
+              <td class="mono" style="font-size: 13px; white-space: normal; word-break: break-all">{{ f.file }}</td>
+              <td><span class="pill bad">{{ f.signature }}</span></td>
+              <td><ConfirmAction label="Quarantine" confirm-label="Move to quarantine" question="Move this file out of the site?" @confirm="quarantineFile(f.file)" /></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </template>
+    <p v-if="mal.data.value?.quarantine.length" class="small muted" style="padding: 0 20px 16px">{{ mal.data.value.quarantine.length }} file(s) in quarantine (/var/lib/nexacloud/quarantine, root only).</p>
   </section>
 </template>
 

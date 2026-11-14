@@ -963,6 +963,15 @@ pub fn plan_delete(env: &ChangeEnv, id: &str) -> Result<ChangePlan, String> {
     if host_exists(env, &cron) {
         b = b.delete_file(&cron);
     }
+    let node_unit = format!("/etc/systemd/system/{}.service", crate::node::unit_name(id));
+    if host_exists(env, &node_unit) {
+        let name = crate::node::unit_name(id);
+        b = b
+            .command(["sh", "-c", "systemctl disable --now \"$1\" 2>/dev/null; true", "stop", &name])
+            .delete_file(&node_unit)
+            .command(["systemctl", "daemon-reload"])
+            .on_revert(["sh", "-c", "systemctl daemon-reload; systemctl enable --now \"$1\" 2>/dev/null; true", "start", &name]);
+    }
     if m.runtime == Runtime::Frankenphp {
         let unit = crate::plans::runtime::unit_name(id);
         b = b.command([
@@ -1051,6 +1060,11 @@ pub fn plan_isolate(
         ))
         .build(env)
         .map_err(|e| format!("{e:#}"))
+}
+
+/// Point a site at another certificate (e.g. a wildcard one).
+pub fn plan_use_cert(env: &ChangeEnv, old: &SiteModel, new: SiteModel) -> Result<ChangePlan, String> {
+    plan_model_update(env, old, new, "site_ssl", format!("Use the wildcard certificate for {}", old.id))
 }
 
 fn plan_model_update(
