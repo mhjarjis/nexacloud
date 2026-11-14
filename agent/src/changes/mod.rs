@@ -572,12 +572,30 @@ pub struct Preview {
     pub on_revert: Vec<Vec<String>>,
 }
 
-/// `KEY=value` lines whose key looks secret get their value masked.
+/// `KEY=value` lines whose key looks secret get their value masked, and
+/// PEM private key blocks are hidden.
 pub fn redact_secrets(text: &str) -> String {
+    let mut in_key = false;
     text.lines()
+        .filter_map(|l| {
+            let t = l.trim();
+            if t.starts_with("-----BEGIN") && t.contains("PRIVATE KEY") {
+                in_key = true;
+                return Some(format!("{t}\n••••••"));
+            }
+            if in_key {
+                if t.starts_with("-----END") {
+                    in_key = false;
+                    return Some(t.to_string());
+                }
+                return None;
+            }
+            Some(l.to_string())
+        })
         .map(|l| match l.split_once('=') {
             Some((k, _))
                 if !l.trim_start().starts_with('#')
+                    && k.len() <= 48
                     && ["PASSWORD", "SECRET", "KEY", "TOKEN", "PASS"]
                         .iter()
                         .any(|w| k.to_ascii_uppercase().contains(w)) =>

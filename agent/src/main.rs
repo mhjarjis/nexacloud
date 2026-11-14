@@ -20,6 +20,7 @@ mod monitor;
 mod nginx;
 mod plans;
 mod routes;
+mod sftp;
 mod state;
 mod terminal;
 mod users;
@@ -196,6 +197,8 @@ async fn run(cfg: Config) -> Result<()> {
     {
         let st = state.clone();
         tokio::spawn(async move { cron::startup(&st).await });
+        let st2 = state.clone();
+        tokio::spawn(async move { sftp::startup(&st2).await });
     }
     let app = routes::router(state.clone()).into_make_service_with_connect_info::<SocketAddr>();
 

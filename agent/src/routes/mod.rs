@@ -1,4 +1,5 @@
 pub mod accounts;
+pub mod sitesec;
 pub mod backups;
 pub mod changes;
 pub mod databases;
@@ -92,6 +93,12 @@ pub fn router(state: AppState) -> Router {
         .route("/account/tokens", post(accounts::token_create))
         .route("/account/tokens/{id}", delete(accounts::token_revoke))
         .route("/users", post(accounts::user_create))
+        .route("/sftp", post(crate::sftp::create))
+        .route("/sftp/{user}", put(crate::sftp::update).delete(crate::sftp::remove))
+        .route(
+            "/dbm/{engine}/{db}/import",
+            post(sitesec::sql_import).layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024 * 1024)),
+        )
         .route("/cron", post(crate::cron::create))
         .route("/cron/{id}", put(crate::cron::update).delete(crate::cron::remove))
         .route("/cron/{id}/run", post(crate::cron::run_now))
@@ -187,6 +194,9 @@ pub fn router(state: AppState) -> Router {
         .route("/files/compress", post(crate::files::compress))
         .route("/files/extract", post(crate::files::extract))
         .route("/terminal", get(crate::terminal::open))
+        .route("/blocklist", get(sitesec::blocklist))
+        .route("/sftp", get(crate::sftp::list))
+        .route("/sites/{id}/auth-users", get(sitesec::auth_users).put(sitesec::auth_users_put))
         .route("/cron", get(crate::cron::list_route))
         .route("/cron/{id}/log", get(crate::cron::log))
         .route("/monitor", get(crate::monitor::routes::list))

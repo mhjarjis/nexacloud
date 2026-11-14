@@ -76,6 +76,95 @@ pub struct SiteOptions {
     /// Let's Encrypt challenges.
     #[serde(default)]
     pub maintenance: bool,
+    /// IP addresses / ranges refused with 403 (`deny`).
+    #[serde(default)]
+    pub deny_ips: Vec<String>,
+    /// Folders that ask for a username and password (HTTP basic auth).
+    #[serde(default)]
+    pub protected: Vec<ProtectedDir>,
+    /// Own pages for errors nginx itself returns (e.g. 502 when PHP is down).
+    #[serde(default)]
+    pub error_pages: Vec<ErrorPage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProtectedDir {
+    /// URL path, `/` = the whole site.
+    pub path: String,
+    #[serde(default = "default_realm")]
+    pub realm: String,
+}
+fn default_realm() -> String {
+    "Restricted".into()
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ErrorPage {
+    pub code: u16,
+    /// URL path of the page inside the web root, e.g. `/errors/502.html`.
+    pub path: String,
+}
+
+/// Per-site PHP-FPM pool settings (isolated sites).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PoolOptions {
+    /// ondemand | dynamic | static
+    #[serde(default = "default_pm")]
+    pub pm: String,
+    #[serde(default = "default_children")]
+    pub max_children: u32,
+    #[serde(default = "default_mem")]
+    pub memory_limit: String,
+    #[serde(default = "default_upload")]
+    pub upload_max_filesize: String,
+    #[serde(default = "default_exec")]
+    pub max_execution_time: u32,
+}
+fn default_pm() -> String {
+    "ondemand".into()
+}
+fn default_children() -> u32 {
+    10
+}
+fn default_mem() -> String {
+    "256M".into()
+}
+fn default_upload() -> String {
+    "64M".into()
+}
+fn default_exec() -> u32 {
+    60
+}
+impl Default for PoolOptions {
+    fn default() -> Self {
+        PoolOptions { pm: default_pm(), max_children: default_children(), memory_limit: default_mem(), upload_max_filesize: default_upload(), max_execution_time: default_exec() }
+    }
+}
+
+/// htpasswd file of a site's protected folders.
+pub const HTPASSWD_DIR: &str = "/etc/nginx/nexacloud-auth";
+pub fn htpasswd_path(id: &str) -> String {
+    format!("{HTPASSWD_DIR}/{id}")
+}
+/// Own certificates uploaded in the panel.
+pub const CUSTOM_SSL_DIR: &str = "/etc/nexacloud/ssl";
+
+pub fn valid_ip_or_cidr(s: &str) -> bool {
+    let (ip, prefix) = match s.split_once('/') {
+        Some((a, b)) => (a, Some(b)),
+        None => (s, None),
+    };
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(addr) => match prefix {
+            None => true,
+            Some(p) => p.parse::<u8>().is_ok_and(|n| n <= if addr.is_ipv4() { 32 } else { 128 }),
+        },
+        Err(_) => false,
+    }
+}
+
+fn valid_url_path(p: &str) -> bool {
+    p.starts_with('/') && p.len() <= 120 && !p.contains("..") && !p.contains("//") && p.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b))
 }
 
 impl Default for SiteOptions {
@@ -88,6 +177,9 @@ impl Default for SiteOptions {
             block_hidden: true,
             front_controller: true,
             maintenance: false,
+            deny_ips: Vec::new(),
+            protected: Vec::new(),
+            error_pages: Vec::new(),
         }
     }
 }
@@ -137,6 +229,9 @@ pub struct SiteModel {
     /// Isolated sites: own Linux user and PHP-FPM pool (socket in `fpm_socket`).
     #[serde(default)]
     pub user: Option<String>,
+    /// Isolated sites: pool tuning (None = defaults).
+    #[serde(default)]
+    pub pool: Option<PoolOptions>,
 }
 
 // ------------------------------------------------------------------ isolation
@@ -165,11 +260,51 @@ pub fn pool_socket(version: &str, user: &str) -> String {
 
 /// A PHP-FPM pool running as the site's own user. nginx (www-data) talks to
 /// it over a socket only it can open.
-pub fn pool_conf(id: &str, version: &str, user: &str) -> String {
-    format!(
-        "; Managed by NexaCloud — isolated PHP-FPM pool for {id}\n[{user}]\nuser = {user}\ngroup = {user}\nlisten = {sock}\nlisten.owner = www-data\nlisten.group = www-data\nlisten.mode = 0660\npm = ondemand\npm.max_children = 10\npm.process_idle_timeout = 30s\npm.max_requests = 500\ncatch_workers_output = yes\nphp_admin_flag[log_errors] = on\n",
+pub fn pool_conf(id: &str, version: &str, user: &str, opts: Option<&PoolOptions>) -> String {
+    let d = PoolOptions::default();
+    let o = opts.unwrap_or(&d);
+    let pm = match o.pm.as_str() {
+        "dynamic" => {
+            let start = (o.max_children / 4).max(1);
+            format!("pm = dynamic\npm.max_children = {mc}\npm.start_servers = {start}\npm.min_spare_servers = {start}\npm.max_spare_servers = {mx}\n", mc = o.max_children, mx = (o.max_children / 2).max(start))
+        }
+        "static" => format!("pm = static\npm.max_children = {}\n", o.max_children),
+        _ => format!("pm = ondemand\npm.max_children = {}\npm.process_idle_timeout = 30s\n", o.max_children),
+    };
+    let mut out = format!(
+        "; Managed by NexaCloud — isolated PHP-FPM pool for {id}\n[{user}]\nuser = {user}\ngroup = {user}\nlisten = {sock}\nlisten.owner = www-data\nlisten.group = www-data\nlisten.mode = 0660\n{pm}pm.max_requests = 500\ncatch_workers_output = yes\nphp_admin_flag[log_errors] = on\n",
         sock = pool_socket(version, user)
-    )
+    );
+    if opts.is_some() {
+        out.push_str(&format!(
+            "php_admin_value[memory_limit] = {}\nphp_admin_value[upload_max_filesize] = {u}\nphp_admin_value[post_max_size] = {u}\nphp_admin_value[max_execution_time] = {}\n",
+            o.memory_limit, o.max_execution_time, u = o.upload_max_filesize
+        ));
+    }
+    out
+}
+
+pub fn valid_pool(o: &PoolOptions) -> Result<(), String> {
+    if !matches!(o.pm.as_str(), "ondemand" | "dynamic" | "static") {
+        return Err("process manager: ondemand, dynamic or static".into());
+    }
+    if !(1..=200).contains(&o.max_children) {
+        return Err("max children: 1–200".into());
+    }
+    let size = |v: &str| {
+        let v = v.trim();
+        v.len() >= 2 && v.len() <= 6 && v[..v.len() - 1].bytes().all(|b| b.is_ascii_digit()) && matches!(v.as_bytes()[v.len() - 1], b'M' | b'G')
+    };
+    if !size(&o.memory_limit) && o.memory_limit != "-1" {
+        return Err("memory limit like 256M or 1G".into());
+    }
+    if !size(&o.upload_max_filesize) {
+        return Err("upload size like 64M".into());
+    }
+    if !(5..=3600).contains(&o.max_execution_time) {
+        return Err("max execution time: 5–3600 seconds".into());
+    }
+    Ok(())
 }
 
 /// Commands that create the user (idempotent) and let nginx read its files.
@@ -316,6 +451,37 @@ pub fn validate(m: &SiteModel) -> Result<(), String> {
             return Err(format!("unsupported path {p:?}"));
         }
     }
+    let o = &m.options;
+    if o.deny_ips.len() > 500 {
+        return Err("block at most 500 addresses per site".into());
+    }
+    for ip in &o.deny_ips {
+        if !valid_ip_or_cidr(ip) {
+            return Err(format!("{ip:?} is not an IP address or range (like 203.0.113.7 or 203.0.113.0/24)"));
+        }
+    }
+    if o.protected.len() > 20 {
+        return Err("protect at most 20 folders".into());
+    }
+    for d in &o.protected {
+        if !valid_url_path(&d.path) {
+            return Err(format!("protected folder {:?}: a path like /admin", d.path));
+        }
+        if d.realm.is_empty() || d.realm.len() > 60 || !d.realm.chars().all(|c| c.is_ascii_alphanumeric() || " ._-".contains(c)) {
+            return Err("prompt text: letters, digits, spaces . _ - (max 60)".into());
+        }
+    }
+    for e in &o.error_pages {
+        if !matches!(e.code, 403 | 404 | 500 | 502 | 503 | 504) {
+            return Err("error pages: 403, 404, 500, 502, 503 or 504".into());
+        }
+        if !valid_url_path(&e.path) || !e.path.ends_with(".html") {
+            return Err(format!("error page {:?}: an .html path like /errors/{}.html", e.path, e.code));
+        }
+    }
+    if let Some(p) = &m.pool {
+        valid_pool(p)?;
+    }
     if m.runtime == Runtime::Frankenphp && m.runtime_port.is_none() {
         return Err("FrankenPHP runtime needs a port".into());
     }
@@ -342,7 +508,7 @@ pub fn render(m: &SiteModel) -> String {
     out.push_str(&format!("{MODEL_MARK}{model_json}\n\n"));
 
     let acme = format!(
-        "    location ^~ /.well-known/acme-challenge/ {{\n        root {ACME_ROOT};\n        default_type text/plain;\n    }}\n"
+        "    location ^~ /.well-known/acme-challenge/ {{\n        root {ACME_ROOT};\n        default_type text/plain;\n        auth_basic off;\n    }}\n"
     );
 
     if m.ssl {
@@ -377,6 +543,22 @@ fn body(m: &SiteModel, acme: &str) -> String {
         "    client_max_body_size {};\n",
         o.client_max_body_size
     ));
+    for ip in &o.deny_ips {
+        b.push_str(&format!("    deny {ip};\n"));
+    }
+    if let Some(d) = o.protected.iter().find(|d| d.path == "/") {
+        b.push_str(&format!("    auth_basic \"{}\";\n    auth_basic_user_file {};\n", d.realm, htpasswd_path(&m.id)));
+    }
+    for e in &o.error_pages {
+        b.push_str(&format!("    error_page {} {};\n", e.code, e.path));
+    }
+    let mut pages: Vec<&str> = o.error_pages.iter().map(|e| e.path.as_str()).collect();
+    pages.sort_unstable();
+    pages.dedup();
+    for p in pages {
+        // The page must load even for blocked or not-signed-in visitors.
+        b.push_str(&format!("    location = {p} {{\n        allow all;\n        auth_basic off;\n    }}\n"));
+    }
     if o.security_headers {
         b.push_str("    add_header X-Frame-Options \"SAMEORIGIN\" always;\n");
         b.push_str("    add_header X-Content-Type-Options \"nosniff\" always;\n");
@@ -401,10 +583,15 @@ fn body(m: &SiteModel, acme: &str) -> String {
             ));
         }
         SiteKind::Proxy => {
-            b.push_str(&proxy_location(
-                "/",
-                m.upstream.as_deref().unwrap_or("http://127.0.0.1:3000"),
-            ));
+            let up = m.upstream.as_deref().unwrap_or("http://127.0.0.1:3000");
+            for d in o.protected.iter().filter(|d| d.path != "/") {
+                let inner = proxy_location("/", up).replace("    location / {\n", "").replace("\n    }\n", "\n");
+                b.push_str(&format!(
+                    "    location ^~ {} {{\n        auth_basic \"{}\";\n        auth_basic_user_file {};\n{}    }}\n",
+                    d.path, d.realm, htpasswd_path(&m.id), inner
+                ));
+            }
+            b.push_str(&proxy_location("/", up));
         }
         SiteKind::Static | SiteKind::Laravel | SiteKind::Php => {
             b.push_str(&format!(
@@ -417,6 +604,9 @@ fn body(m: &SiteModel, acme: &str) -> String {
             } else {
                 "    index index.html index.htm;\n    charset utf-8;\n"
             });
+            for d in o.protected.iter().filter(|d| d.path != "/") {
+                b.push_str(&protected_location(m, d));
+            }
             if o.cache_static {
                 b.push_str("    location ~* \\.(?:css|js|mjs|jpg|jpeg|png|gif|webp|avif|svg|ico|woff2?)$ {\n        expires 30d;\n        access_log off;\n        try_files $uri =404;\n    }\n");
             }
@@ -439,9 +629,7 @@ fn body(m: &SiteModel, acme: &str) -> String {
                 });
                 b.push_str("    location = /favicon.ico { access_log off; log_not_found off; }\n");
                 b.push_str("    location = /robots.txt  { access_log off; log_not_found off; }\n");
-                b.push_str(&format!(
-                    "    location ~ \\.php$ {{\n        fastcgi_pass unix:{sock};\n        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;\n        include fastcgi_params;\n        fastcgi_hide_header X-Powered-By;\n        fastcgi_read_timeout 120;\n    }}\n"
-                ));
+                b.push_str(&php_location(&sock, "    "));
             } else {
                 b.push_str("    location / {\n        try_files $uri $uri/ =404;\n    }\n");
             }
@@ -451,6 +639,39 @@ fn body(m: &SiteModel, acme: &str) -> String {
         }
     }
     b
+}
+
+fn php_socket(m: &SiteModel) -> String {
+    let v = m.php_version.as_deref().unwrap_or("8.3");
+    m.fpm_socket.clone().unwrap_or_else(|| format!("/run/php/php{v}-fpm.sock"))
+}
+
+fn php_location(sock: &str, ind: &str) -> String {
+    format!(
+        "{ind}location ~ \\.php$ {{\n{ind}    fastcgi_pass unix:{sock};\n{ind}    fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;\n{ind}    include fastcgi_params;\n{ind}    fastcgi_hide_header X-Powered-By;\n{ind}    fastcgi_read_timeout 120;\n{ind}}}\n"
+    )
+}
+
+/// A password-protected folder. Access is checked before try_files, so
+/// Laravel routes under the folder are protected too.
+fn protected_location(m: &SiteModel, d: &ProtectedDir) -> String {
+    let php = m.kind.uses_php() && m.runtime != Runtime::Frankenphp;
+    let fallback = if m.kind.uses_php() && (m.options.front_controller || m.kind == SiteKind::Laravel) {
+        "/index.php?$query_string"
+    } else {
+        "=404"
+    };
+    let mut s = format!(
+        "    location ^~ {} {{\n        auth_basic \"{}\";\n        auth_basic_user_file {};\n        try_files $uri $uri/ {fallback};\n",
+        d.path,
+        d.realm,
+        htpasswd_path(&m.id)
+    );
+    if php {
+        s.push_str(&php_location(&php_socket(m), "        "));
+    }
+    s.push_str("    }\n");
+    s
 }
 
 fn proxy_location(loc: &str, upstream: &str) -> String {
@@ -598,6 +819,7 @@ pub fn model_from_create(p: &CreateParams) -> SiteModel {
         ssl_cert: None,
         ssl_key: None,
         user: None,
+        pool: None,
     }
 }
 
@@ -660,7 +882,7 @@ pub fn plan_create(env: &ChangeEnv, p: &CreateParams) -> Result<ChangePlan, Stri
         }
         let v = m.php_version.clone().unwrap_or_default();
         b = b
-            .write_file(&pool_path(&v, u), pool_conf(&m.id, &v, u))
+            .write_file(&pool_path(&v, u), pool_conf(&m.id, &v, u, m.pool.as_ref()))
             .command(["systemctl", "reload", &format!("php{v}-fpm")])
             .on_revert(["systemctl", "reload", &format!("php{v}-fpm")]);
     }
@@ -812,7 +1034,7 @@ pub fn plan_isolate(
             "env-mode",
             &pd,
         ])
-        .write_file(&pool_path(&v, &u), pool_conf(id, &v, &u))
+        .write_file(&pool_path(&v, &u), pool_conf(id, &v, &u, old.pool.as_ref()))
         .write_file(&conf_path(id), render(&new))
         .command(["systemctl", "reload", &format!("php{v}-fpm")])
         .on_revert(["chown", "-R", &format!("{}:{}", md.uid(), md.gid()), &pd])
@@ -877,13 +1099,134 @@ pub fn plan_options(env: &ChangeEnv, p: &OptionsParams) -> Result<ChangePlan, St
             .write_file(&conf_path(&p.id), render(&new));
         return nginx_apply(b).build(env).map_err(|e| format!("{e:#}"));
     }
-    plan_model_update(
-        env,
-        &old,
-        new,
-        "site_options",
-        format!("Update settings of {}", p.id),
-    )
+    validate(&new)?;
+    let mut b = ChangePlan::builder("site_options", &format!("Update settings of {}", p.id), &format!("site:{}", p.id)).lock(&format!("site:{}", p.id));
+    if !new.options.protected.is_empty() {
+        b = b.pre_command(ensure_htpasswd(&p.id));
+    }
+    b = b.write_file(&conf_path(&p.id), render(&new));
+    probe(nginx_apply(b), &new).build(env).map_err(|e| format!("{e:#}"))
+}
+
+/// Create the (empty) password file if it doesn't exist yet: nginx answers
+/// 500 for a protected folder without one.
+pub fn ensure_htpasswd(id: &str) -> Vec<String> {
+    vec![
+        "sh".into(),
+        "-c".into(),
+        "mkdir -p \"$1\" && chmod 750 \"$1\" && chgrp www-data \"$1\" && { [ -f \"$2\" ] || install -m 640 -o root -g www-data /dev/null \"$2\"; }".into(),
+        "htpasswd".into(),
+        HTPASSWD_DIR.into(),
+        htpasswd_path(id),
+    ]
+}
+
+// ------------------------------------------------------------------ PHP pool tuning
+
+pub fn plan_pool(env: &ChangeEnv, id: &str, pool: &PoolOptions) -> Result<ChangePlan, String> {
+    let old = load_model(env, id)?;
+    let user = old.user.clone().ok_or("give the site its own user first (Settings → Isolate), then tune its PHP pool")?;
+    let v = old.php_version.clone().ok_or("this site does not run PHP")?;
+    valid_pool(pool)?;
+    let mut new = old.clone();
+    new.pool = Some(pool.clone());
+    validate(&new)?;
+    let b = ChangePlan::builder("site_pool", &format!("Tune PHP for {id}"), &format!("site:{id}"))
+        .lock(&format!("site:{id}"))
+        .write_file(&pool_path(&v, &user), pool_conf(id, &v, &user, Some(pool)))
+        .write_file(&conf_path(id), render(&new))
+        .command([format!("php-fpm{v}"), "-t".into()])
+        .command(["systemctl".to_string(), "reload".into(), format!("php{v}-fpm")])
+        .on_revert(["systemctl".to_string(), "reload".into(), format!("php{v}-fpm")])
+        .note(format!("{} workers ({}), memory {} per request, uploads up to {}, {} s per request.", pool.max_children, pool.pm, pool.memory_limit, pool.upload_max_filesize, pool.max_execution_time));
+    probe(nginx_apply(b), &new).build(env).map_err(|e| format!("{e:#}"))
+}
+
+// ------------------------------------------------------------------ own certificate
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SslCustomParams {
+    pub id: String,
+    /// PEM: the certificate followed by any intermediate certificates.
+    pub cert: String,
+    /// PEM private key (unencrypted).
+    pub key: String,
+}
+
+pub fn plan_ssl_custom(env: &ChangeEnv, p: &SslCustomParams) -> Result<ChangePlan, String> {
+    let old = load_model(env, &p.id)?;
+    let cert = p.cert.trim().replace("\r\n", "\n");
+    let key = p.key.trim().replace("\r\n", "\n");
+    if !cert.starts_with("-----BEGIN CERTIFICATE-----") || !cert.ends_with("-----END CERTIFICATE-----") || cert.len() > 64 * 1024 {
+        return Err("certificate: paste the PEM text starting with -----BEGIN CERTIFICATE----- (add intermediate certificates after it)".into());
+    }
+    let key_ok = ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY"].iter().any(|k| key.starts_with(&format!("-----BEGIN {k}-----")) && key.ends_with(&format!("-----END {k}-----")));
+    if !key_ok || key.contains("ENCRYPTED") || key.len() > 16 * 1024 {
+        return Err("private key: paste the unencrypted PEM key (-----BEGIN PRIVATE KEY-----)".into());
+    }
+    let dir = format!("{CUSTOM_SSL_DIR}/{}", p.id);
+    let mut new = old.clone();
+    new.ssl = true;
+    new.ssl_cert = Some(format!("{dir}/fullchain.pem"));
+    new.ssl_key = Some(format!("{dir}/privkey.pem"));
+    validate(&new)?;
+    let b = ChangePlan::builder("site_ssl", &format!("Use your own certificate for {}", p.id), &format!("site:{}", p.id))
+        .lock(&format!("site:{}", p.id))
+        .sensitive()
+        .create_parents()
+        .write_file_with(&format!("{dir}/fullchain.pem"), Content::Text(format!("{cert}\n")), Some(0o644), None)
+        .write_file_with(&format!("{dir}/privkey.pem"), Content::Text(format!("{key}\n")), Some(0o600), None)
+        .command([
+            "sh",
+            "-c",
+            "a=$(openssl x509 -noout -pubkey -in \"$1\" 2>/dev/null | openssl sha256); b=$(openssl pkey -pubout -in \"$2\" 2>/dev/null | openssl sha256); [ -n \"$a\" ] && [ \"$a\" = \"$b\" ] || { echo 'the private key does not belong to this certificate' >&2; exit 1; }; openssl x509 -noout -subject -enddate -in \"$1\"",
+            "keycheck",
+            &format!("{dir}/fullchain.pem"),
+            &format!("{dir}/privkey.pem"),
+        ])
+        .write_file(&conf_path(&p.id), render(&new))
+        .note("nginx serves the site over HTTPS with your certificate and redirects HTTP. Renew it yourself before it expires (NexaCloud warns you).");
+    probe(nginx_apply(b), &new).build(env).map_err(|e| format!("{e:#}"))
+}
+
+// ------------------------------------------------------------------ server-wide IP block list
+
+pub const BLOCKLIST: &str = "/etc/nginx/conf.d/nexacloud-blocklist.conf";
+
+pub fn read_blocklist(env: &ChangeEnv) -> Vec<String> {
+    std::fs::read_to_string(env.host_path(BLOCKLIST))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("deny ").map(|x| x.trim_end_matches(';').trim().to_string()))
+        .collect()
+}
+
+pub fn plan_blocklist(env: &ChangeEnv, ips: &[String]) -> Result<ChangePlan, String> {
+    let mut list: Vec<String> = Vec::new();
+    for ip in ips {
+        let ip = ip.trim().to_string();
+        if ip.is_empty() || list.contains(&ip) {
+            continue;
+        }
+        if !valid_ip_or_cidr(&ip) {
+            return Err(format!("{ip:?} is not an IP address or range"));
+        }
+        if ip == "0.0.0.0/0" || ip == "::/0" {
+            return Err("that would block everyone".into());
+        }
+        list.push(ip);
+    }
+    if list.len() > 5000 {
+        return Err("at most 5000 entries".into());
+    }
+    let mut text = String::from("# Managed by NexaCloud — addresses blocked on every website (Security → Block IPs).\n");
+    for ip in &list {
+        text.push_str(&format!("deny {ip};\n"));
+    }
+    let b = ChangePlan::builder("ip_block", &format!("Block list: {} address{}", list.len(), if list.len() == 1 { "" } else { "es" }), "nginx:blocklist")
+        .write_file(BLOCKLIST, text)
+        .note("Blocked addresses get 403 on every website served by nginx. The panel itself is not affected.");
+    nginx_apply(b).build(env).map_err(|e| format!("{e:#}"))
 }
 
 /// Serve a different folder (inside the site's project folder).
@@ -934,7 +1277,7 @@ pub fn plan_php_switch(env: &ChangeEnv, id: &str, version: &str) -> Result<Chang
             validate(&new)?;
             let b = ChangePlan::builder("site_php", &format!("Switch {id} to PHP {version}"), &format!("site:{id}"))
                 .lock(&format!("site:{id}"))
-                .write_file(&pool_path(version, u), pool_conf(id, version, u))
+                .write_file(&pool_path(version, u), pool_conf(id, version, u, old.pool.as_ref()))
                 .delete_file(&pool_path(oldv, u))
                 .write_file(&conf_path(id), render(&new))
                 .command(["systemctl", "reload", &format!("php{version}-fpm")])
@@ -1187,6 +1530,45 @@ mod tests {
         assert!(c.contains("listen 443 ssl http2;"));
         assert!(c.contains("return 301 https://$host$request_uri;"));
         assert!(c.contains("/etc/letsencrypt/live/shop.example.com/fullchain.pem"));
+    }
+
+    #[test]
+    fn renders_security_options_and_pool() {
+        let mut m = laravel();
+        m.options.deny_ips = vec!["203.0.113.7".into(), "2001:db8::/32".into()];
+        m.options.protected = vec![ProtectedDir { path: "/admin".into(), realm: "Staff only".into() }];
+        m.options.error_pages = vec![ErrorPage { code: 502, path: "/errors/502.html".into() }];
+        validate(&m).unwrap();
+        let c = render(&m);
+        assert!(c.contains("    deny 203.0.113.7;\n    deny 2001:db8::/32;"));
+        assert!(c.contains("location ^~ /admin {\n        auth_basic \"Staff only\";\n        auth_basic_user_file /etc/nginx/nexacloud-auth/shop.example.com;\n        try_files $uri $uri/ /index.php?$query_string;\n        location ~ \\.php$ {"));
+        assert!(c.contains("error_page 502 /errors/502.html;"));
+        assert!(c.contains("location = /errors/502.html {\n        allow all;\n        auth_basic off;"));
+        assert!(c.contains("auth_basic off;"), "ACME challenges stay open");
+        assert_eq!(parse_model(&c).unwrap(), m);
+        m.options.protected = vec![ProtectedDir { path: "/".into(), realm: "Private".into() }];
+        let c = render(&m);
+        assert!(c.contains("    auth_basic \"Private\";\n    auth_basic_user_file"));
+        for bad in ["1.2.3", "1.2.3.4/33", "a.b.c.d", "1.2.3.4; allow all"] {
+            m.options.deny_ips = vec![bad.into()];
+            assert!(validate(&m).is_err(), "{bad}");
+        }
+        m.options.deny_ips.clear();
+        m.options.protected = vec![ProtectedDir { path: "/a b".into(), realm: "x".into() }];
+        assert!(validate(&m).is_err());
+        m.options.protected = vec![ProtectedDir { path: "/a".into(), realm: "x\"; deny all".into() }];
+        assert!(validate(&m).is_err());
+        m.options.protected.clear();
+        m.options.error_pages = vec![ErrorPage { code: 418, path: "/x.html".into() }];
+        assert!(validate(&m).is_err());
+        let pc = pool_conf("a.test", "8.3", "nc_a", Some(&PoolOptions { pm: "dynamic".into(), max_children: 20, memory_limit: "512M".into(), upload_max_filesize: "128M".into(), max_execution_time: 120 }));
+        assert!(pc.contains("pm = dynamic\npm.max_children = 20\npm.start_servers = 5"));
+        assert!(pc.contains("php_admin_value[memory_limit] = 512M"));
+        assert!(pc.contains("php_admin_value[post_max_size] = 128M"));
+        assert!(valid_pool(&PoolOptions { max_children: 0, ..Default::default() }).is_err());
+        assert!(valid_pool(&PoolOptions { memory_limit: "lots".into(), ..Default::default() }).is_err());
+        let r = crate::changes::redact_secrets("-----BEGIN PRIVATE KEY-----\nMIIsecret\n-----END PRIVATE KEY-----\nDB_PASSWORD=x");
+        assert!(!r.contains("MIIsecret") && r.contains("DB_PASSWORD=••••••"));
     }
 
     #[test]
@@ -1498,11 +1880,13 @@ pub fn plan_adopt(env: &ChangeEnv, p: &AdoptParams) -> Result<ChangePlan, String
             block_hidden: true,
             front_controller: true,
             maintenance: false,
+            ..Default::default()
         },
         fpm_socket,
         ssl_cert: site.ssl_certificate.clone(),
         ssl_key,
         user: None,
+        pool: None,
     };
     validate(&m)?;
     let mut b = ChangePlan::builder(
@@ -1575,7 +1959,7 @@ mod isolation_tests {
         assert_eq!(pool_socket("8.3", "nc_a"), "/run/php/php8.3-fpm-nc_a.sock");
         // the PHP switch rewrites versioned sockets
         assert_eq!(replace_php_sockets(&pool_socket("8.3", "nc_a"), "8.4").0, pool_socket("8.4", "nc_a"));
-        let c = pool_conf("a.test", "8.3", "nc_a");
+        let c = pool_conf("a.test", "8.3", "nc_a", None);
         assert!(c.contains("[nc_a]") && c.contains("user = nc_a") && c.contains("listen.owner = www-data"));
         let mut m = model_from_create(&CreateParams {
             kind: SiteKind::Laravel,

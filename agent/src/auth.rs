@@ -392,7 +392,7 @@ pub fn allowed(id: &Identity, method: &Method, path: &str) -> Result<(), &'stati
         Role::Admin => Ok(()),
         Role::Viewer => Err("your account is read-only"),
         Role::Developer => {
-            let project_path = seg.first() == Some(&"projects") && seg.len() >= 2 && id.can_change_project(seg[1]);
+            let project_path = matches!(seg.first(), Some(&"projects") | Some(&"sites")) && seg.len() >= 2 && id.can_change_project(seg[1]);
             // body-scoped endpoints check the project in the handler
             let scoped = matches!(seg.first(), Some(&"plans") | Some(&"files") | Some(&"terminal") | Some(&"cron"));
             if project_path || scoped {

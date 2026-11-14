@@ -55,6 +55,9 @@ pub enum PlanRequest {
     ProjectShared { id: String, name: String },
     ProjectPermissions { id: String },
     ProjectReleases { id: String },
+    SitePool { id: String, pool: sites::PoolOptions },
+    SiteSslCustom(sites::SslCustomParams),
+    IpBlock { ips: Vec<String> },
 }
 
 impl PlanRequest {
@@ -85,6 +88,9 @@ impl PlanRequest {
             PlanRequest::ProjectShared { .. } => "project_shared",
             PlanRequest::ProjectPermissions { .. } => "project_permissions",
             PlanRequest::ProjectReleases { .. } => "project_releases",
+            PlanRequest::SitePool { .. } => "site_pool",
+            PlanRequest::SiteSslCustom(_) => "site_ssl_custom",
+            PlanRequest::IpBlock { .. } => "ip_block",
         }
     }
 }
@@ -131,6 +137,9 @@ pub async fn build(state: &AppState, req: &PlanRequest) -> Result<ChangePlan, St
         PlanRequest::SiteOptions(p) => sites::plan_options(env, p),
         PlanRequest::SitePhp { id, version } => sites::plan_php_switch(env, id, version),
         PlanRequest::SiteSsl(p) => sites::plan_ssl(env, p),
+        PlanRequest::SitePool { id, pool } => sites::plan_pool(env, id, pool),
+        PlanRequest::SiteSslCustom(p) => sites::plan_ssl_custom(env, p),
+        PlanRequest::IpBlock { ips } => sites::plan_blocklist(env, ips),
         PlanRequest::NginxRaw(p) => sites::plan_raw(env, p),
         PlanRequest::PhpInstall { version } => system::plan_php_install(env, version),
         PlanRequest::PhpExtensions(p) => system::plan_php_extensions(env, p),
@@ -197,6 +206,8 @@ impl PlanRequest {
             | PlanRequest::SiteRoot { id, .. } => Some(id),
             PlanRequest::SiteOptions(p) => Some(&p.id),
             PlanRequest::SiteSsl(p) => Some(&p.id),
+            PlanRequest::SiteSslCustom(p) => Some(&p.id),
+            PlanRequest::SitePool { id, .. } => Some(id),
             _ => None,
         }
     }

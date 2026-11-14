@@ -835,6 +835,97 @@ check "delete users" bash -c "curl -fsSk -b '$JAR' -H 'Origin: $U' -X DELETE '$U
 check "deleted user's session is gone (401)" test "$(code -b "$DJ" "$U/api/auth/me")" = 401
 rm -f "$DJ" "$VJ" "$TJ"
 
+# ------------------------------------------------------------------ batch B
+step "Site security: blocked IPs, protected folders, error pages, PHP limits, own certificate"
+sudo_on "$PASS"
+app_code() { in_box "curl -s -o /dev/null -w '%{http_code}' ${2:-} -H 'Host: app.test.local' http://127.0.0.1$1"; }
+wait_code() { local want="$1"; shift; for _ in $(seq 1 10); do [ "$(app_code "$@")" = "$want" ] && return 0; sleep 1; done; return 1; }
+opts() { api sites/app.test.local/model | jq -c ".options | $1"; }
+APP_ROOT="$(api sites/app.test.local/model | jq -r .root)"
+in_box "mkdir -p $APP_ROOT/errors && echo 'custom-403-page' > $APP_ROOT/errors/403.html && chmod -R a+rX $APP_ROOT/errors"
+P="$(jq -nc --argjson o "$(opts '.deny_ips=["127.0.0.1"] | .error_pages=[{"code":403,"path":"/errors/403.html"}]')" '{id:"app.test.local",options:$o}')"
+check "block 127.0.0.1 on app.test.local with a custom 403 page → applied" test "$(plan site_options "$P")" = applied
+check "…blocked visitor gets 403" wait_code 403 /
+check "…with the custom error page" in_box "curl -s -H 'Host: app.test.local' http://127.0.0.1/ | grep -q custom-403-page"
+check "…other sites are not affected" in_box "[ \$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: shop.test.local' http://127.0.0.1/) != 403 ]"
+P="$(jq -nc --argjson o "$(opts '.deny_ips=[] | .error_pages=[]')" '{id:"app.test.local",options:$o}')"
+check "unblock → applied" test "$(plan site_options "$P")" = applied
+check "…200 again" wait_code 200 /
+check "bad IP refused" test "$(post_code plans/preview '{"kind":"site_options","params":{"id":"app.test.local","options":{"deny_ips":["1.2.3.4; allow all"]}}}')" = 409
+
+B='{"users":[{"name":"client","password":"client-pass-1"}]}'
+check "add a folder user (hashed)" bash -c "curl -fsSk -b '$JAR' -H 'Origin: $U' -H 'Content-Type: application/json' -X PUT -d '$B' '$U/api/sites/app.test.local/auth-users' | jq -e '.users==[\"client\"]' && docker exec $NAME grep -q '^client:\\\$6\\\$' /etc/nginx/nexacloud-auth/app.test.local"
+check "password file is not world-readable" in_box "[ \$(stat -c %a /etc/nginx/nexacloud-auth/app.test.local) = 640 ]"
+P="$(jq -nc --argjson o "$(opts '.protected=[{"path":"/secret","realm":"Staff only"}]')" '{id:"app.test.local",options:$o}')"
+check "protect /secret → applied" test "$(plan site_options "$P")" = applied
+check "…/secret asks for a password (401)" wait_code 401 /secret/
+check "…wrong password → 401" test "$(app_code /secret/ '-u client:nope')" = 401
+check "…right password → served by the app" test "$(app_code /secret/ '-u client:client-pass-1')" = 200
+check "…the rest of the site stays open" test "$(app_code / '')" = 200
+P="$(jq -nc --argjson o "$(opts '.protected=[{"path":"/","realm":"Staging"}]')" '{id:"app.test.local",options:$o}')"
+check "protect the whole site → applied (probe accepts 401)" test "$(plan site_options "$P")" = applied
+check "…home page needs the password" wait_code 401 /
+check "…Let's Encrypt challenges stay reachable" bash -c "docker exec $NAME sh -c 'mkdir -p /var/www/_acme/.well-known/acme-challenge && echo tok > /var/www/_acme/.well-known/acme-challenge/t1' ; [ \"\$(docker exec $NAME curl -s -o /dev/null -w '%{http_code}' -H 'Host: app.test.local' http://127.0.0.1/.well-known/acme-challenge/t1)\" != 401 ]"
+P="$(jq -nc --argjson o "$(opts '.protected=[]')" '{id:"app.test.local",options:$o}')"
+check "remove protection → applied" test "$(plan site_options "$P")" = applied
+check "…open again" wait_code 200 /
+
+P='{"id":"app.test.local","pool":{"pm":"dynamic","max_children":7,"memory_limit":"384M","upload_max_filesize":"96M","max_execution_time":90}}'
+check "tune PHP pool → applied" test "$(plan site_pool "$P")" = applied
+check "…pool file has the limits" in_box "f=/etc/php/8.3/fpm/pool.d/nc_app_test_local.conf; grep -q 'pm = dynamic' \$f && grep -q 'pm.max_children = 7' \$f && grep -q 'memory_limit\\] = 384M' \$f && grep -q 'post_max_size\\] = 96M' \$f"
+check "…site still served" wait_code 200 /
+check "bad pool settings refused" test "$(post_code plans/preview '{"kind":"site_pool","params":{"id":"app.test.local","pool":{"pm":"turbo","max_children":7}}}')" = 409
+check "shared-pool site can't be tuned (needs its own user)" test "$(post_code plans/preview '{"kind":"site_pool","params":{"id":"down.test.local","pool":{"pm":"ondemand","max_children":5}}}')" = 409
+
+in_box "cd /tmp && openssl req -x509 -newkey rsa:2048 -nodes -keyout own.key -out own.crt -days 30 -subj '/CN=app.test.local' 2>/dev/null && openssl genrsa -out other.key 2048 2>/dev/null"
+P="$(jq -nc --arg c "$(in_box 'cat /tmp/own.crt')" --arg k "$(in_box 'cat /tmp/other.key')" '{id:"app.test.local",cert:$c,key:$k}')"
+st="$(plan site_ssl_custom "$P" 2>/dev/null)"
+check "a key that doesn't match the certificate is refused (reverted)" bash -c "[ '$st' != applied ] && [ \"\$(docker exec $NAME curl -s -o /dev/null -w '%{http_code}' -H 'Host: app.test.local' http://127.0.0.1/)\" = 200 ]"
+P="$(jq -nc --arg c "$(in_box 'cat /tmp/own.crt')" --arg k "$(in_box 'cat /tmp/own.key')" '{id:"app.test.local",cert:$c,key:$k}')"
+check "install own certificate → applied" test "$(plan site_ssl_custom "$P")" = applied
+check "…HTTPS uses it (CN=app.test.local)" in_box "echo | openssl s_client -connect 127.0.0.1:443 -servername app.test.local 2>/dev/null | openssl x509 -noout -subject | grep -q 'CN *= *app.test.local'"
+check "…HTTP redirects to HTTPS" test "$(app_code / '')" = 301
+check "…key file is root-only" in_box "[ \$(stat -c %a /etc/nexacloud/ssl/app.test.local/privkey.pem) = 600 ]"
+check "…the stored change never shows the key" bash -c "! curl -fsSk -b '$JAR' '$U/api/changes?limit=5' | grep -q \"\$(docker exec $NAME sed -n 2p /tmp/own.key)\""
+
+step "Block IPs on every site; import .sql; SFTP accounts"
+check "block list starts empty" jqe "$(api blocklist)" '.ips==[]'
+check "block 127.0.0.1 everywhere → applied" test "$(plan ip_block '{"ips":["127.0.0.1"]}')" = applied
+check "…shop.test.local (HTTPS) now 403 too" in_box "[ \$(curl -sk -o /dev/null -w '%{http_code}' --resolve shop.test.local:443:127.0.0.1 https://shop.test.local/) = 403 ]"
+check "…panel still reachable" curl -fsk "$U/api/health"
+check "blocking everyone is refused" test "$(post_code plans/preview '{"kind":"ip_block","params":{"ips":["0.0.0.0/0"]}}')" = 409
+check "clear the block list → applied" test "$(plan ip_block '{"ips":[]}')" = applied
+check "…shop.test.local answers again" in_box "[ \$(curl -sk -o /dev/null -w '%{http_code}' --resolve shop.test.local:443:127.0.0.1 https://shop.test.local/) = 200 ]"
+
+printf 'CREATE TABLE imported_t (id INT);\nINSERT INTO imported_t VALUES (42),(43);\n' | gzip > /tmp/nc-import.sql.gz
+jid="$(curl -fsSk -b "$JAR" -H "Origin: $U" --data-binary @/tmp/nc-import.sql.gz "$U/api/dbm/mysql/shop_prod/import?name=dump.sql.gz" | jq -r .job_id)"
+st="$(wait_job2 "$jid")"; [ "$st" = ok ] || api "jobs/$jid" | jq -r .log | tail -20
+check "import dump.sql.gz into shop_prod → ok" test "$st" = ok
+check "…rows are there" in_box "[ \$(mysql -N -e 'SELECT COUNT(*) FROM shop_prod.imported_t') = 2 ]"
+check "…a backup was taken first" jqe "$(api "jobs/$jid")" '.log|test("Backup saved")'
+check "…the upload is cleaned up" in_box "[ -z \"\$(ls -A /var/lib/nexacloud/imports 2>/dev/null)\" ]"
+check "import of a .txt refused" test "$(code -b "$JAR" -H "Origin: $U" --data-binary 'x' "$U/api/dbm/mysql/shop_prod/import?name=x.txt")" = 400
+check "import into an unknown database refused" test "$(code -b "$JAR" -H "Origin: $U" --data-binary @/tmp/nc-import.sql.gz "$U/api/dbm/mysql/nope_db/import?name=a.sql.gz")" = 404
+in_box "mysql -e 'DROP TABLE shop_prod.imported_t'"
+
+in_box "rm -f /tmp/sftpkey /tmp/sftpkey.pub && ssh-keygen -q -t ed25519 -N '' -f /tmp/sftpkey"
+APP_DIR="$(api projects/app.test.local | jq -r .dir)"
+B="$(jq -nc --arg k "$(in_box 'cat /tmp/sftpkey.pub')" '{username:"appftp",site_id:"app.test.local",password:"sftp-password-123",ssh_key:$k}')"
+check "create SFTP account for app.test.local" jqe "$(post_json sftp "$B")" '.ok==true'
+check "…listed and mounted" jqe "$(api sftp)" '[.[] | select(.username=="appftp")][0] | .mounted==true and .has_key==true'
+check "…no shell login" in_box "[ \$(getent passwd appftp | cut -d: -f7) = /usr/sbin/nologin ]"
+check "sshd config still valid" in_box "sshd -t"
+in_box "echo sftp-hello > /tmp/up.txt"
+SF="$(in_box "printf 'put /tmp/up.txt\nls -1 /\npwd\n' | sftp -q -b - -i /tmp/sftpkey -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null appftp@127.0.0.1 2>&1")"; echo "    sftp: $(echo "$SF" | tr '\n' ' ' | cut -c1-160)"
+check "…upload lands in the site folder, owned by the site user" in_box "[ -f $APP_DIR/up.txt ] && [ \$(stat -c %U $APP_DIR/up.txt) = \$(stat -c %U $APP_DIR) ]"
+printf '%s\n' "$SF" > /tmp/nc-sftp.out
+check "…jailed: / only shows the site folder" bash -c "grep -qx '/site' /tmp/nc-sftp.out && ! grep -q '^/etc' /tmp/nc-sftp.out"
+check "…shell commands refused" bash -c "! docker exec $NAME ssh -i /tmp/sftpkey -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes appftp@127.0.0.1 id 2>/dev/null | grep -q uid="
+check "duplicate / system usernames refused" test "$(post_code sftp '{"username":"root","site_id":"app.test.local","password":"sftp-password-123"}')" = 400
+check "delete SFTP account" jqe "$(curl -fsSk -b "$JAR" -H "Origin: $U" -X DELETE "$U/api/sftp/appftp")" '.ok==true'
+check "…the site's PHP workers kept running" in_box "pgrep -u nc_app_test_local php-fpm >/dev/null"
+check "…user, mount and fstab line gone; files kept" in_box "! getent passwd appftp && ! grep -q nexacloud-sftp:appftp /etc/fstab && ! mountpoint -q /srv/sftp/appftp/site 2>/dev/null && [ -f $APP_DIR/up.txt ] && rm -f $APP_DIR/up.txt"
+
 # ------------------------------------------------------------------ throttle
 step "Login throttling"
 for _ in 1 2 3 4 5 6; do code -H "Origin: $U" -H 'Content-Type: application/json' -d '{"password":"bad"}' "$U/api/auth/login" >/dev/null; done

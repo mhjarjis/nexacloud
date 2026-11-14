@@ -226,6 +226,15 @@ const MIGRATIONS: &[&str] = &[
         created_at TEXT NOT NULL
     );
     "#,
+    // v8 — SFTP-only users (chrooted to one site folder).
+    r#"
+    CREATE TABLE sftp_users (
+        username   TEXT PRIMARY KEY,
+        site_id    TEXT NOT NULL,
+        dir        TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    "#,
 ];
 
 /// Latest schema version this binary knows.

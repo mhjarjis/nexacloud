@@ -124,6 +124,35 @@ const checks = computed<Check[]>(() => {
 })
 
 const okCount = computed(() => checks.value.filter((c) => c.tone === 'ok').length)
+
+// ---- Server-wide IP block list (nginx, all sites)
+const blocked = useResource<{ ips: string[] }>('/api/blocklist')
+const blockText = ref('')
+watch(() => blocked.data.value, (v) => { if (v) blockText.value = v.ips.join('\n') }, { immediate: true })
+const blockBusy = ref(false)
+const blockMsg = ref('')
+const blockErr = ref('')
+async function saveBlocklist() {
+  blockBusy.value = true; blockMsg.value = ''; blockErr.value = ''
+  const ips = blockText.value.split(/[\s,]+/).map((x) => x.trim()).filter(Boolean)
+  try {
+    const req = { kind: 'ip_block', params: { ips } }
+    const pv = await api.post<{ plan_hash: string }>('/api/plans/preview', req)
+    const st = await api.post<{ change_id: string }>('/api/plans/apply', { ...req, plan_hash: pv.plan_hash })
+    for (let i = 0; i < 60; i++) {
+      const c = await api.get<{ status: string; error?: string | null }>(`/api/changes/${st.change_id}`)
+      if (['applied', 'reverted', 'failed', 'revert_failed'].includes(c.status)) {
+        if (c.status === 'applied') blockMsg.value = ips.length ? `${ips.length} address(es) blocked on every site.` : 'Block list cleared.'
+        else blockErr.value = `${c.status}: ${c.error ?? 'see Activity'}`
+        break
+      }
+      await new Promise((r) => setTimeout(r, 1000))
+    }
+    blocked.refresh()
+  } catch (e) { if (!(e instanceof SudoCancelled)) blockErr.value = errorMessage(e) } finally { blockBusy.value = false }
+}
+const sftpAll = useResource<{ username: string; site_id: string; dir: string; mounted: boolean; has_key: boolean }[]>('/api/sftp')
+
 </script>
 
 <template>
@@ -230,6 +259,33 @@ const okCount = computed(() => checks.value.filter((c) => c.tone === 'ok').lengt
           <span v-else class="small muted">No rules.</span>
         </div>
       </div>
+    </div>
+  </section>
+
+  <section class="card card-pad stack" aria-labelledby="blk-h" style="gap: 12px">
+    <div class="row" style="gap: 10px"><AppIcon name="shield" :size="18" /><h2 id="blk-h" style="font-size: 17px; font-weight: 600">Block IPs on every site</h2></div>
+    <p class="small muted">Addresses here get "403 Forbidden" on every website nginx serves. The panel stays reachable. One per line; ranges like <span class="mono">203.0.113.0/24</span> work. Block one site only from its project's Settings.</p>
+    <textarea v-model="blockText" class="in mono" rows="5" placeholder="203.0.113.7&#10;198.51.100.0/24&#10;2001:db8::/32" aria-label="Blocked addresses" style="min-height: 110px; padding: 10px; resize: vertical" />
+    <p v-if="blockErr" class="small" style="color: var(--bad)" role="alert">{{ blockErr }}</p>
+    <p v-else-if="blockMsg" class="small" style="color: var(--ok)" role="status">{{ blockMsg }}</p>
+    <button type="button" class="btn btn-p" style="align-self: flex-start" :disabled="blockBusy" @click="saveBlocklist">{{ blockBusy ? 'Saving…' : 'Save block list' }}</button>
+  </section>
+
+  <section class="card" aria-labelledby="sftp-h" style="overflow: hidden">
+    <div class="row" style="gap: 10px; padding: 16px 20px"><AppIcon name="folder" :size="18" /><h2 id="sftp-h" style="font-size: 17px; font-weight: 600">SFTP accounts · {{ sftpAll.data.value?.length ?? 0 }}</h2></div>
+    <div style="overflow-x: auto">
+      <table>
+        <thead><tr><th>Account</th><th>Site</th><th>Folder</th><th>Login</th></tr></thead>
+        <tbody>
+          <tr v-for="u in sftpAll.data.value ?? []" :key="u.username">
+            <td class="mono">{{ u.username }}</td>
+            <td><NuxtLink :to="`/projects/${encodeURIComponent(u.site_id)}?tab=settings`">{{ u.site_id }}</NuxtLink></td>
+            <td><span :class="`pill ${u.mounted ? 'ok' : 'warn'}`">{{ u.mounted ? u.dir : 'not mounted' }}</span></td>
+            <td class="small">{{ u.has_key ? 'password / SSH key' : 'password' }}</td>
+          </tr>
+          <tr v-if="!(sftpAll.data.value ?? []).length"><td colspan="4" class="muted">No SFTP accounts. Add one from a project's Settings tab.</td></tr>
+        </tbody>
+      </table>
     </div>
   </section>
 </template>

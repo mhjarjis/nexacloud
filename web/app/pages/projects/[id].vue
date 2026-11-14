@@ -147,6 +147,8 @@ async function runArtisan(cmd = artisanCmd.value.trim()) {
   } catch (e) { fail(e) }
 }
 const maintBusy = ref(false)
+const meInfo = useResource<{ role: string }>('/api/auth/me')
+const meRole = computed(() => meInfo.data.value?.role ?? '')
 interface SiteModelLite { root: string | null; project_dir: string | null; options: Record<string, unknown> & { maintenance?: boolean; front_controller?: boolean } }
 const model = ref<SiteModelLite | null>(null)
 async function loadModel() {
@@ -958,6 +960,7 @@ async function disconnect() {
       <p class="small muted">Domains: <span class="mono">{{ site.server_names.join(', ') }}</span> · HTTPS {{ site.ssl ? `on${site.ssl_expires ? ' until ' + formatDate(site.ssl_expires) : ''}` : 'off' }}</p>
       <SiteManage :site="site" :php="php.data.value" @changed="() => { sites.refresh(); ov.refresh(); loadModel() }" />
     </section>
+    <SiteSecurity v-if="model" :key="`sec-${p.data.value.site_id}`" :site-id="p.data.value.site_id" :is-admin="meRole === 'admin'" @changed="() => { ov.refresh(); loadModel() }" />
   </div>
 </template>
 

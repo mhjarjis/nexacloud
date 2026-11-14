@@ -77,7 +77,51 @@ async function backUp(name: string) {
   busy.value[name] = 'Backing up…'
   try { backupJob.value[name] = (await api.post<{ job_id: string }>(`/api/databases/${eng.value}/${encodeURIComponent(name)}/backup`)).job_id; busy.value[name] = 'Backing up…' } catch (e) { busy.value[name] = e instanceof SudoCancelled ? '' : errorMessage(e) }
 }
-function backupDone(name: string, status: string) { busy.value[name] = status === 'ok' ? 'Done — backup saved.' : 'Backup failed — see the output.'; backups.refresh() }
+function backupDone(name: string, status: string) {
+  const imp = importing.value[name]
+  busy.value[name] = imp ? (status === 'ok' ? 'Done — imported (a backup was taken first).' : 'Import failed — see the output. The backup taken first is under Backups.') : (status === 'ok' ? 'Done — backup saved.' : 'Backup failed — see the output.')
+  importing.value[name] = false
+  backups.refresh()
+}
+
+// ---- import a .sql / .sql.gz file (backs the database up first)
+const sudo = useSudo()
+const importing = ref<Record<string, boolean>>({})
+const importInput = ref<HTMLInputElement | null>(null)
+const importTarget = ref('')
+function pickImport(name: string) { importTarget.value = name; importInput.value?.click() }
+async function onImportFile(ev: Event) {
+  const f = (ev.target as HTMLInputElement).files?.[0]
+  ;(ev.target as HTMLInputElement).value = ''
+  const name = importTarget.value
+  if (!f || !name) return
+  if (!/\.sql(\.gz)?$/i.test(f.name)) { busy.value[name] = 'Choose a .sql or .sql.gz file.'; return }
+  try {
+    const m = await api.get<{ sudo_until: string | null }>('/api/auth/me')
+    if (!m.sudo_until || new Date(m.sudo_until).getTime() < Date.now() + 10000) await sudo.requestSudo()
+  } catch (e) { busy.value[name] = e instanceof SudoCancelled ? '' : errorMessage(e); return }
+  busy.value[name] = `Uploading ${f.name}… 0%`
+  try {
+    const job = await new Promise<string>((resolve, reject) => {
+      const x = new XMLHttpRequest()
+      x.open('POST', `/api/dbm/${eng.value}/${encodeURIComponent(name)}/import?name=${encodeURIComponent(f.name)}`)
+      x.withCredentials = true
+      x.upload.onprogress = (e) => { if (e.lengthComputable) busy.value[name] = `Uploading ${f.name}… ${Math.round((e.loaded / e.total) * 100)}%` }
+      x.onload = () => {
+        try {
+          const j = JSON.parse(x.responseText)
+          if (x.status >= 200 && x.status < 300) resolve(j.job_id)
+          else reject(new Error(j.error === 'sudo_required' ? 'Your sudo time ran out — try again.' : j.error))
+        } catch { reject(new Error(`Upload failed (HTTP ${x.status})`)) }
+      }
+      x.onerror = () => reject(new Error('Upload failed — connection lost'))
+      x.send(f)
+    })
+    importing.value[name] = true
+    busy.value[name] = 'Backing up, then importing…'
+    backupJob.value[name] = job
+  } catch (e) { busy.value[name] = errorMessage(e) }
+}
 
 // ---- create database
 const form = reactive({ name: '', user: '', connect: '' })
@@ -147,6 +191,7 @@ const tunnelCopied = ref(false)
     </div>
   </section>
 
+  <input ref="importInput" type="file" accept=".sql,.gz,application/sql,application/gzip" hidden @change="onImportFile">
   <section class="card" aria-labelledby="dbl" style="overflow: hidden">
     <div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 16px 20px">
       <h2 id="dbl" style="font-size: 17px; font-weight: 600">{{ eng === 'mysql' ? 'MySQL' : 'PostgreSQL' }} {{ cur?.version?.split('.').slice(0, 2).join('.') ?? '' }} · {{ rows.length }} {{ rows.length === 1 ? 'database' : 'databases' }}</h2>
@@ -176,6 +221,7 @@ const tunnelCopied = ref(false)
                   <JobLog v-if="backupJob[d.name]" :key="backupJob[d.name]" :job-id="backupJob[d.name]!" status="running" style="width: 100%" @finished="(st) => backupDone(d.name, st)" />
                   <template v-if="more === d.name">
                     <a v-if="d.file" class="btn btn-s" :href="`/api/backups/download?file=${encodeURIComponent(d.file)}`">Download last backup</a>
+                    <button type="button" class="btn btn-s" @click="pickImport(d.name)"><AppIcon name="upload" :size="13" /> Import .sql…</button>
                     <NuxtLink class="btn btn-s" to="/backups">Restore…</NuxtLink>
                     <NuxtLink class="btn btn-s" :to="`/db/${eng}/${encodeURIComponent(d.name)}?console=1`">SQL console</NuxtLink>
                   </template>

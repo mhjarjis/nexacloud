@@ -91,6 +91,8 @@ try {
     ['/monitoring', '17-monitoring', ['Monitoring', 'shop.test.local', 'Where to send alerts', 'Recent alerts']],
     ['/apps/new', '18-new-app', ['What are you deploying?', 'Laravel', 'Plain PHP']],
     ['/db/mysql/shop_prod', '15-db-browser', ['orders', 'SQL']],
+    ['/projects/app.test.local?tab=settings', '14e-project-settings', ['Blocked IP addresses', 'Password-protected folders', 'Custom error pages', 'PHP workers & limits', 'Your own SSL certificate', 'SFTP accounts']],
+    ['/security', '07b-security-block', ['Block IPs on every site', 'SFTP accounts']],
     ['/account', '20-account', ['Account & users', 'Two-factor sign-in', 'API tokens', 'Panel users', 'Create token']],
     ['/cron', '21-cron', ['Cron jobs', 'Scheduled jobs', 'New cron job']],
     ['/files', '22-files', ['File manager', '/var/www', 'read and write']],
