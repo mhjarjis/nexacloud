@@ -80,7 +80,7 @@ try {
     ['/services', '05-services', ['PHP & Services', 'Nginx', 'MySQL', 'PostgreSQL', 'PHP versions']],
     ['/databases', '06-databases', ['shop_prod', 'portal_db']],
     ['/security', '07-security', ['UFW', 'Hide nginx version']],
-    ['/activity', '08-activity', ['Timeline', 'Hide nginx version', 'Roll back: Hide nginx version']],
+    ['/activity?limit=300', '08-activity', ['Timeline', 'Hide nginx version', 'Roll back: Hide nginx version']],
     ['/advisor', '11-advisor', ['Advisor', 'Tuned for']],
     ['/backups', '12-backups', ['Backups & Storage', 'Backup jobs', 'Nightly', 'Destinations', 'Synology (test)', 'Restore points', 'Free up space']],
     ['/projects', '13-projects', ['Projects', 'app.test.local', 'git/app', 'New project']],

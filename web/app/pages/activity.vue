@@ -7,7 +7,29 @@ useHead({ title: 'Activity · NexaCloud' })
 
 const api = useApi()
 const route = useRoute()
-const changes = useResource<ChangeSummary[]>('/api/changes', { interval: 5000 })
+const latest = useResource<ChangeSummary[]>('/api/changes', { interval: 5000 })
+// Older changes, loaded on demand ("Show older changes" or ?limit=)
+const older = shallowRef<ChangeSummary[]>([])
+const olderLimit = ref(0)
+const olderBusy = ref(false)
+async function loadOlder(limit = Math.max(olderLimit.value, 50) + 100) {
+  olderBusy.value = true
+  try { older.value = await api.get<ChangeSummary[]>(`/api/changes?limit=${Math.min(limit, 500)}`); olderLimit.value = limit } catch { /* keep what we have */ } finally { olderBusy.value = false }
+}
+onMounted(() => { const l = Number(route.query.limit); if (l > 50) loadOlder(l) })
+const changes = {
+  data: computed(() => {
+    const l = latest.data.value
+    if (!older.value.length) return l
+    const seen = new Set((l ?? []).map((c) => c.id))
+    return [...(l ?? []), ...older.value.filter((c) => !seen.has(c.id))]
+  }),
+  loading: latest.loading,
+  error: latest.error,
+  refreshing: latest.refreshing,
+  refresh: () => (older.value.length ? Promise.all([latest.refresh(), loadOlder(olderLimit.value)]).then(() => {}) : latest.refresh()),
+}
+const hasMore = computed(() => (changes.data.value?.length ?? 0) >= (olderLimit.value || 50) && (olderLimit.value || 50) < 500)
 const jobs = useResource<Job[]>('/api/jobs', { interval: 5000 })
 
 type Item =
@@ -324,6 +346,9 @@ function titleOf(id: string | null): string {
         </div>
       </li>
     </ul>
+    <div v-if="hasMore" style="display: flex; justify-content: center; padding: 16px">
+      <button type="button" class="btn btn-s" :disabled="olderBusy" @click="loadOlder()">{{ olderBusy ? 'Loading…' : 'Show older changes' }}</button>
+    </div>
   </section>
 </template>
 
