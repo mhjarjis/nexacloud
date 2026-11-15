@@ -323,7 +323,7 @@ async function quarantineFile(file: string) {
       <div style="padding: 0 20px 12px" class="small muted">Last scan of <span class="mono">{{ mal.data.value.last.path }}</span> {{ formatRelative(mal.data.value.last.finished_at) }} · {{ mal.data.value.last.scanned_files }} files · <span :style="`color: ${mal.data.value.last.found.length ? 'var(--bad)' : 'var(--ok)'}`">{{ mal.data.value.last.found.length ? `${mal.data.value.last.found.length} infected` : 'nothing found' }}</span></div>
       <div v-if="mal.data.value.last.found.length" style="overflow-x: auto">
         <table>
-          <thead><tr><th>File</th><th>Found</th><th><span style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Actions</span></th></tr></thead>
+          <thead><tr><th>File</th><th>Found</th><th><span class="sr-only">Actions</span></th></tr></thead>
           <tbody>
             <tr v-for="f in mal.data.value.last.found" :key="f.file">
               <td class="mono" style="font-size: 13px; white-space: normal; word-break: break-all">{{ f.file }}</td>

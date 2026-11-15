@@ -136,7 +136,7 @@ const stats = computed(() => {
     </div>
     <div style="overflow-x: auto">
       <table>
-        <thead><tr><th>Schedule</th><th>Command</th><th>Project / user</th><th>Last run</th><th><span style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Actions</span></th></tr></thead>
+        <thead><tr><th>Schedule</th><th>Command</th><th>Project / user</th><th>Last run</th><th><span class="sr-only">Actions</span></th></tr></thead>
         <tbody>
           <template v-for="j in jobs.data.value ?? []" :key="j.id">
             <tr :style="j.enabled ? '' : 'opacity: .55'">

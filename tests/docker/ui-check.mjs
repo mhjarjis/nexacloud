@@ -216,16 +216,27 @@ try {
   await shot('15-activity-rolled-back')
 
   console.log('\n▶ Phone width')
+  // clientWidth = the real screen width (innerWidth grows with the content under mobile emulation)
+  const sideways = () => ev('return document.documentElement.scrollWidth > document.documentElement.clientWidth + 1')
+  for (const [w, h, label] of [[390, 844, 'phone'], [820, 1180, 'tablet']]) {
+    await send('Emulation.setDeviceMetricsOverride', { width: w, height: h, deviceScaleFactor: 2, mobile: true })
+    for (const p of ['/', '/projects', '/projects/app.test.local?tab=settings', '/domains', '/files?path=/var/www', '/databases', '/backups', '/php', '/activity', '/security', '/server', '/cron', '/account']) {
+      await go(p, 2500)
+      expect(!(await sideways()), `${p} has no sideways scroll on ${label} (${w} px)`)
+    }
+  }
   await send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 2, mobile: true })
   await go('/', 3000)
-  const overflow = await ev('return document.documentElement.scrollWidth > window.innerWidth + 1')
-  expect(!overflow, 'dashboard has no horizontal scroll at 390 px')
   await shot('10-dashboard-mobile')
-  await go('/activity', 3000)
-  expect(!(await ev('return document.documentElement.scrollWidth > window.innerWidth + 1')), 'activity has no horizontal scroll at 390 px')
+  expect(await ev(`const r = document.querySelector('main h1')?.getBoundingClientRect(); return !!r && r.top < 200`), 'phone: page title is near the top (menu is in a drawer)')
+  expect(await ev(`const s = document.querySelector('.sidebar').getBoundingClientRect(); return s.right <= 0`), 'phone: menu drawer is closed by default')
+  await ev(`document.querySelector('.topbar-menu').click(); return 1`); await sleep(400)
+  expect(await ev(`const s = document.querySelector('.sidebar').getBoundingClientRect(); return s.left >= 0 && s.right > 200`), 'phone: menu button opens the drawer')
+  await shot('10b-drawer-mobile')
+  await ev(`[...document.querySelectorAll('.sidebar .nav-item')].find((a) => a.textContent.includes('Activity')).click(); return 1`); await sleep(2500)
+  expect((await ev('return location.pathname')) === '/activity' && await ev(`return document.querySelector('.sidebar').getBoundingClientRect().right <= 0`), 'phone: choosing a page navigates and closes the drawer')
+  expect((await ev(`return document.querySelector('.topbar-title').textContent.trim()`)) === 'Activity', 'phone: top bar shows the current page')
   await shot('16-activity-mobile')
-  await go('/security', 3000)
-  expect(!(await ev('return document.documentElement.scrollWidth > window.innerWidth + 1')), 'security has no horizontal scroll at 390 px')
   await send('Emulation.clearDeviceMetricsOverride')
 
   console.log('\n▶ Sign out')

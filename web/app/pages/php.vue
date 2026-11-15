@@ -166,7 +166,7 @@ const installing = ref<string | null>(null)
       </div>
       <div style="overflow-x: auto">
         <table>
-          <thead><tr><th>Site</th><th>Now</th><th>Switch to</th><th>Compatibility</th><th><span style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Apply</span></th></tr></thead>
+          <thead><tr><th>Site</th><th>Now</th><th>Switch to</th><th>Compatibility</th><th><span class="sr-only">Apply</span></th></tr></thead>
           <tbody>
             <template v-for="s in phpSites" :key="s.id">
               <tr>

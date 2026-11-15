@@ -180,7 +180,7 @@ const siteOptionsList = computed(() => (sites.data.value ?? []).map((s) => ({ va
     </div>
     <div style="overflow-x: auto">
       <table>
-        <thead><tr><th>Domain</th><th>Kind</th><th>Serves</th><th>DNS</th><th>SSL</th><th>PHP</th><th><span style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Actions</span></th></tr></thead>
+        <thead><tr><th>Domain</th><th>Kind</th><th>Serves</th><th>DNS</th><th>SSL</th><th>PHP</th><th><span class="sr-only">Actions</span></th></tr></thead>
         <tbody>
           <template v-for="d in domains" :key="d.name">
             <tr>

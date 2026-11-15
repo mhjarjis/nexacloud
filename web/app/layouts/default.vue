@@ -24,6 +24,19 @@ const MORE: { to: string; label: string; icon: IconName }[] = [
   { to: '/account', label: 'Account & users', icon: 'users' },
 ]
 const route = useRoute()
+// Phone / tablet: the sidebar is a drawer behind a menu button.
+const drawer = ref(false)
+const menuBtn = ref<HTMLButtonElement | null>(null)
+const currentLabel = computed(() => [...NAV, ...MORE].find((i) => isActive(i.to))?.label ?? 'NexaCloud')
+watch(() => route.fullPath, () => { drawer.value = false })
+watch(drawer, (open) => {
+  if (typeof document === 'undefined') return
+  document.documentElement.classList.toggle('drawer-open', open)
+  if (!open) nextTick(() => menuBtn.value?.focus({ preventScroll: true }))
+})
+function onKey(e: KeyboardEvent) { if (e.key === 'Escape' && drawer.value) drawer.value = false }
+onMounted(() => window.addEventListener('keydown', onKey))
+onBeforeUnmount(() => { window.removeEventListener('keydown', onKey); document.documentElement.classList.remove('drawer-open') })
 function isActive(to: string) {
   if (to === '/') return route.path === '/'
   if (to === '/php') return route.path.startsWith('/php') || route.path.startsWith('/services')
@@ -68,7 +81,20 @@ async function signOut() {
 
 <template>
   <div class="shell">
-    <aside class="sidebar" aria-label="Sidebar">
+    <header class="topbar">
+      <button ref="menuBtn" type="button" class="icon-btn topbar-menu" aria-label="Open menu" :aria-expanded="drawer" aria-controls="sidebar" @click="drawer = true">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16" /></svg>
+      </button>
+      <NuxtLink to="/" class="brand topbar-brand" aria-label="NexaCloud dashboard"><LogoMark :size="26" /></NuxtLink>
+      <span class="topbar-title">{{ currentLabel }}</span>
+      <span class="topbar-status" :title="agentUp ? 'Agent connected' : 'Agent unreachable'">
+        <span class="dot" :class="{ down: !agentUp && !health.loading.value }" aria-hidden="true" />
+        <span class="topbar-host">{{ system.data.value?.hostname ?? '' }}</span>
+      </span>
+    </header>
+    <div v-if="drawer" class="drawer-scrim" aria-hidden="true" @click="drawer = false" />
+    <aside id="sidebar" class="sidebar" :class="{ open: drawer }" aria-label="Sidebar">
+      <button type="button" class="icon-btn drawer-close" aria-label="Close menu" @click="drawer = false"><AppIcon name="close" :size="18" /></button>
       <div class="sidebar-top">
         <NuxtLink to="/" class="brand" aria-label="NexaCloud dashboard">
           <LogoMark />

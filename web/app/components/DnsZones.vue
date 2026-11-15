@@ -176,7 +176,7 @@ async function wildcard() {
 
       <div style="overflow-x: auto">
         <table>
-          <thead><tr><th>Type</th><th>Name</th><th>Value</th><th>TTL</th><th><span style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Actions</span></th></tr></thead>
+          <thead><tr><th>Type</th><th>Name</th><th>Value</th><th>TTL</th><th><span class="sr-only">Actions</span></th></tr></thead>
           <tbody>
             <tr v-for="r in shown" :key="r.id">
               <td><span class="pill mono">{{ r.type }}</span></td>

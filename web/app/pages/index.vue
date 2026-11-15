@@ -177,7 +177,7 @@ const score = computed(() => adv.data.value?.score ?? null)
       </div>
       <div style="overflow-x: auto">
         <table>
-          <thead><tr><th>Project</th><th>Stack</th><th>Status</th><th>p95</th><th>Uptime 24 h</th><th>Last deploy</th><th><span style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Open</span></th></tr></thead>
+          <thead><tr><th>Project</th><th>Stack</th><th>Status</th><th>p95</th><th>Uptime 24 h</th><th>Last deploy</th><th><span class="sr-only">Open</span></th></tr></thead>
           <tbody>
             <tr v-for="p in projects" :key="p.id">
               <td><div style="display: flex; flex-direction: column; gap: 3px"><span style="font-weight: 600">{{ p.name }}</span><span style="font-size: 12px; color: #A3AEBD">{{ p.repo }}</span></div></td>

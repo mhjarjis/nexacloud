@@ -323,7 +323,7 @@ const anyEncrypted = computed(() => (dests.data.value ?? []).some((d) => d.confi
     <div style="padding: 16px 20px"><h2 id="jobs" style="font-size: 17px; font-weight: 600">Backup jobs</h2></div>
     <div style="overflow-x: auto">
       <table>
-        <thead><tr><th>Job</th><th>Includes</th><th>Schedule</th><th>Goes to</th><th>Keeps</th><th>Last run</th><th><span style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Actions</span></th></tr></thead>
+        <thead><tr><th>Job</th><th>Includes</th><th>Schedule</th><th>Goes to</th><th>Keeps</th><th>Last run</th><th><span class="sr-only">Actions</span></th></tr></thead>
         <tbody>
           <template v-for="j in jobRows" :key="j.p.id">
             <tr>

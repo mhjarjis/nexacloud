@@ -205,7 +205,7 @@ async function deleteUser(u: PanelUser) {
     </div>
     <div style="overflow-x: auto">
       <table>
-        <thead><tr><th>Name</th><th>Token</th><th>Scope</th><th v-if="isAdmin">User</th><th>Last used</th><th>Expires</th><th><span style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Actions</span></th></tr></thead>
+        <thead><tr><th>Name</th><th>Token</th><th>Scope</th><th v-if="isAdmin">User</th><th>Last used</th><th>Expires</th><th><span class="sr-only">Actions</span></th></tr></thead>
         <tbody>
           <tr v-for="t in tokens.data.value ?? []" :key="t.id">
             <td style="font-weight: 500">{{ t.name }}</td>
@@ -259,7 +259,7 @@ async function deleteUser(u: PanelUser) {
     </div>
     <div style="overflow-x: auto">
       <table>
-        <thead><tr><th>User</th><th>Role</th><th>Projects</th><th>2FA</th><th>Last sign-in</th><th><span style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Actions</span></th></tr></thead>
+        <thead><tr><th>User</th><th>Role</th><th>Projects</th><th>2FA</th><th>Last sign-in</th><th><span class="sr-only">Actions</span></th></tr></thead>
         <tbody>
           <template v-for="u in users" :key="u.username">
             <tr>

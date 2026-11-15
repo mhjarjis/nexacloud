@@ -202,7 +202,7 @@ const tunnelCopied = ref(false)
     </div>
     <div style="overflow-x: auto">
       <table>
-        <thead><tr><th>Database</th><th>Used by</th><th>Size</th><th>Tables</th><th>{{ eng === 'mysql' ? 'Users' : 'Owner' }}</th><th>Last backup</th><th><span style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Actions</span></th></tr></thead>
+        <thead><tr><th>Database</th><th>Used by</th><th>Size</th><th>Tables</th><th>{{ eng === 'mysql' ? 'Users' : 'Owner' }}</th><th>Last backup</th><th><span class="sr-only">Actions</span></th></tr></thead>
         <tbody>
           <template v-for="d in shownRows" :key="d.name">
             <tr>
@@ -268,7 +268,7 @@ const tunnelCopied = ref(false)
         <div style="padding: 16px 20px; display: flex; align-items: center; justify-content: space-between"><h2 style="font-size: 17px; font-weight: 600">Users</h2></div>
         <div style="overflow-x: auto">
           <table>
-            <thead><tr><th>User</th><th>Host</th><th>Access</th><th>Privileges</th><th><span style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Actions</span></th></tr></thead>
+            <thead><tr><th>User</th><th>Host</th><th>Access</th><th>Privileges</th><th><span class="sr-only">Actions</span></th></tr></thead>
             <tbody>
               <tr v-for="u in users" :key="u.user + u.host">
                 <td class="mono">{{ u.user }}</td>

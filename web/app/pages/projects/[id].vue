@@ -147,6 +147,14 @@ async function runArtisan(cmd = artisanCmd.value.trim()) {
   } catch (e) { fail(e) }
 }
 const maintBusy = ref(false)
+const tabsEl = ref<HTMLElement | null>(null)
+// Phones: the tab strip scrolls sideways — keep the active tab in view.
+watch(tab, () => nextTick(() => {
+  const strip = tabsEl.value
+  const on = strip?.querySelector<HTMLElement>('button.on')
+  if (strip && on && strip.scrollWidth > strip.clientWidth) strip.scrollTo({ left: on.offsetLeft - (strip.clientWidth - on.offsetWidth) / 2, behavior: 'smooth' })
+}), { immediate: true })
+onMounted(() => nextTick(() => { const strip = tabsEl.value; const on = strip?.querySelector<HTMLElement>('button.on'); if (strip && on) strip.scrollLeft = on.offsetLeft - (strip.clientWidth - on.offsetWidth) / 2 }))
 const nodeSt = ref<{ unit: string; active: string; port: number | null; logs: string } | null>(null)
 const nodeBusy = ref(false)
 async function loadNode() { if (p.data.value?.kind !== 'node') return; try { nodeSt.value = await api.get(`/api/projects/${enc.value}/node`) } catch { nodeSt.value = null } }
@@ -558,7 +566,7 @@ async function disconnect() {
   <p v-if="createErr" class="small" style="color: var(--bad)" role="alert">{{ createErr }} — <NuxtLink to="/domains">see Domains &amp; SSL</NuxtLink></p>
   <p v-if="err" class="small" style="color: var(--bad)" role="alert">{{ err }} <button type="button" class="linkish" @click="err = null">Dismiss</button></p>
 
-  <nav class="tabs" aria-label="Project sections">
+  <nav ref="tabsEl" class="tabs" aria-label="Project sections">
     <button v-for="t in tabs" :key="t[0]" type="button" :class="{ on: tab === t[0] }" :aria-pressed="tab === t[0]" @click="tab = t[0]"><AppIcon :name="TAB_ICONS[t[0]]" :size="15" /> {{ t[1] }}</button>
   </nav>
 
@@ -986,9 +994,10 @@ async function disconnect() {
 .crumb { color: var(--muted); }
 h2 { font-size: 17px; font-weight: 600; margin: 0; }
 .linkish { background: none; border: 0; color: var(--info); cursor: pointer; text-decoration: underline; font: inherit; }
-.tabs { display: flex; flex-wrap: wrap; gap: 4px; border-bottom: 1px solid #222A34; }
+.tabs { position: relative; display: flex; flex-wrap: wrap; gap: 4px; border-bottom: 1px solid #222A34; }
 .tabs button { min-height: 44px; padding: 0 16px; background: transparent; border: 0; border-bottom: 2px solid transparent; color: var(--muted); font-size: 14px; font-weight: 600; cursor: pointer; margin-bottom: -1px; }
 .tabs button.on { color: var(--text); border-bottom-color: var(--accent); }
+@media (max-width: 640px) { .tabs { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; } .tabs::-webkit-scrollbar { display: none; } .tabs button { flex: none; padding: 0 12px; } }
 .checks { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
 .check { padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
 .check-val { font-family: var(--font-head); font-size: 22px; font-weight: 600; }

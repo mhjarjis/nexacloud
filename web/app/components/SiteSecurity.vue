@@ -225,7 +225,7 @@ const host = computed(() => (typeof window !== 'undefined' ? window.location.hos
       </div>
       <div style="overflow-x: auto">
         <table>
-          <thead><tr><th>Account</th><th>Connect</th><th>Login</th><th>Folder</th><th><span style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Actions</span></th></tr></thead>
+          <thead><tr><th>Account</th><th>Connect</th><th>Login</th><th>Folder</th><th><span class="sr-only">Actions</span></th></tr></thead>
           <tbody>
             <tr v-for="u in sftp" :key="u.username">
               <td class="mono" style="font-weight: 500">{{ u.username }}</td>

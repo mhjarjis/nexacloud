@@ -142,7 +142,7 @@ async function reboot() {
     </div>
     <div style="overflow-x: auto">
       <table>
-        <thead><tr><th>Key</th><th>Fingerprint</th><th>Comment</th><th><span style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Actions</span></th></tr></thead>
+        <thead><tr><th>Key</th><th>Fingerprint</th><th>Comment</th><th><span class="sr-only">Actions</span></th></tr></thead>
         <tbody>
           <tr v-for="k in keys.data.value?.keys ?? []" :key="k.fingerprint">
             <td class="mono" style="font-size: 13px">{{ k.kind }} · {{ k.bits }}</td>

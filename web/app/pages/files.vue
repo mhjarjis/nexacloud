@@ -191,7 +191,7 @@ function open(e: Entry) {
 
     <div style="overflow-x: auto">
       <table>
-        <thead><tr><th style="width: 32px"><input v-model="allChecked" type="checkbox" aria-label="Select all" :disabled="!writable"></th><th>Name</th><th>Size</th><th>Permissions</th><th>Owner</th><th>Modified</th><th><span style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Actions</span></th></tr></thead>
+        <thead><tr><th style="width: 32px"><input v-model="allChecked" type="checkbox" aria-label="Select all" :disabled="!writable"></th><th>Name</th><th>Size</th><th>Permissions</th><th>Owner</th><th>Modified</th><th><span class="sr-only">Actions</span></th></tr></thead>
         <tbody>
           <tr v-if="path !== '/' && crumbs.length > 1"><td /><td colspan="6"><button type="button" class="mono" style="background: none; border: 0; cursor: pointer; color: #A3AEBD; font-size: 13px" @click="go(crumbs[crumbs.length - 2]!.path)">.. (up)</button></td></tr>
           <tr v-for="e in shown" :key="e.name">
