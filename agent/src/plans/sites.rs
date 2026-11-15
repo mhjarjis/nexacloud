@@ -48,6 +48,15 @@ pub enum Runtime {
     #[default]
     Fpm,
     Frankenphp,
+    /// Laravel Octane on FrankenPHP (worker mode: the app stays in memory).
+    Octane,
+}
+
+impl Runtime {
+    /// Runtimes nginx reaches over a loopback port (a systemd service per site).
+    pub fn proxied(&self) -> bool {
+        matches!(self, Runtime::Frankenphp | Runtime::Octane)
+    }
 }
 
 fn default_body() -> String {
@@ -482,8 +491,8 @@ pub fn validate(m: &SiteModel) -> Result<(), String> {
     if let Some(p) = &m.pool {
         valid_pool(p)?;
     }
-    if m.runtime == Runtime::Frankenphp && m.runtime_port.is_none() {
-        return Err("FrankenPHP runtime needs a port".into());
+    if m.runtime.proxied() && m.runtime_port.is_none() {
+        return Err("this runtime needs a port".into());
     }
     Ok(())
 }
@@ -610,7 +619,7 @@ fn body(m: &SiteModel, acme: &str) -> String {
             if o.cache_static {
                 b.push_str("    location ~* \\.(?:css|js|mjs|jpg|jpeg|png|gif|webp|avif|svg|ico|woff2?)$ {\n        expires 30d;\n        access_log off;\n        try_files $uri =404;\n    }\n");
             }
-            if php && m.runtime == Runtime::Frankenphp {
+            if php && m.runtime.proxied() {
                 let up = format!("http://127.0.0.1:{}", m.runtime_port.unwrap_or(8100));
                 // PHP files must never be served as static files: send them to the app.
                 b.push_str(&proxy_location("~ \\.php$", &up));
@@ -655,7 +664,7 @@ fn php_location(sock: &str, ind: &str) -> String {
 /// A password-protected folder. Access is checked before try_files, so
 /// Laravel routes under the folder are protected too.
 fn protected_location(m: &SiteModel, d: &ProtectedDir) -> String {
-    let php = m.kind.uses_php() && m.runtime != Runtime::Frankenphp;
+    let php = m.kind.uses_php() && !m.runtime.proxied();
     let fallback = if m.kind.uses_php() && (m.options.front_controller || m.kind == SiteKind::Laravel) {
         "/index.php?$query_string"
     } else {
@@ -972,7 +981,7 @@ pub fn plan_delete(env: &ChangeEnv, id: &str) -> Result<ChangePlan, String> {
             .command(["systemctl", "daemon-reload"])
             .on_revert(["sh", "-c", "systemctl daemon-reload; systemctl enable --now \"$1\" 2>/dev/null; true", "start", &name]);
     }
-    if m.runtime == Runtime::Frankenphp {
+    if m.runtime.proxied() {
         let unit = crate::plans::runtime::unit_name(id);
         b = b.command([
             "sh",
@@ -1009,7 +1018,7 @@ pub fn plan_isolate(
     if old.user.is_some() {
         return Err("this site already has its own user".into());
     }
-    if old.runtime == Runtime::Frankenphp {
+    if old.runtime.proxied() {
         return Err("switch the site back to PHP-FPM first".into());
     }
     let pd = old

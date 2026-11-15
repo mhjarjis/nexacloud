@@ -21,6 +21,20 @@ async function loadModel() {
 }
 onMounted(loadModel)
 
+// Runtime choice
+type Rt = 'fpm' | 'frankenphp' | 'octane'
+const runtimeTarget = ref<Rt>('fpm')
+watch(model, (m) => { if (m) runtimeTarget.value = m.runtime === 'fpm' ? (m.kind === 'laravel' ? 'octane' : 'frankenphp') : 'fpm' }, { immediate: true })
+const runtimes = computed(() => {
+  const m = model.value
+  const laravel = m?.kind === 'laravel'
+  return [
+    { id: 'fpm' as Rt, label: 'PHP-FPM', hint: 'Standard and most compatible. Uses the server\'s PHP version.', disabled: false, why: undefined },
+    { id: 'frankenphp' as Rt, label: 'FrankenPHP', hint: 'Modern app server (classic mode). Any PHP app.', disabled: false, why: undefined },
+    { id: 'octane' as Rt, label: 'Laravel Octane', hint: 'Worker mode: the app stays in memory — fastest. Needs laravel/octane.', disabled: !laravel, why: laravel ? undefined : 'Only for Laravel sites' },
+  ]
+})
+
 // PHP switch
 const installed = computed(() => (props.php?.versions ?? []).filter((v) => v.fpm_installed).map((v) => v.version))
 const phpTarget = ref('')
@@ -73,7 +87,7 @@ function done(s: string) {
         <AppIcon name="ssl" :size="14" :stroke="2" /> Enable HTTPS
       </button>
       <button v-if="managed && model && (model.kind === 'laravel' || model.kind === 'php')" type="button" class="btn btn-s" :class="{ 'btn-on': tab === 'runtime' }" @click="tab = tab === 'runtime' ? '' : 'runtime'">
-        <AppIcon name="services" :size="14" :stroke="2" /> Runtime: {{ model.runtime === 'frankenphp' ? 'FrankenPHP' : 'PHP-FPM' }}
+        <AppIcon name="services" :size="14" :stroke="2" /> Runtime: {{ model.runtime === 'frankenphp' ? 'FrankenPHP' : model.runtime === 'octane' ? 'Octane' : 'PHP-FPM' }}
       </button>
       <button v-if="managed && model && model.php_version && !model.user && model.runtime !== 'frankenphp'" type="button" class="btn btn-s" :class="{ 'btn-on': tab === 'isolate' }" @click="tab = tab === 'isolate' ? '' : 'isolate'">
         <AppIcon name="lock" :size="14" :stroke="2" /> Own user &amp; PHP pool
@@ -131,16 +145,27 @@ function done(s: string) {
       />
     </div>
 
-    <div v-if="tab === 'runtime' && model" class="stack" style="gap: 10px">
-      <p v-if="model.runtime !== 'frankenphp'" class="small muted">
-        <strong>FrankenPHP</strong> is a modern PHP app server (built on Caddy). NexaCloud runs it for this site on a private port as its own service, and nginx keeps handling HTTPS and static files.
-        It uses its own bundled PHP — check your extensions with <span class="mono">frankenphp php-cli -m</span> after switching. PHP-FPM stays installed, so switching back is one click.
+    <div v-if="tab === 'runtime' && model" class="stack" style="gap: 12px">
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px" role="radiogroup" aria-label="PHP runtime">
+        <button v-for="r in runtimes" :key="r.id" type="button" role="radio" :aria-checked="runtimeTarget === r.id" :disabled="r.disabled" :title="r.why" :style="`min-height: 92px; padding: 12px; border-radius: 10px; cursor: ${r.disabled ? 'not-allowed' : 'pointer'}; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; text-align: left; color: #E7ECF2; opacity: ${r.disabled ? .5 : 1}; background: ${runtimeTarget === r.id ? '#13211B' : '#0F1318'}; border: 1px solid ${runtimeTarget === r.id ? '#3DDC97' : '#2A3441'}`" @click="runtimeTarget = r.id">
+          <span class="row" style="gap: 8px; font-size: 14px; font-weight: 600">{{ r.label }}<span v-if="model.runtime === r.id" class="pill ok">now</span></span>
+          <span style="font-size: 12px; color: #A3AEBD; line-height: 1.4">{{ r.hint }}</span>
+        </button>
+      </div>
+      <p v-if="runtimeTarget === 'octane'" class="small muted">
+        <strong>Laravel Octane</strong> keeps your app booted in memory between requests (FrankenPHP worker mode) — often several times faster. Your project needs <span class="mono">laravel/octane</span>: run <span class="mono">composer require laravel/octane</span> and <span class="mono">php artisan octane:install --server=frankenphp</span>, commit and deploy first. Every deploy restarts the workers. Watch out for code that keeps state in static properties or singletons between requests.
       </p>
-      <p v-else class="small muted">This site runs on FrankenPHP (port {{ model.runtime_port }}). Switch back to PHP {{ model.php_version }} FPM at any time.</p>
+      <p v-else-if="runtimeTarget === 'frankenphp'" class="small muted">
+        <strong>FrankenPHP</strong> (classic mode) is a modern PHP app server built on Caddy, run for this site on a private port; nginx keeps HTTPS and static files. It uses its own bundled PHP — check extensions with <span class="mono">frankenphp php-cli -m</span>.
+      </p>
+      <p v-else class="small muted"><strong>PHP-FPM</strong> with PHP {{ model.php_version }} — the standard setup. PHP limits and the PHP version switch apply here.</p>
+      <p v-if="model.runtime !== 'fpm' && runtimeTarget !== 'fpm' && runtimeTarget !== model.runtime" class="small" style="color: var(--warn, #F7C55E)">Switch back to PHP-FPM first, then to the other runtime.</p>
       <PlanAction
-        :request="{ kind: 'site_runtime', params: { id: site.id, runtime: model.runtime === 'frankenphp' ? 'fpm' : 'frankenphp' } }"
-        :label="model.runtime === 'frankenphp' ? 'Preview switch to PHP-FPM' : 'Preview switch to FrankenPHP'"
-        :success-text="model.runtime === 'frankenphp' ? 'Back on PHP-FPM.' : 'Now running on FrankenPHP.'"
+        v-if="runtimeTarget !== model.runtime"
+        :key="`rt-${runtimeTarget}`"
+        :request="{ kind: 'site_runtime', params: { id: site.id, runtime: runtimeTarget } }"
+        :label="`Preview switch to ${runtimes.find((r) => r.id === runtimeTarget)?.label}`"
+        :success-text="`Now running on ${runtimes.find((r) => r.id === runtimeTarget)?.label}.`"
         @done="done"
       />
     </div>

@@ -255,7 +255,7 @@ export interface SiteModel {
   project_dir: string | null
   root: string | null
   php_version: string | null
-  runtime: 'fpm' | 'frankenphp'
+  runtime: 'fpm' | 'frankenphp' | 'octane'
   runtime_port: number | null
   upstream: string | null
   redirect_to: string | null

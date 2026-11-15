@@ -41,6 +41,33 @@ fn unit(m: &SiteModel, user: &str) -> String {
     )
 }
 
+/// Laravel Octane (FrankenPHP worker mode) service. Runs from the app folder
+/// (`…/current` with release folders, so a restart picks up a new release).
+fn octane_unit(m: &SiteModel, user: &str, app: &str, port: u16) -> String {
+    let id = &m.id;
+    let php = m.php_version.as_deref().map(|v| format!("/usr/bin/php{v}")).filter(|p| std::path::Path::new(p).exists()).unwrap_or_else(|| "/usr/bin/php".into());
+    format!(
+        "# Managed by NexaCloud\n[Unit]\nDescription=Laravel Octane (FrankenPHP) for {id}\nAfter=network.target\n\n[Service]\nUser={user}\nGroup={user}\nWorkingDirectory={app}\nEnvironment=HOME=/var/lib/frankenphp/{id}\nEnvironment=XDG_DATA_HOME=/var/lib/frankenphp/{id}\nEnvironment=XDG_CONFIG_HOME=/var/lib/frankenphp/{id}\nEnvironment=PATH=/usr/local/bin:/usr/bin:/bin\nExecStart={php} artisan octane:frankenphp --host=127.0.0.1 --port={port} --admin-port={admin} --workers=auto --max-requests=500\nRestart=always\nRestartSec=2\nTimeoutStopSec=30\nMemoryMax=2G\nLimitNOFILE=65535\n\n[Install]\nWantedBy=multi-user.target\n",
+        admin = port + 1000
+    )
+}
+
+fn ensure_binary(env: &ChangeEnv, b: crate::changes::ChangePlanBuilder) -> crate::changes::ChangePlanBuilder {
+    if env.host_path(FRANKENPHP_BIN).exists() {
+        return b;
+    }
+    b.pre_command_timeout(["curl", "-fsSL", "--retry", "5", "--retry-all-errors", "-C", "-", "-o", "/usr/local/bin/frankenphp.download", FRANKENPHP_URL], 1800)
+        .pre_command([
+            "sh",
+            "-c",
+            "echo \"$1  /usr/local/bin/frankenphp.download\" | sha256sum -c - || { rm -f /usr/local/bin/frankenphp.download; echo 'checksum mismatch: refusing to install FrankenPHP'; exit 1; }",
+            "verify",
+            FRANKENPHP_SHA256,
+        ])
+        .pre_command(["install", "-m", "0755", "/usr/local/bin/frankenphp.download", FRANKENPHP_BIN])
+        .pre_command(["rm", "-f", "/usr/local/bin/frankenphp.download"])
+}
+
 /// First free port from 8100 not used by another managed site.
 fn pick_port(env: &ChangeEnv, me: &str) -> u16 {
     let used: Vec<u16> = std::fs::read_dir(env.host_path("/etc/nginx/conf.d"))
@@ -93,6 +120,9 @@ pub fn plan_runtime(env: &ChangeEnv, p: &RuntimeParams) -> Result<ChangePlan, St
     }
     if old.runtime == p.runtime {
         return Err(format!("{} already runs on {:?}", p.id, p.runtime));
+    }
+    if old.runtime != Runtime::Fpm && p.runtime != Runtime::Fpm {
+        return Err("switch the site back to PHP-FPM first, then to the other runtime".into());
     }
     let unit_n = unit_name(&p.id);
     let unit_path = format!("/etc/systemd/system/{unit_n}.service");
@@ -164,15 +194,53 @@ pub fn plan_runtime(env: &ChangeEnv, p: &RuntimeParams) -> Result<ChangePlan, St
                     p.id
                 ));
         }
+        Runtime::Octane => {
+            if old.kind != sites::SiteKind::Laravel {
+                return Err("Octane is for Laravel sites".into());
+            }
+            let root = old.root.clone().ok_or("this site has no web root")?;
+            let app = root.strip_suffix("/public").ok_or("Octane needs the standard Laravel layout (web root = the app's public folder)")?.to_string();
+            if !env.host_path(&format!("{app}/vendor/laravel/octane")).exists() {
+                return Err(format!(
+                    "laravel/octane is not installed in {app}. In your project run:  composer require laravel/octane  and  php artisan octane:install --server=frankenphp  — commit, deploy, then switch again."
+                ));
+            }
+            let port = pick_port(env, &p.id);
+            new.runtime_port = Some(port);
+            let user = owner(env, &old);
+            title = format!("Run {} on Laravel Octane", p.id);
+            b = ChangePlan::builder("site_runtime", &title, &format!("site:{}", p.id))
+                .lock(&format!("site:{}", p.id))
+                .lock("nginx")
+                .create_parents();
+            b = ensure_binary(env, b)
+                .pre_command(["install", "-d", "-m", "0750", "-o", &user, "-g", &user, &format!("/var/lib/frankenphp/{}", p.id)])
+                .write_file(&unit_path, octane_unit(&new, &user, &app, port))
+                .write_file(&sites::conf_path(&p.id), sites::render(&new))
+                .command(["systemctl", "daemon-reload"])
+                .command(["systemctl", "enable", "--now", &unit_n])
+                .command([
+                    "sh", "-c",
+                    "for i in $(seq 1 60); do code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$1/); [ \"$code\" -gt 0 ] && [ \"$code\" -lt 500 ] && { echo \"Octane answers: HTTP $code\"; exit 0; }; sleep 1; done; echo \"Octane did not answer (last HTTP $code)\"; journalctl -u \"$2\" -n 30 --no-pager 2>/dev/null; exit 1",
+                    "probe", &port.to_string(), &unit_n,
+                ])
+                .command(["nginx", "-t"])
+                .command(["systemctl", "reload", "nginx"])
+                .on_revert(["sh", "-c", "systemctl disable --now \"$1\" 2>/dev/null; systemctl daemon-reload; systemctl reload nginx", "revert", &unit_n])
+                .note(format!(
+                    "Starts Laravel Octane with FrankenPHP (worker mode — your app stays in memory between requests) for {} on 127.0.0.1:{port} as {user}, then points nginx at it. Every deploy restarts the workers. Code that keeps state in static properties or singletons can behave differently — test first. The PHP-FPM pool is kept: switching back is one click.",
+                    p.id
+                ));
+        }
         Runtime::Fpm => {
             new.runtime_port = None;
             title = format!("Run {} on PHP-FPM", p.id);
+            let had_caddy = env.host_path(&caddy_path).exists();
             b = ChangePlan::builder("site_runtime", &title, &format!("site:{}", p.id))
                 .lock(&format!("site:{}", p.id))
                 .lock("nginx")
                 .write_file(&sites::conf_path(&p.id), sites::render(&new))
                 .delete_file(&unit_path)
-                .delete_file(&caddy_path)
                 .command(["nginx", "-t"])
                 .command(["systemctl", "reload", "nginx"])
                 .command([
@@ -183,6 +251,9 @@ pub fn plan_runtime(env: &ChangeEnv, p: &RuntimeParams) -> Result<ChangePlan, St
                     &unit_n,
                 ])
                 .on_revert(["sh", "-c", "systemctl daemon-reload; systemctl enable --now \"$1\" 2>/dev/null; systemctl reload nginx", "revert", &unit_n]);
+            if had_caddy {
+                b = b.delete_file(&caddy_path);
+            }
         }
     }
     b = b.verify_command(["systemctl", "is-active", "--quiet", "nginx"]);
@@ -330,5 +401,45 @@ mod tests {
             conf.contains("location ~ \\.php$ {\n        proxy_pass http://127.0.0.1:8101;"),
             "{conf}"
         );
+        let mut o = m.clone();
+        o.runtime = Runtime::Octane;
+        o.runtime_port = Some(8102);
+        let ou = octane_unit(&o, "nc_shop", "/var/www/shop.example.com/current", 8102);
+        assert!(ou.contains("WorkingDirectory=/var/www/shop.example.com/current"));
+        assert!(ou.contains("artisan octane:frankenphp --host=127.0.0.1 --port=8102 --admin-port=9102 --workers=auto --max-requests=500"));
+        assert!(ou.contains("User=nc_shop") && ou.contains("Restart=always"));
+        let conf = sites::render(&o);
+        assert!(conf.contains("proxy_pass http://127.0.0.1:8102;") && !conf.contains("fastcgi_pass"));
+        assert_eq!(sites::parse_model(&conf).unwrap().runtime, Runtime::Octane);
+    }
+
+    #[test]
+    fn octane_needs_laravel_with_octane_installed() {
+        let tmp = std::env::temp_dir().join(format!("ncrt-{}", uuid::Uuid::new_v4()));
+        let mut env = ChangeEnv::system(tmp.join("snapshots"));
+        env.root = tmp.clone();
+        let m = sites::model_from_create(&sites::CreateParams {
+            kind: sites::SiteKind::Laravel,
+            domain: "oct.example.com".into(),
+            aliases: vec![],
+            root: None,
+            php_version: Some("8.3".into()),
+            upstream: None,
+            redirect_to: None,
+            redirect_code: None,
+            options: None,
+            isolate: false,
+            no_placeholder: false,
+        });
+        std::fs::create_dir_all(env.host_path("/etc/nginx/conf.d")).unwrap();
+        std::fs::write(env.host_path(&sites::conf_path(&m.id)), sites::render(&m)).unwrap();
+        std::fs::create_dir_all(env.host_path("/var/www/oct.example.com/public")).unwrap();
+        let req = RuntimeParams { id: m.id.clone(), runtime: Runtime::Octane };
+        let e = plan_runtime(&env, &req).unwrap_err();
+        assert!(e.contains("composer require laravel/octane"), "{e}");
+        std::fs::create_dir_all(env.host_path("/var/www/oct.example.com/vendor/laravel/octane")).unwrap();
+        let plan = plan_runtime(&env, &req).unwrap();
+        assert!(plan.title.contains("Octane"));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

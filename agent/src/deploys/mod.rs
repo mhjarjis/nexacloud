@@ -758,12 +758,12 @@ async fn reload_fpm(p: &Project, job: &JobCtx) {
             if o.ok { "ok" } else { "failed" }
         ));
     }
-    // FrankenPHP keeps code in memory too.
+    // FrankenPHP / Octane keep code in memory too: restart on the new code.
     if let Ok(m) = crate::plans::sites::load_model(
         &crate::changes::ChangeEnv::system(PathBuf::from("/tmp")),
         &p.site_id,
     ) {
-        if m.runtime == crate::plans::sites::Runtime::Frankenphp {
+        if m.runtime.proxied() {
             let unit = crate::plans::runtime::unit_name(&p.site_id);
             let o = Cmd::new("systemctl")
                 .args(["restart", &unit])

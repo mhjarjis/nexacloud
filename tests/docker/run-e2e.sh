@@ -1034,6 +1034,38 @@ check "Hostinger: MX via email wizard (priority kept)" bash -c "curl -fsSk -b '$
 check "wildcard SSL needs Cloudflare" test "$(post_code "dns/$HSID/wildcard" '{"zone":"example.test","email":"a@example.test"}')" = 400
 check "disconnect a DNS account" jqe "$(curl -fsSk -b "$JAR" -H "Origin: $U" -X DELETE "$U/api/dns/providers/$HSID")" '.ok==true'
 
+# ------------------------------------------------------------------ octane
+step "Laravel Octane runtime (FrankenPHP worker mode)"
+sudo_on "$PASS"
+in_box 'set -e
+rm -rf /srv/git/oct.git /tmp/octsrc && git init -q --bare /srv/git/oct.git
+cp -a /opt/laravel-octane /tmp/octsrc && cd /tmp/octsrc && rm -rf .git .env database/database.sqlite
+sed -i "/^\/vendor/d" .gitignore
+cat >> routes/web.php <<"PHP"
+
+Route::get("/version", fn () => "oct v1 " . (isset($_SERVER["LARAVEL_OCTANE"]) ? "octane" : "fpm"));
+PHP
+git init -q -b main && git config user.email dev@example.com && git config user.name Dev
+git add -A && git commit -qm "oct v1" && git remote add origin /srv/git/oct.git && git push -q origin main
+chmod -R a+rX /srv/git/oct.git'
+OJ="$(post_json apps '{"kind":"laravel","domain":"octane.test.local","php_version":"8.3","repo":"/srv/git/oct.git","branch":"main","database":"none","isolate":true,"releases":true,"worker":false,"scheduler":false}' | jq -r .job_id)"
+st="$(wait_job2 "$OJ")"; [ "$st" = ok ] || api "jobs/$OJ" | jq -r .log | tail -20
+check "Laravel app for Octane → created" test "$st" = ok
+check "…first deploy ok" bash -c "for i in \$(seq 1 600); do s=\$(curl -fsSk -b '$JAR' '$U/api/projects/octane.test.local/deploys' | jq -r '.[0].status // empty'); case \$s in ok) exit 0;; failed|rolled_back) exit 1;; esac; sleep 1; done; exit 1"
+check "…served by PHP-FPM" bash -c "[ \"\$(docker exec $NAME curl -s -H 'Host: octane.test.local' http://127.0.0.1/version)\" = 'oct v1 fpm' ]"
+check "Octane refused on a non-Laravel site" test "$(post_code plans/preview '{"kind":"site_runtime","params":{"id":"app.test.local","runtime":"octane"}}')" = 409
+st="$(plan site_runtime '{"id":"octane.test.local","runtime":"octane"}')"
+check "switch to Laravel Octane → applied" test "$st" = applied
+check "…served by Octane workers" bash -c "for i in \$(seq 1 20); do [ \"\$(docker exec $NAME curl -s -H 'Host: octane.test.local' http://127.0.0.1/version)\" = 'oct v1 octane' ] && exit 0; sleep 1; done; exit 1"
+check "…as the site user, under systemd" in_box "systemctl is-active --quiet nexacloud-frankenphp-octane-test-local && [ \$(ps -o user= -p \$(systemctl show -p MainPID --value nexacloud-frankenphp-octane-test-local)) = nc_octane_test_local ]"
+check "…static files still served by nginx" in_box "[ \$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: octane.test.local' http://127.0.0.1/robots.txt) = 200 ]"
+in_box "cd /tmp/octsrc && sed -i 's/oct v1/oct v2/' routes/web.php && git commit -qam v2 && git push -q origin main && chmod -R a+rX /srv/git/oct.git"
+st="$(wait_job2 "$(post_json projects/octane.test.local/deploy '{}' | jq -r .job_id)")"
+check "deploy v2 → workers restarted, v2 live" bash -c "[ '$st' = ok ] && for i in \$(seq 1 20); do [ \"\$(docker exec $NAME curl -s -H 'Host: octane.test.local' http://127.0.0.1/version)\" = 'oct v2 octane' ] && exit 0; sleep 1; done; exit 1"
+st="$(plan site_runtime '{"id":"octane.test.local","runtime":"fpm"}')"
+check "switch back to PHP-FPM → applied" test "$st" = applied
+check "…served by PHP-FPM again, Octane stopped" bash -c "for i in \$(seq 1 10); do [ \"\$(docker exec $NAME curl -s -H 'Host: octane.test.local' http://127.0.0.1/version)\" = 'oct v2 fpm' ] && ! docker exec $NAME systemctl is-active --quiet nexacloud-frankenphp-octane-test-local && exit 0; sleep 1; done; exit 1"
+
 # ------------------------------------------------------------------ throttle
 step "Login throttling"
 for _ in 1 2 3 4 5 6; do code -H "Origin: $U" -H 'Content-Type: application/json' -d '{"password":"bad"}' "$U/api/auth/login" >/dev/null; done

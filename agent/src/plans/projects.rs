@@ -407,7 +407,7 @@ pub fn plan_releases(env: &ChangeEnv, p: &Project) -> Result<ChangePlan, String>
     }
     let old = crate::plans::sites::load_model(env, &p.site_id)
         .map_err(|_| "only sites managed by NexaCloud can switch (use “Manage with NexaCloud” on the Sites page first)".to_string())?;
-    if old.runtime == crate::plans::sites::Runtime::Frankenphp {
+    if old.runtime.proxied() {
         return Err("switch the site back to PHP-FPM first".into());
     }
     let root = old.root.clone().ok_or("this site has no web root")?;

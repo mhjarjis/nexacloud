@@ -25,6 +25,11 @@ RUN curl -fsSL --retry 5 https://getcomposer.org/installer | php -- --install-di
  && COMPOSER_ALLOW_SUPERUSER=1 composer create-project --no-interaction --prefer-dist --no-progress laravel/laravel /opt/laravel-skel \
  && rm -rf /root/.cache/composer
 
+# the same Laravel app with laravel/octane installed, for the Octane runtime test
+RUN cp -a /opt/laravel-skel /opt/laravel-octane \
+ && cd /opt/laravel-octane && COMPOSER_ALLOW_SUPERUSER=1 composer require --no-interaction --no-progress laravel/octane \
+ && rm -rf /root/.cache/composer
+
 # Batch C: ClamAV and Node.js preinstalled (no signature download in tests: a tiny
 # EICAR-only signature file), WordPress tarball cached for the installer test
 RUN apt-get update && apt-get install -y --no-install-recommends clamav nodejs npm \
