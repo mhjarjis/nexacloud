@@ -111,27 +111,19 @@ async function onPick(ev: Event) {
 }
 
 // ---- editor
-const editor = reactive({ open: false, name: '', content: '', original: '', writable: false, busy: false, err: '' })
+const editorBytes = computed(() => new TextEncoder().encode(editor.content).length)
+const editor = reactive({ open: false, name: '', content: '', original: '', writable: false, busy: false, err: '', line: 1, col: 1 })
 async function openEditor(name: string) {
   editor.err = ''
   try {
     const r = await api.get<{ content: string; writable: boolean }>(`/api/files/read?path=${encodeURIComponent(join(name))}`)
-    Object.assign(editor, { open: true, name, content: r.content, original: r.content, writable: r.writable })
+    Object.assign(editor, { open: true, name, content: r.content, original: r.content, writable: r.writable, line: 1, col: 1 })
+    nextTick(() => document.getElementById('ed-h')?.scrollIntoView({ behavior: 'smooth', block: 'start' }))
   } catch (e) { err.value = errorMessage(e) }
 }
 async function saveEditor() {
   editor.busy = true; editor.err = ''
   try { await api.post('/api/files/write', { path: join(editor.name), content: editor.content }); editor.original = editor.content; msg.value = `Saved ${editor.name}`; load() } catch (e) { editor.err = errorMessage(e) } finally { editor.busy = false }
-}
-function onKey(e: KeyboardEvent) {
-  if ((e.metaKey || e.ctrlKey) && e.key === 's' && editor.open) { e.preventDefault(); if (editor.writable) saveEditor() }
-  if (e.key === 'Tab' && (e.target as HTMLElement)?.tagName === 'TEXTAREA') {
-    e.preventDefault()
-    const t = e.target as HTMLTextAreaElement
-    const s = t.selectionStart
-    editor.content = editor.content.slice(0, s) + '    ' + editor.content.slice(t.selectionEnd)
-    nextTick(() => { t.selectionStart = t.selectionEnd = s + 4 })
-  }
 }
 function open(e: Entry) {
   if (e.kind === 'dir') go(join(e.name))
@@ -232,7 +224,7 @@ function open(e: Entry) {
     </div>
   </section>
 
-  <section v-if="editor.open" class="card" aria-labelledby="ed-h" style="padding: 0; overflow: hidden" @keydown="onKey">
+  <section v-if="editor.open" class="card" aria-labelledby="ed-h" style="padding: 0; overflow: hidden">
     <div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 20px; border-bottom: 1px solid #1B222B">
       <div style="display: flex; align-items: center; gap: 10px"><AppIcon name="edit" :size="16" /><h2 id="ed-h" class="mono" style="font-size: 15px; font-weight: 600">{{ editor.name }}</h2><span v-if="editor.content !== editor.original" class="pill warn">unsaved</span><span v-if="!editor.writable" class="pill">read only</span></div>
       <div style="display: flex; gap: 8px">
@@ -241,7 +233,13 @@ function open(e: Entry) {
       </div>
     </div>
     <p v-if="editor.err" class="small" style="color: var(--bad); padding: 8px 20px" role="alert">{{ editor.err }}</p>
-    <textarea v-model="editor.content" class="mono" :readonly="!editor.writable" spellcheck="false" aria-label="File contents" placeholder="Empty file — start typing" style="width: 100%; min-height: 480px; resize: vertical; background: #07090C; color: #E7ECF2; border: 0; padding: 16px 20px; font-size: 13px; line-height: 1.6; tab-size: 4; outline: none" />
-    <p style="font-size: 12px; color: #A3AEBD; padding: 8px 20px">⌘/Ctrl + S saves. Owner and permissions are kept.</p>
+    <CodeEditor :key="editor.name" v-model="editor.content" :filename="editor.name" :readonly="!editor.writable" height="65vh" @save="editor.writable && editor.content !== editor.original && saveEditor()" @cursor="(l, c) => { editor.line = l; editor.col = c }" />
+    <div class="mono" style="display: flex; flex-wrap: wrap; gap: 16px; font-size: 12px; color: #A3AEBD; padding: 8px 20px; border-top: 1px solid #1B222B">
+      <span>Ln {{ editor.line }}, Col {{ editor.col }}</span>
+      <span>{{ editor.content.split('\n').length }} lines</span>
+      <span>{{ formatBytes(editorBytes) }}</span>
+      <span style="flex: 1" />
+      <span>⌘/Ctrl+S save · ⌘/Ctrl+F find · ⌘/Ctrl+Z undo · Tab indent</span>
+    </div>
   </section>
 </template>

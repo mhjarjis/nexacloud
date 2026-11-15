@@ -115,6 +115,28 @@ try {
     await shot(name)
   }
 
+  console.log('\n▶ File manager: code editor')
+  const php = '<?php\nnamespace App;\n\nclass Hello {\n    public function greet(string $name): string {\n        return "Hello, {$name}!"; // say hi\n    }\n}\n'
+  await ev(`await fetch('/api/files/write', { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: '/var/www/nc-editor-test.php', content: ${JSON.stringify(php)} }) }); return 1`)
+  await go('/files?path=/var/www', 2500)
+  await ev(`[...document.querySelectorAll('button')].find((b) => b.textContent.trim() === 'nc-editor-test.php')?.click(); return 1`)
+  await sleep(2500)
+  expect(await ev(`return !!document.querySelector('.cm-editor .cm-content')`), 'PHP file opens in the code editor')
+  expect(await ev(`return document.querySelectorAll('.cm-lineNumbers .cm-gutterElement').length >= 9`), 'line numbers shown')
+  expect(await ev(`const spans = [...document.querySelectorAll('.cm-content span')]; return spans.some((s) => s.textContent === 'function' && getComputedStyle(s).color !== getComputedStyle(document.querySelector('.cm-content')).color)`), 'PHP syntax is highlighted (keywords coloured)')
+  await shot('22c-files-editor')
+  await ev(`const c = document.querySelector('.cm-content'); c.focus(); const v = c.cmView?.view; return 1`)
+  await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'End', code: 'End', windowsVirtualKeyCode: 35, modifiers: 2 })
+  await send('Input.insertText', { text: '// edited in the panel\n' })
+  await sleep(300)
+  expect(/unsaved/.test(await text()), 'typing marks the file unsaved')
+  await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 's', code: 'KeyS', windowsVirtualKeyCode: 83, modifiers: process.platform === 'darwin' ? 4 : 2 })
+  await sleep(1500)
+  const saved = await ev(`const r = await fetch('/api/files/read?path=/var/www/nc-editor-test.php', { credentials: 'include' }); return (await r.json()).content`)
+  expect(typeof saved === 'string' && saved.includes('// edited in the panel'), 'Ctrl/⌘+S saves through the editor')
+  expect(!/unsaved/.test(await text()), 'saved state shown after saving')
+  await ev(`await fetch('/api/files/delete', { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths: ['/var/www/nc-editor-test.php'] }) }); return 1`)
+
   console.log('\n▶ Back up a database from the UI')
   await go('/databases', 3000)
   const clicked = await ev(`const r=[...document.querySelectorAll('tbody tr')].find(t=>t.querySelector('td')?.textContent.trim()==='portal_db'); const b=r?.querySelector('button'); if(!b) return false; b.click(); return true`)
